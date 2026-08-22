@@ -307,7 +307,9 @@ TEST_F(XrdHttpTpcRStreamTests, WriteBelowSeedIsRejected) {
   TPCR::Stream stream(std::move(file), 16, 8, log);
 
   // The committed prefix [0, W) belongs to the previous session; writing into
-  // it is the prior-offset logic error, exactly as for a fresh stream.
+  // it is the prior-offset logic error, exactly as for a fresh stream --
+  // an internal inconsistency fails the transfer with an error rather than
+  // silently continuing (NFR-7).
   EXPECT_EQ(SFS_ERROR, stream.Write(0, "xxxxxxxx", 8, false));
   EXPECT_FALSE(stream.GetErrorMessage().empty());
 }

@@ -124,6 +124,12 @@ public:
     // against).
     off_t GetReportedLength() const {return m_reported_length;}
 
+    // Source validators from the current response (SUB-7): the ETag exactly
+    // as sent (including quotes / a W/ prefix) and the Last-Modified string.
+    // Empty when the response did not carry them.
+    const std::string &GetETag() const {return m_etag;}
+    const std::string &GetLastModified() const {return m_last_modified;}
+
     // Validates the current response against the requested range (FR-8).
     // Called once when the body starts (completion=false: status must be
     // 206, Content-Range must exactly echo the request, a reported
@@ -268,6 +274,8 @@ private:
     bool m_range_request = false;   // a Range header was set for this request.
     bool m_seen_content_range = false;  // response carried a Content-Range.
     bool m_body_validated = false;  // ValidateRangeResponse(false) already ran.
+    std::string m_etag;             // ETag from the current response (SUB-7).
+    std::string m_last_modified;    // Last-Modified from the current response.
     Stream *m_stream;  // stream corresponding to this transfer.
     CURL *m_curl;  // libcurl handle
     struct curl_slist *m_headers; // any headers we set as part of the libcurl request.

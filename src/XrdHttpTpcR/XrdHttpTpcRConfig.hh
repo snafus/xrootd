@@ -56,6 +56,13 @@ struct Config {
     // curl's low-speed limits and the global stall timeout -- SUB-11).
     unsigned range_timeout = 60;                  // tpcr.range.timeout
 
+    // --- WP-5 ---
+    // Recovery budget (FR-16): the degraded state may ride through a total
+    // source outage for this many seconds of zero commit progress before
+    // failure is admitted.  Deliberately below common orchestrator
+    // marker-stall timeouts (02 §2).  Default 120.
+    unsigned recovery_maxsecs = 120;              // tpcr.recovery.maxsecs
+
     // Applies the streams cap to a client-requested value (NFR-1/BUG-10):
     // 0 means "default" (1), values above the cap clamp to it.  The caller
     // has already rejected negative/unparseable input.  Sets clamped so the

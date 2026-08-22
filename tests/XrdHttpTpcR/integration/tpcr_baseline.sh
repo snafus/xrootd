@@ -3,6 +3,10 @@
 # T-P1 baseline: wall-clock throughput of TPCR vs the stock TPC handler on
 # the same testbed (NFR-2: TPCR must not regress at equal streams).
 #
+# Also documents the BUG-8 outcome: the dead streams x 16 pipelining pool is
+# gone; read-ahead comes from the reorder window, and the multi-stream
+# numbers below show the effect.
+#
 # NOTE: this is a *loopback* baseline against the python mock source -- it
 # measures relative handler overhead, not network behavior.  The
 # RTT-sensitive comparison (tc netem) runs in WP-12; results append to

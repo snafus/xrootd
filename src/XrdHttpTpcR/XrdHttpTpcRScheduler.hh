@@ -24,6 +24,7 @@
 #include <deque>
 #include <functional>
 #include <random>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,25 @@ enum class FailureClass {
 // transfer (priority order: reliability over efficiency).
 FailureClass ClassifyCurlFailure(int curl_code, int http_status,
                                  int state_error_code);
+
+// Source validators captured at the session-start HEAD (SUB-7) and
+// re-checked by the degraded-state re-probe (FR-14).  Also the baseline the
+// cross-session resume ladder (FR-21, WP-8) persists in the journal.
+struct SourceValidators {
+    off_t content_length = -1;
+    std::string etag;                       // verbatim, may be weak (W/...)
+    std::string last_modified;
+    std::map<std::string, std::string> repr_digests;
+
+    // Mid-session comparison (FR-14): a *definite* change -- differing
+    // length, ETag, Last-Modified, or any common digest algorithm's value --
+    // makes the transfer a permanent failure.  A validator merely missing
+    // from one side is logged by the caller but is not evidence of change
+    // (the strict presence policy belongs to the resume ladder, FR-21).
+    // Returns true when compatible; otherwise fills `reason`.
+    bool CompatibleMidSession(const SourceValidators &fresh,
+                              std::string &reason) const;
+};
 
 // Pure range-scheduling state machine (WP-4; 02-ARCHITECTURE §6).
 //
@@ -140,6 +160,20 @@ public:
     // range_timeout seconds; the loop cancels their connections and calls
     // OnRangeResult(id, false, Retryable).
     std::vector<uint64_t> TimedOut(time_t now) const;
+
+    // --- Degraded-state support (FR-14, WP-5) ----------------------------
+
+    // Teardown: every in-flight range returns to PENDING, immediately
+    // issuable, keeping its delivered-prefix shrink but WITHOUT an attempt
+    // increment -- the teardown is the session's decision, not the range's
+    // failure.  Called when the loop dismantles the connections on entering
+    // the degraded state.
+    void RequeueInFlight(time_t now);
+
+    // Fresh patience after a successful recovery (degraded exit): attempt
+    // counters and backoffs reset, so previously-exhausted ranges get the
+    // full retry budget against the recovered source.
+    void ResetAttempts();
 
     // --- Window / bookkeeping --------------------------------------------
 

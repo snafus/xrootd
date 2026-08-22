@@ -13,6 +13,7 @@
 #include "XrdTls/XrdTlsTempCA.hh"
 #include "XrdHttpTpcPMarkManager.hh"
 #include "XrdHttpTpcRConfig.hh"
+#include "XrdHttpTpcRScheduler.hh"
 #include "XrdHttpTpcRSlabPool.hh"
 
 #include <curl/curl.h>
@@ -143,7 +144,20 @@ private:
     int PerformHEADRequest(CURL *curl, XrdHttpExtReq &req, TPCR::State &state,
                            bool &success, TPCLogRecord &rec, bool shouldReturnErrorToClient = true);
 
-    int GetRemoteFileInfoTPCPull(CURL *curl, XrdHttpExtReq &req, uint64_t & contentLength, std::map<std::string,std::string> & reprDigest, bool & success, TPCLogRecord &rec);
+    // Session-start source interrogation.  Besides length and digests it
+    // captures the ETag/Last-Modified validators (SUB-7) into `validators`
+    // when non-null -- the baseline for the degraded-state re-probe (FR-14)
+    // and, later, the journal (FR-21).
+    int GetRemoteFileInfoTPCPull(CURL *curl, XrdHttpExtReq &req, uint64_t & contentLength, std::map<std::string,std::string> & reprDigest, bool & success, TPCLogRecord &rec, TPCR::SourceValidators *validators = nullptr);
+
+    // Mid-session source re-probe on a dedicated easy handle (SUB-7: the
+    // transfer states and the multi handle are never touched).  Returns
+    // true and fills `fresh` when the HEAD succeeded; false on transport
+    // or HTTP failure (the caller keeps waiting out the outage).
+    bool ProbeSourceValidators(XrdHttpExtReq &req, TPCLogRecord &rec,
+                               const std::string &resource_url,
+                               const std::string &interface_ip,
+                               TPCR::SourceValidators &fresh);
 
     // Send a 'performance marker' back to the TPC client, informing it of our
     // progress.  The TPC client will use this information to determine whether
@@ -173,11 +187,13 @@ private:
                          TPCR::Stream &stream, size_t streams,
                          const std::string &resource_url,
                          const std::string &interface_ip,
+                         const TPCR::SourceValidators &baseline,
                          TPCLogRecord &rec);
     int RunPullSchedulerImpl(XrdHttpExtReq &req, TPCR::State &state,
                              TPCR::Stream &stream, size_t streams,
                              const std::string &resource_url,
                              const std::string &interface_ip,
+                             const TPCR::SourceValidators &baseline,
                              std::vector<TPCR::State*> &states,
                              std::vector<ManagedCurlHandle> &owned_handles,
                              TPCLogRecord &rec);

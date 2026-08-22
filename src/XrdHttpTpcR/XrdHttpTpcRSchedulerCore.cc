@@ -258,6 +258,63 @@ Scheduler::Disposition Scheduler::OnRangeResult(uint64_t id, bool ok,
     return Disposition::Retry;
 }
 
+bool SourceValidators::CompatibleMidSession(const SourceValidators &fresh,
+                                            std::string &reason) const
+{
+    // Length must match whenever both sides know it -- a changed length is
+    // always a changed file.
+    if (content_length >= 0 && fresh.content_length >= 0 &&
+        content_length != fresh.content_length) {
+        reason = "content length changed (" + std::to_string(content_length) +
+                 " -> " + std::to_string(fresh.content_length) + ")";
+        return false;
+    }
+    if (!etag.empty() && !fresh.etag.empty() && etag != fresh.etag) {
+        reason = "ETag changed (" + etag + " -> " + fresh.etag + ")";
+        return false;
+    }
+    if (!last_modified.empty() && !fresh.last_modified.empty() &&
+        last_modified != fresh.last_modified) {
+        reason = "Last-Modified changed (" + last_modified + " -> " +
+                 fresh.last_modified + ")";
+        return false;
+    }
+    for (const auto &[algorithm, value] : repr_digests) {
+        auto match = fresh.repr_digests.find(algorithm);
+        if (match != fresh.repr_digests.end() && match->second != value) {
+            reason = "Repr-Digest (" + algorithm + ") changed";
+            return false;
+        }
+    }
+    return true;
+}
+
+void Scheduler::RequeueInFlight(time_t now)
+{
+    for (auto &range : m_table) {
+        if (range.state != RState::ISSUED && range.state != RState::RECEIVING) {
+            continue;
+        }
+        // Keep the delivered prefix (validated, in-order, accepted by the
+        // Stream) exactly as a retryable failure would; no attempt penalty.
+        range.offset += static_cast<off_t>(range.delivered);
+        range.length -= range.delivered;
+        range.delivered = 0;
+        range.state = range.length ? RState::PENDING : RState::DONE;
+        range.not_before = now;
+    }
+    m_inflight = 0;
+    CheckInvariants();
+}
+
+void Scheduler::ResetAttempts()
+{
+    for (auto &range : m_table) {
+        range.attempts = 0;
+        if (range.state == RState::PENDING) {range.not_before = 0;}
+    }
+}
+
 std::vector<uint64_t> Scheduler::TimedOut(time_t now) const
 {
     std::vector<uint64_t> stalled;

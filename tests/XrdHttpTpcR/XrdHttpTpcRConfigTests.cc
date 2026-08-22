@@ -23,6 +23,10 @@ TEST(XrdHttpTpcRConfigTests, DocumentedDefaults) {
   EXPECT_EQ(16u * 1024 * 1024, config.block_size);
   EXPECT_EQ(4ULL * 1024 * 1024 * 1024, config.mempool_max);
   EXPECT_EQ(16u, config.streams_max);
+  EXPECT_EQ(256u * 1024 * 1024, config.window_bytes);
+  EXPECT_EQ(5u, config.retry_max);
+  EXPECT_EQ(60u, config.range_timeout);
+  EXPECT_EQ(120u, config.recovery_maxsecs);  // FR-16 default
 }
 
 TEST(XrdHttpTpcRConfigTests, SetParsesEveryDirective) {
@@ -34,6 +38,14 @@ TEST(XrdHttpTpcRConfigTests, SetParsesEveryDirective) {
   EXPECT_EQ(8ULL * 1024 * 1024 * 1024, config.mempool_max);
   EXPECT_TRUE(config.Set("tpcr.streams.max", "32", err)) << err;
   EXPECT_EQ(32u, config.streams_max);
+  EXPECT_TRUE(config.Set("tpcr.window.bytes", "64m", err)) << err;
+  EXPECT_EQ(64u * 1024 * 1024, config.window_bytes);
+  EXPECT_TRUE(config.Set("tpcr.retry.max", "3", err)) << err;
+  EXPECT_EQ(3u, config.retry_max);
+  EXPECT_TRUE(config.Set("tpcr.range.timeout", "2m", err)) << err;
+  EXPECT_EQ(120u, config.range_timeout);
+  EXPECT_TRUE(config.Set("tpcr.recovery.maxsecs", "90s", err)) << err;
+  EXPECT_EQ(90u, config.recovery_maxsecs);
 }
 
 TEST(XrdHttpTpcRConfigTests, UnknownDirectiveIsFatal) {
@@ -57,6 +69,9 @@ TEST(XrdHttpTpcRConfigTests, InvalidValuesAreFatal) {
   EXPECT_FALSE(config.Set("tpcr.mempool.max", "0", err));
   EXPECT_FALSE(config.Set("tpcr.streams.max", "0", err));
   EXPECT_FALSE(config.Set("tpcr.streams.max", "4096", err));
+  EXPECT_FALSE(config.Set("tpcr.retry.max", "999", err));
+  EXPECT_FALSE(config.Set("tpcr.range.timeout", "1s", err));
+  EXPECT_FALSE(config.Set("tpcr.recovery.maxsecs", "2s", err));
   // Defaults must survive every failed Set.
   EXPECT_EQ(16u * 1024 * 1024, config.block_size);
   EXPECT_EQ(16u, config.streams_max);

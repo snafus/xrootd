@@ -186,6 +186,17 @@ bool Config::Set(const std::string &directive, const std::string &value,
         range_timeout = static_cast<unsigned>(seconds);
         return true;
     }
+    if (directive == "tpcr.recovery.maxsecs") {
+        uint64_t seconds;
+        if (!ParseDuration(value, seconds) || seconds < 5 || seconds > 86400) {
+            bad << directive << " value '" << value
+                << "' is not a valid duration in [5s, 24h]";
+            err = bad.str();
+            return false;
+        }
+        recovery_maxsecs = static_cast<unsigned>(seconds);
+        return true;
+    }
     // FR-30: unknown tpcr.* directives are fatal at init -- a typo silently
     // falling back to a default is exactly the failure mode this prevents.
     bad << "unknown tpcr directive '" << directive << "'";

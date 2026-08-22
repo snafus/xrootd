@@ -31,7 +31,8 @@ cleanup() {
     [ -n "$XROOTD_PID" ] && kill "$XROOTD_PID" 2>/dev/null
     [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null
     wait 2>/dev/null
-    rm -rf "$WORK"
+    # TPCR_KEEP_WORK=1 preserves the work dir for debugging.
+    [ -n "${TPCR_KEEP_WORK:-}" ] || rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -71,6 +72,10 @@ tpc.trace all
 tpcr.blocksize 1m
 tpcr.window.bytes 4m
 tpcr.range.timeout 30
+# Fast escalation for the T-I7 degraded-state scenarios: exhaust after 2
+# attempts (~3s of backoff), 25s recovery budget.
+tpcr.retry.max 2
+tpcr.recovery.maxsecs 25
 EOF
 
 LD_LIBRARY_PATH="$LIB_DIR" "$XROOTD_BIN" -c "$WORK/xrootd.cfg" \
@@ -134,7 +139,11 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# T-I1: fresh pulls -- size matrix x streams, byte-compare
+# T-I1: fresh pulls -- size matrix x streams, byte-compare.
+# Verifies FR-1 (COPY verb, 202 + chunked, final chunk grammar), FR-7
+# (streams=1 runs the same scheduler path), FR-10 (block coverage incl.
+# short last range), FR-11 (success only after full committed content),
+# CON-2 (libXrdHttpTPCR loaded via http.exthandler xrdtpcr).
 # ---------------------------------------------------------------------------
 BLOCK=$((1024 * 1024))
 for size in 0 1 $((BLOCK - 1)) $BLOCK $((BLOCK + 1)) $((8 * BLOCK + 12345)); do
@@ -168,7 +177,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# T-I1: marker grammar on a throttled transfer (CON-4 wire shape)
+# T-I1: marker grammar on a throttled transfer (CON-4 wire shape; BUG-13:
+# the stripe fields keep the exact stock values clients parse).
 # ---------------------------------------------------------------------------
 make_ref "$WORK/ref.bin" $((4 * BLOCK))
 start_mock "$WORK/ref.bin" --throttle $((512 * 1024))
@@ -186,7 +196,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# T-I2: TransferHeader passthrough to HEAD and every range GET
+# T-I2: TransferHeader passthrough to HEAD and every range GET (FR-2:
+# header handling behavior-compatible with the stock handler).
 # ---------------------------------------------------------------------------
 make_ref "$WORK/ref.bin" $((3 * BLOCK))
 : > "$WORK/headers.jsonl"
@@ -250,6 +261,146 @@ if printf '%s' "$RESPONSE" | grep -q "success: Created" \
 else
     fail "T-I3 (resets): $RESPONSE"
 fi
+
+# Starts a COPY in the background, response streamed to $1.
+copy_pull_bg() {
+    local out="$1"; local dest="$2"; local streams="$3"; shift 3
+    curl -s -N -X COPY "http://127.0.0.1:$HTTP_PORT$dest" \
+        -H "Source: http://127.0.0.1:$MOCK_PORT/src.bin" \
+        -H "X-Number-Of-Streams: $streams" \
+        -H "Overwrite: T" \
+        "$@" > "$out" 2>>"$WORK/curl.err" &
+    COPY_PID=$!
+}
+
+mock_ctl() { curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl?$1"; }
+
+# ---------------------------------------------------------------------------
+# T-I7: total source outage shorter than the recovery budget -> invisible
+# (degraded state rides it out; markers keep flowing; transfer succeeds)
+# ---------------------------------------------------------------------------
+make_ref "$WORK/ref.bin" $((20 * BLOCK))
+start_mock "$WORK/ref.bin" --throttle $((512 * 1024))
+copy_pull_bg "$WORK/resp-outage.txt" "/dest-outage.bin" 4
+sleep 3                      # let the transfer get going (~10s total)
+mock_ctl "mode=refuse"       # total outage: data AND HEAD fail
+sleep 8                      # exhaustion (~3s) + degraded probing
+mock_ctl "mode=ok"           # source comes back
+wait "$COPY_PID"
+stop_mock
+if grep -q "success: Created" "$WORK/resp-outage.txt" \
+   && cmp -s "$WORK/ref.bin" "$WORK/data/dest-outage.bin"; then
+    markers=$(grep -c "Perf Marker" "$WORK/resp-outage.txt")
+    if [ "$markers" -ge 2 ]; then
+        pass "T-I7 outage < budget ridden out invisibly ($markers markers)"
+    else
+        fail "T-I7 outage < budget: succeeded but only $markers markers (FR-15)"
+    fi
+else
+    fail "T-I7 outage < budget: $(tail -2 "$WORK/resp-outage.txt")"
+fi
+
+# ---------------------------------------------------------------------------
+# T-I7: outage longer than the recovery budget -> failure admitted only
+# after the budget, with the specific message
+# ---------------------------------------------------------------------------
+make_ref "$WORK/ref.bin" $((20 * BLOCK))
+start_mock "$WORK/ref.bin" --throttle $((512 * 1024))
+copy_pull_bg "$WORK/resp-outage2.txt" "/dest-outage2.bin" 4
+sleep 3
+T_OUTAGE_START=$(date +%s)
+mock_ctl "mode=refuse"       # and it never comes back
+wait "$COPY_PID"
+T_FAILED=$(date +%s)
+stop_mock
+if grep -q "recovery budget" "$WORK/resp-outage2.txt"; then
+    ELAPSED=$((T_FAILED - T_OUTAGE_START))
+    if [ "$ELAPSED" -ge 20 ]; then
+        pass "T-I7 outage > budget admitted after ${ELAPSED}s (budget 25s)"
+    else
+        fail "T-I7 outage > budget: failed too early (${ELAPSED}s < ~25s budget)"
+    fi
+else
+    fail "T-I7 outage > budget: wrong failure: $(tail -2 "$WORK/resp-outage2.txt")"
+fi
+
+# ---------------------------------------------------------------------------
+# T-I7: source content changes mid-session -> permanent failure at re-probe
+# ---------------------------------------------------------------------------
+make_ref "$WORK/ref.bin" $((20 * BLOCK))
+start_mock "$WORK/ref.bin" --throttle $((512 * 1024))
+copy_pull_bg "$WORK/resp-changed.txt" "/dest-changed.bin" 4
+sleep 3
+mock_ctl "mode=refuse-data&etag=%22tpcr-mock-etag-CHANGED%22"
+wait "$COPY_PID"
+stop_mock
+if grep -q "source changed mid-transfer" "$WORK/resp-changed.txt"; then
+    pass "T-I7 mid-session source change detected at re-probe"
+else
+    fail "T-I7 source change: $(tail -2 "$WORK/resp-changed.txt")"
+fi
+
+# ---------------------------------------------------------------------------
+# FR-12: 401 mid-session -- one re-probe recovers a flapping gateway...
+# ---------------------------------------------------------------------------
+make_ref "$WORK/ref.bin" $((4 * BLOCK + 999))
+start_mock "$WORK/ref.bin" --fail-first 401:1
+copy_pull "/dest-auth1.bin" 4
+stop_mock
+if printf '%s' "$RESPONSE" | grep -q "success: Created" \
+   && cmp -s "$WORK/ref.bin" "$WORK/data/dest-auth1.bin"; then
+    pass "FR-12 single 401 flap recovered via one re-probe"
+else
+    fail "FR-12 single 401: $RESPONSE"
+fi
+
+# ...and a persistently-401 source is a prompt permanent failure.
+make_ref "$WORK/ref.bin" $((3 * BLOCK))
+start_mock "$WORK/ref.bin" --fail-first 401:9999
+copy_pull "/dest-auth2.bin" 4
+stop_mock
+if printf '%s' "$RESPONSE" | grep -q "failure:"; then
+    pass "FR-12 persistent 401 is a permanent failure"
+else
+    fail "FR-12 persistent 401: $RESPONSE"
+fi
+
+# ---------------------------------------------------------------------------
+# CON-6 push-mode smoke: the verbatim-ported push path still works.  The
+# local file is served to the mock's PUT endpoint; byte-compare the upload.
+# ---------------------------------------------------------------------------
+make_ref "$WORK/data/pushsrc.bin" $((2 * BLOCK + 777))
+make_ref "$WORK/ref.bin" 1   # mock needs a file to serve; content irrelevant
+: > "$WORK/headers.jsonl"
+start_mock "$WORK/ref.bin" --headers-log "$WORK/headers.jsonl"
+PUSH_RESPONSE=$(curl -s -X COPY "http://127.0.0.1:$HTTP_PORT/pushsrc.bin" \
+    -H "Destination: http://127.0.0.1:$MOCK_PORT/uploaded.bin" 2>>"$WORK/curl.err")
+stop_mock
+if printf '%s' "$PUSH_RESPONSE" | grep -q "success: Created" \
+   && cmp -s "$WORK/data/pushsrc.bin" "$WORK/headers.jsonl.put"; then
+    pass "CON-6 push mode smoke (byte-compared upload)"
+else
+    fail "CON-6 push: $PUSH_RESPONSE"
+fi
+
+# ---------------------------------------------------------------------------
+# FR-31: the structured log events for everything the suite exercised must
+# be present in the server log (checked last, after all scenarios ran).
+# ---------------------------------------------------------------------------
+# Exercise the streams clamp once so its event exists (NFR-1/BUG-10).
+make_ref "$WORK/ref.bin" $BLOCK
+start_mock "$WORK/ref.bin"
+copy_pull "/dest-clamp.bin" 99
+stop_mock
+printf '%s' "$RESPONSE" | grep -q "success: Created" || fail "clamp transfer failed: $RESPONSE"
+
+for event in DEGRADED_ENTER DEGRADED_EXIT RANGE_RETRY SOURCE_CHANGED STREAMS_CLAMPED; do
+    if grep -q "event=$event" "$WORK"/tpcr/xrootd.log* 2>/dev/null; then
+        pass "FR-31 structured event $event logged"
+    else
+        fail "FR-31 structured event $event missing from server log"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 echo

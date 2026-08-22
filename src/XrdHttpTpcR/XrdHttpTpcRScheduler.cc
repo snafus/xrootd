@@ -36,9 +36,11 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace TPCR;
@@ -62,6 +64,14 @@ struct HandleSlot {
     State *state = nullptr;
     bool busy = false;
     uint64_t range_id = 0;
+};
+
+// Outcome of the degraded-state recovery procedure (FR-14..FR-16).
+enum class DegradedResult {
+    Recovered,        // probe succeeded; restore full parallelism
+    AdmitFailure,     // recovery budget exhausted with zero commit progress
+    PermanentFailure, // source changed mid-session, or a permanent error
+    ClientGone,       // chunk write failed (SUB-6): exit without verdict
 };
 
 } // namespace
@@ -113,6 +123,7 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
                                   Stream &stream, size_t streams,
                                   const std::string &resource_url,
                                   const std::string &interface_ip,
+                                  const SourceValidators &baseline,
                                   TPCLogRecord &rec)
 {
     std::vector<State*> states;
@@ -120,7 +131,7 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
     try {
         int retval = RunPullSchedulerImpl(req, state, stream, streams,
                                           resource_url, interface_ip,
-                                          states, owned_handles, rec);
+                                          baseline, states, owned_handles, rec);
         for (auto *each : states) {delete each;}
         return retval;
     } catch (std::runtime_error &e) {
@@ -142,6 +153,7 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                                       Stream &stream, size_t streams,
                                       const std::string &resource_url,
                                       const std::string &interface_ip,
+                                      const SourceValidators &baseline,
                                       std::vector<State*> &states,
                                       std::vector<ManagedCurlHandle> &owned_handles,
                                       TPCLogRecord &rec)
@@ -307,6 +319,14 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
     int abort_status = 0;             // HTTP status to report, if any
     CURLcode abort_curl_code = CURLE_OK;
 
+    // Degraded-state machinery (FR-14..FR-16, WP-5).
+    bool enter_degraded = false;
+    std::string degraded_reason;
+    bool auth_probe_used = false;     // FR-12: one re-probe for 401/403
+    bool client_gone = false;         // SUB-6: stop writing to the client
+    time_t last_commit_time = time(NULL);
+    off_t last_committed_offset = stream.CommittedOffset();
+
     // Cancels an in-flight range's connection and re-queues (or aborts).
     // The handle is reset and reconfigured -- its connection state is
     // unknown after a cancel, so it must be rebuilt from scratch (SUB-5).
@@ -332,11 +352,10 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             throw std::runtime_error("Failed to reconfigure a transfer handle after reset");
         }
         slot.busy = false;
-        if (disposition == Scheduler::Disposition::Exhausted && !aborted) {
-            // WP-5 turns this into the degraded-state entry; until then,
-            // exhaustion is an admitted failure with a distinct message.
-            aborted = true;
-            abort_msg = "range retries exhausted while the source is unresponsive";
+        if (disposition == Scheduler::Disposition::Exhausted) {
+            // FR-14: retry exhaustion escalates to the degraded state.
+            enter_degraded = true;
+            degraded_reason = "per-range retries exhausted";
         }
     };
 
@@ -344,6 +363,206 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
     off_t last_advance_bytes = 0;
     time_t last_advance_time = time(NULL);
     const time_t transfer_start = last_advance_time;
+
+    // Refreshes the zero-commit-progress clock (FR-16's budget yardstick).
+    auto refresh_commit_clock = [&]() {
+        if (stream.CommittedOffset() > last_committed_offset) {
+            last_committed_offset = stream.CommittedOffset();
+            last_commit_time = time(NULL);
+        }
+    };
+
+    // Marker upkeep usable from the recovery paths (FR-15: markers continue
+    // throughout the degraded state, reporting the stalled byte count).
+    // Returns false when the chunk write failed -- the client is gone.
+    auto marker_tick = [&]() -> bool {
+        const time_t tick_now = time(NULL);
+        if (tick_now >= last_marker + m_marker_period) {
+            if (SendPerfMarker(req, rec, states, received_bytes())) {
+                return false;
+            }
+            last_marker = tick_now;
+        }
+        return true;
+    };
+
+    // ------------------------------------------------------------------ //
+    //             Degraded state: Tier-1 recovery (FR-14..FR-16)          //
+    // ------------------------------------------------------------------ //
+    // Entered when per-range retries exhaust or an auth flap needs its
+    // one-shot re-probe.  Tears down every connection, then repeatedly:
+    // re-HEADs the source on a dedicated handle (SUB-7), revalidates the
+    // session baseline (a definite change is a permanent failure), and runs
+    // a single-connection probe range.  Success restores full parallelism
+    // with fresh retry patience; the budget is recovery_maxsecs of ZERO
+    // commit progress -- any committed byte restarts the clock.
+    auto RunDegraded = [&]() -> DegradedResult {
+        logTransferEvent(LogMask::Warning, rec, "DEGRADED_ENTER",
+                         degraded_reason);
+        time_t now = time(NULL);
+
+        // Teardown (FR-14): dismantle every connection.  Ranges keep their
+        // delivered prefixes and return to PENDING without attempt penalty.
+        for (auto &slot : slots) {
+            if (!slot.busy) {continue;}
+            sched.OnProgress(slot.range_id, slot.state->BytesTransferred(), now);
+            curl_multi_remove_handle(multi.Get(), slot.state->GetHandle());
+            harvested_bytes += slot.state->BytesTransferred();
+            slot.state->ResetAfterRequest();
+            curl_easy_reset(slot.state->GetHandle());
+            if (!ConfigureHandle(slot.state->GetHandle(), *slot.state, rec,
+                                 resource_url, interface_ip)) {
+                throw std::runtime_error("Failed to reconfigure a transfer handle after reset");
+            }
+            slot.busy = false;
+        }
+        running_handles = 0;
+        sched.RequeueInFlight(now);
+
+        const time_t degraded_enter = now;
+        auto budget_deadline = [&]() -> time_t {
+            return std::max(degraded_enter, last_commit_time) +
+                   static_cast<time_t>(m_tpcr.recovery_maxsecs);
+        };
+        int probe_pause = 2;  // secs between re-probes, doubling up to 15
+
+        while (true) {
+            if (!marker_tick()) {return DegradedResult::ClientGone;}
+            now = time(NULL);
+            if (now > budget_deadline()) {return DegradedResult::AdmitFailure;}
+
+            SourceValidators fresh;
+            if (!ProbeSourceValidators(req, rec, resource_url, interface_ip,
+                                       fresh)) {
+                logTransferEvent(LogMask::Debug, rec, "DEGRADED_PROBE",
+                    "source re-HEAD failed; continuing to wait out the outage");
+            } else {
+                std::string reason;
+                if (!baseline.CompatibleMidSession(fresh, reason)) {
+                    // FR-14: a mid-session source change is permanent.
+                    degraded_reason = "source changed mid-transfer: " + reason;
+                    logTransferEvent(LogMask::Error, rec, "SOURCE_CHANGED",
+                                     reason);
+                    return DegradedResult::PermanentFailure;
+                }
+                // Single-connection probe: prove a real data path end to
+                // end before restoring parallelism.
+                Scheduler::RangeRef probe_ref;
+                if (!sched.NextIssuable(now, probe_ref)) {
+                    logTransferEvent(LogMask::Info, rec, "DEGRADED_EXIT",
+                        "no pending work after re-probe");
+                    sched.ResetAttempts();
+                    last_advance_time = time(NULL);
+                    return DegradedResult::Recovered;
+                }
+                HandleSlot &slot = slots[0];
+                slot.state->SetTransferParameters(probe_ref.offset,
+                                                  probe_ref.length);
+                curl_multi_add_handle(multi.Get(), slot.state->GetHandle());
+                sched.MarkIssued(probe_ref.id, now);
+                slot.busy = true;
+                slot.range_id = probe_ref.id;
+                running_handles = 1;
+
+                bool settled = false, probe_ok = false;
+                while (!settled) {
+                    if (!marker_tick()) {
+                        curl_multi_remove_handle(multi.Get(),
+                                                 slot.state->GetHandle());
+                        return DegradedResult::ClientGone;
+                    }
+                    refresh_commit_clock();
+                    now = time(NULL);
+                    if (now > budget_deadline()) {
+                        curl_multi_remove_handle(multi.Get(),
+                                                 slot.state->GetHandle());
+                        sched.OnProgress(slot.range_id,
+                                         slot.state->BytesTransferred(), now);
+                        harvested_bytes += slot.state->BytesTransferred();
+                        sched.RequeueInFlight(now);
+                        slot.state->ResetAfterRequest();
+                        slot.busy = false;
+                        return DegradedResult::AdmitFailure;
+                    }
+                    curl_multi_perform(multi.Get(), &running_handles);
+                    CURLMsg *msg;
+                    int msgq = 0;
+                    while ((msg = curl_multi_info_read(multi.Get(), &msgq))) {
+                        if (msg->msg != CURLMSG_DONE) {continue;}
+                        const CURLcode res = msg->data.result;
+                        curl_multi_remove_handle(multi.Get(),
+                                                 slot.state->GetHandle());
+                        now = time(NULL);
+                        sched.OnProgress(slot.range_id,
+                                         slot.state->BytesTransferred(), now);
+                        harvested_bytes += slot.state->BytesTransferred();
+                        bool ok = (res == CURLE_OK) &&
+                                  (slot.state->GetStatusCode() < 400) &&
+                                  slot.state->ValidateRangeResponse(true);
+                        FailureClass fclass = FailureClass::Retryable;
+                        if (!ok) {
+                            fclass = ClassifyCurlFailure(
+                                static_cast<int>(res),
+                                slot.state->GetStatusCode(),
+                                slot.state->GetErrorCode());
+                            // The one-shot auth re-probe is this very
+                            // procedure: a second auth failure is final.
+                            if (fclass == FailureClass::AuthRetry) {
+                                fclass = FailureClass::Permanent;
+                            }
+                        }
+                        const auto disposition = sched.OnRangeResult(
+                            slot.range_id, ok, fclass, now);
+                        probe_ok = (disposition == Scheduler::Disposition::Done);
+                        if (!ok && fclass == FailureClass::Permanent) {
+                            degraded_reason =
+                                slot.state->GetErrorMessage().empty()
+                                    ? std::string(curl_easy_strerror(res))
+                                    : slot.state->GetErrorMessage();
+                            slot.state->ResetAfterRequest();
+                            slot.busy = false;
+                            return DegradedResult::PermanentFailure;
+                        }
+                        slot.state->ResetAfterRequest();
+                        if (!probe_ok) {
+                            // Connection state unknown after the failure:
+                            // rebuild the handle (SUB-5).
+                            curl_easy_reset(slot.state->GetHandle());
+                            if (!ConfigureHandle(slot.state->GetHandle(),
+                                                 *slot.state, rec,
+                                                 resource_url, interface_ip)) {
+                                throw std::runtime_error("Failed to reconfigure a transfer handle after reset");
+                            }
+                        }
+                        slot.busy = false;
+                        settled = true;
+                    }
+                    if (!settled) {MultiWait(multi.Get(), 1000);}
+                }
+                running_handles = 0;
+                refresh_commit_clock();
+                if (probe_ok) {
+                    logTransferEvent(LogMask::Warning, rec, "DEGRADED_EXIT",
+                        "single-connection probe succeeded; restoring parallelism");
+                    // Fresh patience against the recovered source, and a
+                    // fresh steady-state stall clock: the outage window was
+                    // governed by the recovery budget, not the global stall.
+                    sched.ResetAttempts();
+                    last_advance_bytes = received_bytes();
+                    last_advance_time = time(NULL);
+                    return DegradedResult::Recovered;
+                }
+                // Probe failed retryably: pause, then re-HEAD again.
+            }
+            // Pause between probes, keeping markers flowing (FR-15).
+            const time_t pause_end = time(NULL) + probe_pause;
+            while (time(NULL) < pause_end) {
+                if (!marker_tick()) {return DegradedResult::ClientGone;}
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            probe_pause = std::min(probe_pause * 2, 15);
+        }
+    };
 
     issue_ready(time(NULL));
 
@@ -448,10 +667,18 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                 failure = ClassifyCurlFailure(static_cast<int>(res),
                                               state->GetStatusCode(),
                                               state->GetErrorCode());
-                // WP-4 interim: the one-shot re-probe for auth flaps is
-                // WP-5's degraded machinery; treat as permanent until then.
                 if (failure == FailureClass::AuthRetry) {
-                    failure = FailureClass::Permanent;
+                    // FR-12: 401/403 mid-session gets exactly one full
+                    // re-probe (the source side may be a flapping gateway);
+                    // a second occurrence is permanent -- this session
+                    // cannot refresh its own token.
+                    if (auth_probe_used) {
+                        failure = FailureClass::Permanent;
+                    } else {
+                        auth_probe_used = true;
+                        enter_degraded = true;
+                        degraded_reason = "authorization rejected mid-session (one re-probe)";
+                    }
                 }
             }
 
@@ -476,8 +703,10 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                     break;
                 }
                 case Scheduler::Disposition::Exhausted:
-                    aborted = true;
-                    abort_msg = "range retries exhausted while the source is unresponsive";
+                    // FR-14: escalate to the degraded state instead of
+                    // admitting failure (which forfeits the partial).
+                    enter_degraded = true;
+                    degraded_reason = "per-range retries exhausted";
                     break;
                 case Scheduler::Disposition::Permanent: {
                     aborted = true;
@@ -513,9 +742,35 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         if (aborted) {break;}
 
         // Commit advance drives the window (and, from WP-7, checkpoints).
+        refresh_commit_clock();
         sched.AdvanceCommitted(stream.CommittedOffset());
         // Return excess slab reservations to the pool.
         while (slab_stash.size() > sched.InFlight()) {slab_stash.pop_back();}
+
+        if (enter_degraded) {
+            enter_degraded = false;
+            switch (RunDegraded()) {
+                case DegradedResult::Recovered:
+                    break;  // main loop resumes with restored parallelism
+                case DegradedResult::AdmitFailure: {
+                    aborted = true;
+                    std::stringstream ss;
+                    ss << "no commit progress within the recovery budget ("
+                       << m_tpcr.recovery_maxsecs
+                       << "s); source unavailable, admitting failure";
+                    abort_msg = ss.str();
+                    break;
+                }
+                case DegradedResult::PermanentFailure:
+                    aborted = true;
+                    abort_msg = degraded_reason;
+                    break;
+                case DegradedResult::ClientGone:
+                    client_gone = true;
+                    break;
+            }
+            if (aborted || client_gone) {break;}
+        }
 
         issue_ready(time(NULL));
 
@@ -544,6 +799,16 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         if (MultiWait(multi.Get(), static_cast<int>(max_sleep_ms)) != CURLM_OK) {
             throw std::runtime_error("libcurl multi-wait failure");
         }
+    }
+
+    if (client_gone) {
+        // SUB-6: the client connection is dead.  Stop entirely, take the
+        // final checkpoint (WP-7 stub), and exit WITHOUT attempting any
+        // further write to the client -- this is a distinct event, not a
+        // transfer failure.
+        logTransferEvent(LogMask::Info, rec, "CLIENT_DISCONNECT",
+            "Client connection lost during recovery; exiting without verdict");
+        return -1;
     }
 
     // ------------------------------------------------------------------ //

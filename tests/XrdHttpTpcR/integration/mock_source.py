@@ -41,7 +41,11 @@ class SourceState:
         self.reset_after = self._parse_pair(args.reset_after)   # [bytes, n]
         self.stall = self._parse_pair(args.stall)               # [secs, n]
         self.throttle = args.throttle
-        self.refuse = False           # /ctl?mode=refuse -> connection refused-ish (503)
+        # /ctl?mode=...: "ok" serves normally; "refuse" 503s everything
+        # (HEAD included -- a total outage); "refuse-data" 503s only the
+        # ranged GETs while HEAD keeps working (lets the degraded re-probe
+        # see validators, e.g. for the source-changed scenarios).
+        self.refuse = "ok"
         self.etag = '"tpcr-mock-etag-1"'
         self.last_modified = "Wed, 01 Jan 2025 00:00:00 GMT"
         self.headers_log = args.headers_log
@@ -78,8 +82,10 @@ class Handler(BaseHTTPRequestHandler):
         if not state.headers_log:
             return
         entry = {
+            "time": time.time(),
             "method": self.command,
             "path": self.path,
+            "mode": state.refuse,
             "headers": {k: v for k, v in self.headers.items()},
         }
         with state.lock:
@@ -97,10 +103,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if self.state.refuse == "refuse":
+            self._plain_status(503, "source down (test-controlled)")
+            return
         self.send_response(200)
         self.send_header("Content-Length", str(len(self.payload)))
         self._send_validators()
         self.end_headers()
+
+    def do_PUT(self):
+        # Push-mode target (CON-6 smoke): store the body for byte-compare.
+        self._log_headers()
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        with self.state.lock:
+            uploads = getattr(self.state, "uploads", {})
+            uploads[self.path] = body
+            self.state.uploads = uploads
+        # Persist for the test script to compare.
+        if self.state.headers_log:
+            with open(self.state.headers_log + ".put" , "wb") as out:
+                out.write(body)
+        self._plain_status(201, "Created")
 
     def do_GET(self):
         state = self.state
@@ -111,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
         with state.lock:
             state.request_count += 1
 
-        if state.refuse:
+        if state.refuse in ("refuse", "refuse-data"):
             self._plain_status(503, "source down (test-controlled)")
             return
 
@@ -136,7 +160,7 @@ class Handler(BaseHTTPRequestHandler):
         state = self.state
         with state.lock:
             if "mode" in query:
-                state.refuse = query["mode"][0] == "refuse"
+                state.refuse = query["mode"][0]
             if "etag" in query:
                 state.etag = query["etag"][0]
             if "lastmod" in query:

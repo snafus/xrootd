@@ -704,7 +704,7 @@ int TPCRHandler::PerformHEADRequest(CURL *curl, XrdHttpExtReq &req, State &state
     return 0;
 }
 
-int TPCRHandler::GetRemoteFileInfoTPCPull(CURL *curl, XrdHttpExtReq &req, uint64_t &contentLength, std::map<std::string,std::string> & reprDigest, bool & success, TPCLogRecord &rec) {
+int TPCRHandler::GetRemoteFileInfoTPCPull(CURL *curl, XrdHttpExtReq &req, uint64_t &contentLength, std::map<std::string,std::string> & reprDigest, bool & success, TPCLogRecord &rec, TPCR::SourceValidators *validators) {
     State state(curl,req.tpcForwardCreds);
     //Don't forget to copy the headers of the client's request before doing the HEAD call. Otherwise, if there is a need for authentication,
     //it will fail
@@ -716,7 +716,57 @@ int TPCRHandler::GetRemoteFileInfoTPCPull(CURL *curl, XrdHttpExtReq &req, uint64
     }
     contentLength = state.GetReportedLength();
     reprDigest = state.GetReprDigest();
+    if (validators) {
+        // SUB-7: the session baseline the degraded-state re-probe (FR-14)
+        // revalidates against, and the journal persists (FR-21, WP-8).
+        validators->content_length = state.GetReportedLength();
+        validators->etag = state.GetETag();
+        validators->last_modified = state.GetLastModified();
+        validators->repr_digests = state.GetReprDigest();
+    }
     return result;
+}
+
+// Mid-session re-probe (FR-14/SUB-7): a dedicated easy handle so the transfer
+// states and the multi handle are untouched.  Any transport or HTTP failure
+// simply returns false -- the degraded loop keeps riding out the outage.
+bool TPCRHandler::ProbeSourceValidators(XrdHttpExtReq &req, TPCLogRecord &rec,
+                                        const std::string &resource_url,
+                                        const std::string &interface_ip,
+                                        TPCR::SourceValidators &fresh)
+{
+    ManagedCurlHandle probe(curl_easy_init());
+    if (!probe) {return false;}
+    State head_state(probe.get(), req.tpcForwardCreds);
+    if (!ConfigureHandle(probe.get(), head_state, rec, resource_url,
+                         interface_ip)) {
+        return false;
+    }
+    head_state.SetupHeadersForHEAD(req);
+    bool success = false;
+    // PerformHEADRequest treats rec.tpc_status >= 400 as "this HEAD failed",
+    // but the field is sticky on the log record: a previous failed probe's
+    // status would veto a now-successful one.  (Latent in stock, where the
+    // HEAD ran once per transfer; fatal for re-probing.)  Clear it for the
+    // duration of the probe; a genuine failure sets it again.
+    const int prior_tpc_status = rec.tpc_status;
+    rec.tpc_status = -1;
+    // shouldReturnErrorToClient=false: the client already holds the 202
+    // chunked stream; errors here are recovery-internal.
+    PerformHEADRequest(probe.get(), req, head_state, success, rec,
+                       /*shouldReturnErrorToClient=*/false);
+    if (!success) {
+        // Keep the freshest meaningful status for monitoring.
+        if (rec.tpc_status < 400 && prior_tpc_status >= 400) {
+            rec.tpc_status = prior_tpc_status;
+        }
+        return false;
+    }
+    fresh.content_length = head_state.GetReportedLength();
+    fresh.etag = head_state.GetETag();
+    fresh.last_modified = head_state.GetLastModified();
+    fresh.repr_digests = head_state.GetReprDigest();
+    return true;
 }
   
 /******************************************************************************/
@@ -1292,13 +1342,15 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
         return req.SendSimpleResp(rec.status, NULL, NULL, generateClientErr(ss, rec).c_str(), 0);
     }
     uint64_t sourceFileContentLength = 0;
+    // Session-start validator baseline (SUB-7), captured from the HEAD.
+    TPCR::SourceValidators sourceValidators;
     {
         //Get the content-length of the source file and pass it to the OSS layer
         //during the open
         bool success = false;
         bool mismatchDigests = false;
         std::map<std::string,std::string> sourceFileReprDigest;
-        GetRemoteFileInfoTPCPull(curl, req, sourceFileContentLength, sourceFileReprDigest, success, rec);
+        GetRemoteFileInfoTPCPull(curl, req, sourceFileContentLength, sourceFileReprDigest, success, rec, &sourceValidators);
         if(success) {
             //In the case we cannot get the information from the source server (offline or other error)
             //we just don't add the file information to the opaque of the local file to open
@@ -1342,7 +1394,8 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
 
     // FR-7: every pull -- streams=1 included -- runs through the range
     // scheduler.  There is exactly one pull code path.
-    return RunPullScheduler(req, state, stream, streams, resource, iface_ip, rec);
+    return RunPullScheduler(req, state, stream, streams, resource, iface_ip,
+                            sourceValidators, rec);
 }
 
 /******************************************************************************/

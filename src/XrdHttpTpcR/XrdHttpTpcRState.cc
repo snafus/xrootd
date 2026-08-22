@@ -48,6 +48,8 @@ void State::Move(State &other)
     m_range_request = other.m_range_request;
     m_seen_content_range = other.m_seen_content_range;
     m_body_validated = other.m_body_validated;
+    m_etag = other.m_etag;
+    m_last_modified = other.m_last_modified;
     m_stream = other.m_stream;
     m_curl = other.m_curl;
     m_headers = other.m_headers;
@@ -234,6 +236,8 @@ void State::SetupHeadersForHEAD(XrdHttpExtReq &req) {
 //   m_range_request      a Range was set for the current request    -> false
 //   m_seen_content_range response carried Content-Range             -> false
 //   m_body_validated     body-start validation already ran          -> false
+//   m_etag               ETag from the current response             -> clear
+//   m_last_modified      Last-Modified from the current response    -> clear
 // NOT reset (they describe the transfer, not the request):
 //   m_start_offset, m_stream, m_curl, m_headers*, m_push,
 //   m_is_transfer_state, tpcForwardCreds, m_finalize_error_*,
@@ -254,6 +258,8 @@ void State::ResetAfterRequest() {
     m_range_request = false;
     m_seen_content_range = false;
     m_body_validated = false;
+    m_etag.clear();
+    m_last_modified.clear();
 }
 
 void State::RebindHeaders() {
@@ -310,6 +316,22 @@ int State::Header(const std::string &header) {
                     // Header unparseable -- not a great sign, fail request.
                     //printf("Content-length header unparseable\n");
                     return 0;
+                }
+            }
+            if (header_name == "etag" || header_name == "last-modified")
+            {
+                // Source validators (SUB-7): captured at the session-start
+                // HEAD as the baseline the degraded-state re-probe (FR-14)
+                // and the resume ladder (FR-21) compare against.
+                std::string value = header_value;
+                const char *whitespace = " \t\r\n";
+                value.erase(0, value.find_first_not_of(whitespace));
+                const auto tail = value.find_last_not_of(whitespace);
+                if (tail != std::string::npos) {value.erase(tail + 1);}
+                if (header_name == "etag") {
+                    m_etag = value;
+                } else {
+                    m_last_modified = value;
                 }
             }
             if (header_name == "content-range")

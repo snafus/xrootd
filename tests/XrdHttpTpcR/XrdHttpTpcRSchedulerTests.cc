@@ -331,6 +331,123 @@ TEST(XrdHttpTpcRSchedulerTests, ZeroLengthFileIsImmediatelyDone) {
   EXPECT_TRUE(scheduler.AllDone());
 }
 
+TEST(XrdHttpTpcRSchedulerTests, RequeueInFlightKeepsPrefixWithoutPenalty) {
+  // FR-14 teardown: in-flight ranges return to PENDING keeping their
+  // delivered-prefix shrink, with no attempt increment.
+  FakeClock clock;
+  Scheduler scheduler(SmallLimits(), clock.fn(), 7);
+
+  Scheduler::RangeRef a, b;
+  ASSERT_TRUE(scheduler.NextIssuable(clock.now, a));
+  scheduler.MarkIssued(a.id, clock.now);
+  ASSERT_TRUE(scheduler.NextIssuable(clock.now, b));
+  scheduler.MarkIssued(b.id, clock.now);
+  scheduler.OnProgress(a.id, 4, clock.now);  // half of range a delivered
+
+  scheduler.RequeueInFlight(clock.now);
+  EXPECT_EQ(0u, scheduler.InFlight());
+
+  // Both immediately issuable again; range a shrunk to its remainder.
+  Scheduler::RangeRef again;
+  bool found_a = false, found_b = false;
+  while (scheduler.NextIssuable(clock.now, again)) {
+    scheduler.MarkIssued(again.id, clock.now);
+    if (again.id == a.id) {
+      found_a = true;
+      EXPECT_EQ(a.offset + 4, again.offset) << "delivered prefix not re-fetched";
+      EXPECT_EQ(a.length - 4, again.length);
+    }
+    if (again.id == b.id) {
+      found_b = true;
+      EXPECT_EQ(b.offset, again.offset);
+    }
+  }
+  EXPECT_TRUE(found_a);
+  EXPECT_TRUE(found_b);
+
+  // No attempt was consumed: the ranges still have the full retry budget.
+  for (unsigned i = 0; i < SmallLimits().retry_max; i++) {
+    EXPECT_EQ(Scheduler::Disposition::Retry,
+              scheduler.OnRangeResult(a.id, false, FailureClass::Retryable,
+                                      clock.now))
+        << "attempt " << i;
+    clock.now += 60;
+    Scheduler::RangeRef retry;
+    ASSERT_TRUE(scheduler.NextIssuable(clock.now, retry));
+    scheduler.MarkIssued(retry.id, clock.now);
+    ASSERT_EQ(a.id, retry.id);
+  }
+  EXPECT_EQ(Scheduler::Disposition::Exhausted,
+            scheduler.OnRangeResult(a.id, false, FailureClass::Retryable,
+                                    clock.now));
+}
+
+TEST(XrdHttpTpcRSchedulerTests, ResetAttemptsRestoresPatience) {
+  // Degraded exit (FR-14): a recovered source deserves the full retry
+  // budget, even for ranges that had exhausted theirs.
+  FakeClock clock;
+  auto limits = SmallLimits();
+  limits.retry_max = 1;
+  limits.max_inflight = 1;
+  Scheduler scheduler(limits, clock.fn(), 7);
+
+  Scheduler::RangeRef ref;
+  ASSERT_TRUE(scheduler.NextIssuable(clock.now, ref));
+  scheduler.MarkIssued(ref.id, clock.now);
+  ASSERT_EQ(Scheduler::Disposition::Retry,
+            scheduler.OnRangeResult(ref.id, false, FailureClass::Retryable,
+                                    clock.now));
+  clock.now += 60;
+  ASSERT_TRUE(scheduler.NextIssuable(clock.now, ref));
+  scheduler.MarkIssued(ref.id, clock.now);
+  ASSERT_EQ(Scheduler::Disposition::Exhausted,
+            scheduler.OnRangeResult(ref.id, false, FailureClass::Retryable,
+                                    clock.now));
+
+  scheduler.ResetAttempts();
+  ASSERT_TRUE(scheduler.NextIssuable(clock.now, ref));
+  scheduler.MarkIssued(ref.id, clock.now);
+  EXPECT_EQ(Scheduler::Disposition::Retry,
+            scheduler.OnRangeResult(ref.id, false, FailureClass::Retryable,
+                                    clock.now))
+      << "attempts must be reset after recovery";
+}
+
+TEST(XrdHttpTpcRSchedulerTests, ValidatorMidSessionComparison) {
+  // FR-14: definite changes are fatal; missing validators are not.
+  TPCR::SourceValidators base;
+  base.content_length = 1000;
+  base.etag = "\"abc\"";
+  base.last_modified = "Wed, 01 Jan 2025 00:00:00 GMT";
+  base.repr_digests["adler"] = ":c4Ki0g==:";
+  std::string reason;
+
+  TPCR::SourceValidators same = base;
+  EXPECT_TRUE(base.CompatibleMidSession(same, reason));
+
+  TPCR::SourceValidators shorter = base;
+  shorter.content_length = 999;
+  EXPECT_FALSE(base.CompatibleMidSession(shorter, reason));
+  EXPECT_NE(std::string::npos, reason.find("content length"));
+
+  TPCR::SourceValidators new_etag = base;
+  new_etag.etag = "\"def\"";
+  EXPECT_FALSE(base.CompatibleMidSession(new_etag, reason));
+
+  TPCR::SourceValidators new_mtime = base;
+  new_mtime.last_modified = "Thu, 02 Jan 2025 00:00:00 GMT";
+  EXPECT_FALSE(base.CompatibleMidSession(new_mtime, reason));
+
+  TPCR::SourceValidators new_digest = base;
+  new_digest.repr_digests["adler"] = ":zzzzzz==:";
+  EXPECT_FALSE(base.CompatibleMidSession(new_digest, reason));
+
+  // Missing on one side: not evidence of change (mid-session policy).
+  TPCR::SourceValidators sparse;
+  sparse.content_length = 1000;
+  EXPECT_TRUE(base.CompatibleMidSession(sparse, reason));
+}
+
 TEST(XrdHttpTpcRSchedulerTests, ClassificationTable) {
   // FR-12, table-driven.  Args: (curl code, http status, state error code).
   using S = TPCR::State;
