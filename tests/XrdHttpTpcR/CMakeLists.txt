@@ -18,12 +18,15 @@ target_link_libraries(xrdhttptpcr-unit-tests
 
 gtest_discover_tests(xrdhttptpcr-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
 
-# T-U6 slab pool and T-U3 config: pure TPCR code, no server libs needed.
+# T-U6 slab pool, T-U3 config, T-U9 scheduler FSM: pure TPCR code, no server
+# libs needed.
 add_executable(xrdhttptpcr-pool-unit-tests
         XrdHttpTpcRSlabPoolTests.cc
         XrdHttpTpcRConfigTests.cc
+        XrdHttpTpcRSchedulerTests.cc
         ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc
-        ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRConfig.cc)
+        ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRConfig.cc
+        ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSchedulerCore.cc)
 
 target_link_libraries(xrdhttptpcr-pool-unit-tests
         GTest::gtest

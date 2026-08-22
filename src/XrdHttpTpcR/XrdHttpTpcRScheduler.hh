@@ -1,0 +1,199 @@
+//------------------------------------------------------------------------------
+// This file is part of XrdHttpTpcR: the resumable HTTP-TPC handler.
+//
+// XRootD is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// XRootD is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with XRootD.  If not, see <http://www.gnu.org/licenses/>.
+//------------------------------------------------------------------------------
+
+#ifndef __XRD_TPCR_SCHEDULER_HH__
+#define __XRD_TPCR_SCHEDULER_HH__
+
+#include <cstddef>
+#include <cstdint>
+#include <ctime>
+#include <deque>
+#include <functional>
+#include <random>
+#include <string>
+#include <vector>
+
+#include <sys/types.h>
+
+namespace TPCR {
+
+// Failure classification per FR-12.  The mapping from (CURLcode, HTTP status,
+// State error code) lives in Classify() in the .cc; the scheduler itself only
+// consumes the class.
+enum class FailureClass {
+    Retryable,   // connect/reset/timeout/partial classes, HTTP 408/429/5xx-transient
+    Permanent,   // other 4xx, TLS failures, Range-not-honored, malformed responses
+    AuthRetry,   // 401/403 mid-session: one re-probe, then permanent (FR-12, WP-5)
+};
+
+// Pure range-scheduling state machine (WP-4; 02-ARCHITECTURE §6).
+//
+// Owns the range table over the active window
+// [committed, committed + window_bytes) -- never the whole file, so state
+// stays O(window/block), not O(file/block) (NFR-5).  Each range moves
+//
+//     PENDING -> ISSUED -> RECEIVING -> DONE
+//                   \__________________/
+//                    FAILED(retryable) -> PENDING (backoff, attempts++)
+//                    FAILED(permanent) -> transfer aborts
+//
+// The scheduler is deliberately curl-free and side-effect-free: the transfer
+// loop asks it what to do (NextIssuable, TimedOut, OnRangeResult) and reports
+// what happened.  The clock and the backoff jitter RNG are injected, so every
+// transition and timing rule is unit-testable (T-U9).
+//
+// Three counters, three meanings (SUB-3) -- never mix them:
+//   ScheduledOffset()  bytes handed to range requests so far ("scheduled")
+//   received bytes     live in the transfer loop / States ("received";
+//                      perf markers report these)
+//   committed offset   bytes durably in order in the Stream ("committed";
+//                      pushed in via AdvanceCommitted, drives the window)
+//
+// Retry model: bytes a failed range already delivered were validated and
+// accepted in order into the Stream, so a retry re-fetches only the
+// remainder -- the range's offset advances by the delivered count (recorded
+// via OnProgress).  Nothing is ever delivered twice, which is exactly the
+// invariant the Stream enforces (FR-10: every byte scheduled once).
+class Scheduler {
+public:
+    struct Limits {
+        off_t  start_offset = 0;      // W: first byte to fetch (0 = fresh)
+        off_t  content_length = 0;    // total file length (absolute)
+        size_t block_size = 16 * 1024 * 1024;   // FR-10: tpcr.blocksize
+        size_t window_bytes = 256 * 1024 * 1024;  // reorder/admission window
+        size_t max_inflight = 1;      // = streams (effective parallelism)
+        unsigned retry_max = 5;       // per-range attempt cap (FR-13)
+        int    range_timeout = 60;    // secs without per-range progress (WP-4)
+    };
+
+    // What the transfer loop should do about a completed/failed range.
+    enum class Disposition {
+        Done,        // range complete; nothing to do
+        Retry,       // re-queued with backoff; issue again when ready
+        Exhausted,   // per-range retries exhausted -> degraded state (WP-5)
+        Permanent,   // permanent failure -> abort the transfer promptly
+    };
+
+    struct RangeRef {
+        uint64_t id = 0;
+        off_t offset = 0;
+        size_t length = 0;
+    };
+
+    using Clock = std::function<time_t()>;
+
+    Scheduler(const Limits &limits, Clock clock, uint32_t jitter_seed);
+
+    // --- Issue side -------------------------------------------------------
+
+    // True if a PENDING range inside the window is ready (backoff expired)
+    // and the in-flight cap has room; fills `out`.  The caller reserves its
+    // buffer (slab) BEFORE MarkIssued -- if reservation fails, simply do not
+    // issue: the range stays PENDING and is offered again later (the
+    // never-fail backpressure path, NFR-1).
+    bool NextIssuable(time_t now, RangeRef &out);
+
+    // The range was handed to a connection.
+    void MarkIssued(uint64_t id, time_t now);
+
+    // Delivery progress: `delivered_total` is the byte count of this range's
+    // current issue accepted into the Stream so far.  Also moves
+    // ISSUED -> RECEIVING on first bytes and feeds the per-range stall
+    // detector.
+    void OnProgress(uint64_t id, size_t delivered_total, time_t now);
+
+    // The range's request finished.  `failure` is ignored when ok=true.
+    // On a retryable failure the delivered prefix is kept (see class
+    // comment) and the remainder re-queued with exponential backoff +
+    // jitter (FR-13).  AuthRetry counts against the same cap but is
+    // reported distinctly so the loop can trigger the WP-5 re-probe.
+    Disposition OnRangeResult(uint64_t id, bool ok, FailureClass failure,
+                              time_t now);
+
+    // Ranges whose current issue has shown no delivery progress for
+    // range_timeout seconds; the loop cancels their connections and calls
+    // OnRangeResult(id, false, Retryable).
+    std::vector<uint64_t> TimedOut(time_t now) const;
+
+    // --- Window / bookkeeping --------------------------------------------
+
+    // Slide the window: `committed` is Stream::CommittedOffset().  Completed
+    // ranges below it are dropped from the table and new PENDING ranges are
+    // created up to committed + window_bytes (exact, gap-free, overlap-free
+    // coverage of [start, content_length) -- asserted in debug builds).
+    void AdvanceCommitted(off_t committed);
+
+    // --- Completion / observability --------------------------------------
+
+    // FR-11 completion gate, scheduler side: every byte of
+    // [start, content_length) was scheduled and every range is DONE.
+    bool AllDone() const;
+
+    // First byte not yet covered by any created range ("scheduled" counter).
+    off_t ScheduledOffset() const {return m_next_offset;}
+
+    size_t InFlight() const {return m_inflight;}
+    size_t PendingCount() const;
+
+    // The earliest not-before among PENDING ranges (for loop wait sizing);
+    // 0 if a range is ready now or none is pending.
+    time_t NextNotBefore(time_t now) const;
+
+    // --- Static policy helpers (pure; unit-tested directly) ---------------
+
+    // FR-13: exponential backoff with jitter.  attempt is 1 for the first
+    // retry.  Returns seconds in [0.5 * 2^(a-1), 1.5 * 2^(a-1)] capped at
+    // BACKOFF_CAP_SECS, never negative.
+    static double BackoffDelay(unsigned attempt, std::mt19937 &rng);
+
+    static const unsigned BACKOFF_CAP_SECS = 30;
+
+private:
+    enum class RState { PENDING, ISSUED, RECEIVING, DONE };
+
+    struct Range {
+        uint64_t id;
+        off_t offset;        // current fetch start (advances on shrink-retry)
+        size_t length;       // current remaining length
+        RState state = RState::PENDING;
+        unsigned attempts = 0;       // failures so far
+        time_t not_before = 0;       // earliest re-issue (backoff)
+        time_t last_progress = 0;    // last delivery advance (stall detector)
+        size_t delivered = 0;        // bytes of current issue accepted
+    };
+
+    Range *Find(uint64_t id);
+    const Range *Find(uint64_t id) const;
+
+    // Extend the table while it fits the window; debug-checks coverage.
+    void FillWindow();
+    void CheckInvariants() const;
+
+    const Limits m_limits;
+    Clock m_clock;
+    std::mt19937 m_rng;
+
+    std::deque<Range> m_table;   // ordered by offset; O(window/block) entries
+    off_t m_next_offset;         // next byte to cover with a new range
+    off_t m_committed;           // latest committed offset from the Stream
+    size_t m_inflight = 0;       // ISSUED + RECEIVING
+    uint64_t m_next_id = 1;
+};
+
+} // namespace TPCR
+
+#endif // __XRD_TPCR_SCHEDULER_HH__
