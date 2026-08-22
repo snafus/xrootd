@@ -21,8 +21,9 @@ set(XrdHttpTPCR XrdHttpTPCR-${PLUGIN_VERSION})
 add_library(${XrdHttpTPCR} MODULE
   XrdHttpTpcRConfig.cc       XrdHttpTpcRConfig.hh
   XrdHttpTpcRConfigure.cc
-  XrdHttpTpcRMultistream.cc
   XrdHttpTpcPMarkManager.cc  XrdHttpTpcPMarkManager.hh
+  XrdHttpTpcRScheduler.cc    XrdHttpTpcRScheduler.hh
+  XrdHttpTpcRSchedulerCore.cc
   XrdHttpTpcRSlabPool.cc     XrdHttpTpcRSlabPool.hh
   XrdHttpTpcRState.cc        XrdHttpTpcRState.hh
   XrdHttpTpcRStream.cc       XrdHttpTpcRStream.hh

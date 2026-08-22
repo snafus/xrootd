@@ -161,6 +161,17 @@ public:
 
     void ResetAfterRequest();
 
+    // Installs the libcurl callbacks (header/write/read), the data
+    // pointers, and CURLOPT_PRIVATE for this state.  Public because
+    // TPCRHandler::ConfigureHandle re-runs it after curl_easy_reset as part
+    // of the single-place handle configuration (SUB-5).
+    bool InstallHandlers(CURL *curl);
+
+    // Re-binds the stored custom header list to the curl handle.  Required
+    // after curl_easy_reset (which wipes every option) as part of the
+    // ConfigureHandle sequence (SUB-5).
+    void RebindHeaders();
+
     CURL *GetHandle() const {return m_curl;}
 
     // Returns true if at least one byte of the response has been received,
@@ -211,8 +222,6 @@ private:
     // Production code must not gain setters for these, so the tests get a
     // single named friend instead.
     friend struct ::StateTestPeer;
-
-    bool InstallHandlers(CURL *curl);
 
     // Record a failure that happened while flushing or closing the local file.
     // Only the first failure is kept: the ones that follow are almost always a

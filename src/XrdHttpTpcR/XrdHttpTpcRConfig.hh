@@ -43,6 +43,19 @@ struct Config {
     // (NFR-1, BUG-10).  Default 16.
     size_t   streams_max = 16;                    // tpcr.streams.max
 
+    // --- WP-4 ---
+    // Reorder/admission window: the scheduler only creates ranges within
+    // [committed, committed + window], bounding per-transfer buffering and
+    // table size (NFR-1, NFR-5).  Default 256 MiB (the stock code's
+    // effective read-ahead of 16 x 16 MiB).
+    size_t   window_bytes = 256 * 1024 * 1024;    // tpcr.window.bytes
+    // Per-range attempt cap before the scheduler escalates (FR-13).
+    unsigned retry_max = 5;                       // tpcr.retry.max
+    // Seconds without delivery progress before an in-flight range is
+    // cancelled and re-queued (WP-4 per-range stall detector; sits between
+    // curl's low-speed limits and the global stall timeout -- SUB-11).
+    unsigned range_timeout = 60;                  // tpcr.range.timeout
+
     // Applies the streams cap to a client-requested value (NFR-1/BUG-10):
     // 0 means "default" (1), values above the cap clamp to it.  The caller
     // has already rejected negative/unparseable input.  Sets clamped so the

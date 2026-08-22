@@ -80,6 +80,10 @@ bool State::InstallHandlers(CURL *curl) {
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "xrootd-tpc/" XrdVERSION);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &State::HeaderCB);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, this);
+    // Handle -> State lookup for the scheduler loop.  Also the one handle
+    // option that is introspectable (CURLINFO_PRIVATE), which T-U8 uses to
+    // prove the reset/reinstall cycle actually restores options (SUB-5).
+    curl_easy_setopt(curl, CURLOPT_PRIVATE, this);
     if(m_is_transfer_state) {
         if (m_push) {
             curl_easy_setopt(curl, CURLOPT_UPLOAD, 1);
@@ -250,6 +254,12 @@ void State::ResetAfterRequest() {
     m_range_request = false;
     m_seen_content_range = false;
     m_body_validated = false;
+}
+
+void State::RebindHeaders() {
+    if (m_curl && m_headers) {
+        curl_easy_setopt(m_curl, CURLOPT_HTTPHEADER, m_headers);
+    }
 }
 
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)

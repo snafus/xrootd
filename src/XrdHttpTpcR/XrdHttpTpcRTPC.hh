@@ -27,6 +27,7 @@ typedef void CURL;
 
 namespace TPCR {
 class State;
+class Stream;
 
 enum LogMask {
     Debug   = 0x01,
@@ -153,16 +154,33 @@ private:
         off_t bytes_transferred);
 
     // Perform the libcurl transfer, periodically sending back chunked updates.
+    // PUSH mode only (CON-6): every pull runs through the range scheduler.
     int RunCurlWithUpdates(CURL *curl, XrdHttpExtReq &req, TPCR::State &state,
                            TPCLogRecord &rec);
 
-    // Experimental multi-stream version of RunCurlWithUpdates
-    int RunCurlWithStreams(XrdHttpExtReq &req, TPCR::State &state,
-                           size_t streams, TPCLogRecord &rec);
-    int RunCurlWithStreamsImpl(XrdHttpExtReq &req, TPCR::State &state,
-                           size_t streams, std::vector<TPCR::State*> &streams_handles,
-                           std::vector<ManagedCurlHandle> &curl_handles,
-                           TPCLogRecord &rec);
+    // Applies every option a transfer handle needs, in one place (SUB-5):
+    // called at handle creation and after every curl_easy_reset.  Returns
+    // false if the CA store could not be configured (fatal for the
+    // transfer).  CURLOPT_RANGE is deliberately excluded: each issue sets
+    // it explicitly via State::SetTransferParameters.
+    bool ConfigureHandle(CURL *curl, TPCR::State &state, TPCLogRecord &rec,
+                         const std::string &resource_url,
+                         const std::string &interface_ip);
+
+    // The WP-4 range-scheduler transfer loop: drives ALL pull transfers,
+    // including streams=1 (FR-7).  Defined in XrdHttpTpcRScheduler.cc.
+    int RunPullScheduler(XrdHttpExtReq &req, TPCR::State &state,
+                         TPCR::Stream &stream, size_t streams,
+                         const std::string &resource_url,
+                         const std::string &interface_ip,
+                         TPCLogRecord &rec);
+    int RunPullSchedulerImpl(XrdHttpExtReq &req, TPCR::State &state,
+                             TPCR::Stream &stream, size_t streams,
+                             const std::string &resource_url,
+                             const std::string &interface_ip,
+                             std::vector<TPCR::State*> &states,
+                             std::vector<ManagedCurlHandle> &owned_handles,
+                             TPCLogRecord &rec);
 
     int ProcessPushReq(const std::string & resource, XrdHttpExtReq &req);
     int ProcessPullReq(const std::string &resource, XrdHttpExtReq &req);
@@ -214,10 +232,9 @@ private:
     XrdSfsFileSystem *m_sfs;
     std::shared_ptr<XrdTlsTempCA> m_ca_file;
 
-    // 16 blocks in flight at 16 MB each, meaning that there will be up to 256MB
-    // in flight; this is equal to the bandwidth delay product of a 200ms transcontinental
-    // connection at 10Gbps.
-    static const int m_pipelining_multiplier = 16;
+    // BUG-8: the stock streams x 16 handle multiplier served an HTTP/1.1
+    // pipelining mechanism libcurl removed in 7.62; read-ahead is now the
+    // scheduler's reorder window (tpcr.window.bytes).
 
     bool usingEC; // indicate if XrdEC is used
 

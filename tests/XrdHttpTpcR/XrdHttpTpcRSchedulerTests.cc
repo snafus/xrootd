@@ -13,12 +13,16 @@
 // checked deterministically -- no sleeps, no curl.
 
 #include "XrdHttpTpcR/XrdHttpTpcRScheduler.hh"
+#include "XrdHttpTpcR/XrdHttpTpcRState.hh"
 
 #include <gtest/gtest.h>
+
+#include <curl/curl.h>
 
 #include <set>
 #include <vector>
 
+using TPCR::ClassifyCurlFailure;
 using TPCR::FailureClass;
 using TPCR::Scheduler;
 
@@ -325,6 +329,61 @@ TEST(XrdHttpTpcRSchedulerTests, ZeroLengthFileIsImmediatelyDone) {
   Scheduler::RangeRef ref;
   EXPECT_FALSE(scheduler.NextIssuable(clock.now, ref));
   EXPECT_TRUE(scheduler.AllDone());
+}
+
+TEST(XrdHttpTpcRSchedulerTests, ClassificationTable) {
+  // FR-12, table-driven.  Args: (curl code, http status, state error code).
+  using S = TPCR::State;
+  const int no_state_err = S::errNone;
+
+  // Recorded validation / local-storage errors dominate everything.
+  EXPECT_EQ(FailureClass::Permanent,
+            ClassifyCurlFailure(CURLE_WRITE_ERROR, 206, S::errRangeNotHonored));
+  EXPECT_EQ(FailureClass::Permanent,
+            ClassifyCurlFailure(CURLE_OK, 206, S::errRangeMismatch));
+  EXPECT_EQ(FailureClass::Permanent,
+            ClassifyCurlFailure(CURLE_OK, 206, S::errLengthMismatch));
+  EXPECT_EQ(FailureClass::Permanent,
+            ClassifyCurlFailure(CURLE_WRITE_ERROR, 206, S::errWrite));
+
+  // HTTP statuses: transient server-side conditions retry...
+  for (int status : {408, 429, 500, 502, 503, 504}) {
+    EXPECT_EQ(FailureClass::Retryable,
+              ClassifyCurlFailure(CURLE_OK, status, no_state_err))
+        << "status " << status;
+  }
+  // ...auth flaps get the one-shot re-probe class...
+  for (int status : {401, 403}) {
+    EXPECT_EQ(FailureClass::AuthRetry,
+              ClassifyCurlFailure(CURLE_OK, status, no_state_err))
+        << "status " << status;
+  }
+  // ...and the rest of 4xx/5xx is permanent.
+  for (int status : {400, 404, 410, 412, 501, 505}) {
+    EXPECT_EQ(FailureClass::Permanent,
+              ClassifyCurlFailure(CURLE_OK, status, no_state_err))
+        << "status " << status;
+  }
+
+  // Transport-level: connectivity blips retry...
+  for (int code : {CURLE_COULDNT_CONNECT, CURLE_COULDNT_RESOLVE_HOST,
+                   CURLE_OPERATION_TIMEDOUT, CURLE_PARTIAL_FILE,
+                   CURLE_GOT_NOTHING, CURLE_SEND_ERROR, CURLE_RECV_ERROR}) {
+    EXPECT_EQ(FailureClass::Retryable,
+              ClassifyCurlFailure(code, 0, no_state_err)) << "curl " << code;
+  }
+  // ...TLS problems are configuration/security failures, permanent.
+  for (int code : {CURLE_SSL_CONNECT_ERROR, CURLE_PEER_FAILED_VERIFICATION,
+                   CURLE_SSL_CERTPROBLEM, CURLE_SSL_CACERT_BADFILE}) {
+    EXPECT_EQ(FailureClass::Permanent,
+              ClassifyCurlFailure(code, 0, no_state_err)) << "curl " << code;
+  }
+  // Unattributed write-callback aborts are permanent.
+  EXPECT_EQ(FailureClass::Permanent,
+            ClassifyCurlFailure(CURLE_WRITE_ERROR, 0, no_state_err));
+  // Unknown transport errors default to retryable (bounded by the cap).
+  EXPECT_EQ(FailureClass::Retryable,
+            ClassifyCurlFailure(CURLE_OBSOLETE20, 0, no_state_err));
 }
 
 TEST(XrdHttpTpcRSchedulerTests, NextNotBeforeReportsBackoffHorizon) {

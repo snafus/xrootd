@@ -150,6 +150,42 @@ bool Config::Set(const std::string &directive, const std::string &value,
         streams_max = static_cast<size_t>(count);
         return true;
     }
+    if (directive == "tpcr.window.bytes") {
+        uint64_t size;
+        // Floor of one block-size upper bound (1 GiB floor check is not
+        // possible here since blocksize may be set later; enforced to be at
+        // least 1 MiB, sanity-capped at 64 GiB).
+        if (!ParseSize(value, size) || size < (1ULL << 20) || size > (64ULL << 30)) {
+            bad << directive << " value '" << value
+                << "' is not a valid size in [1m, 64g]";
+            err = bad.str();
+            return false;
+        }
+        window_bytes = static_cast<size_t>(size);
+        return true;
+    }
+    if (directive == "tpcr.retry.max") {
+        uint64_t count;
+        if (!ParseUnsigned(value, count) || count > 100) {
+            bad << directive << " value '" << value
+                << "' is not a valid retry count in [0, 100]";
+            err = bad.str();
+            return false;
+        }
+        retry_max = static_cast<unsigned>(count);
+        return true;
+    }
+    if (directive == "tpcr.range.timeout") {
+        uint64_t seconds;
+        if (!ParseDuration(value, seconds) || seconds < 5 || seconds > 3600) {
+            bad << directive << " value '" << value
+                << "' is not a valid duration in [5s, 1h]";
+            err = bad.str();
+            return false;
+        }
+        range_timeout = static_cast<unsigned>(seconds);
+        return true;
+    }
     // FR-30: unknown tpcr.* directives are fatal at init -- a typo silently
     // falling back to a default is exactly the failure mode this prevents.
     bad << "unknown tpcr directive '" << directive << "'";

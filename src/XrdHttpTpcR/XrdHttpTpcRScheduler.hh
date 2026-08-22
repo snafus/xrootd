@@ -32,13 +32,25 @@
 namespace TPCR {
 
 // Failure classification per FR-12.  The mapping from (CURLcode, HTTP status,
-// State error code) lives in Classify() in the .cc; the scheduler itself only
+// State error code) lives in ClassifyCurlFailure(); the scheduler itself only
 // consumes the class.
 enum class FailureClass {
     Retryable,   // connect/reset/timeout/partial classes, HTTP 408/429/5xx-transient
     Permanent,   // other 4xx, TLS failures, Range-not-honored, malformed responses
     AuthRetry,   // 401/403 mid-session: one re-probe, then permanent (FR-12, WP-5)
 };
+
+// FR-12 classification of a failed range request.  `curl_code` is the
+// CURLcode as an int (kept as int so this header stays curl-free),
+// `http_status` the response status (or <= 0 if none), `state_error_code`
+// the TPCR::State ErrorCode recorded by the callbacks (errNone if none).
+// Precedence: recorded validation/local-write errors, then HTTP status,
+// then the curl transport code.  Unknown transport errors default to
+// Retryable -- the per-range cap and the recovery budget bound the cost,
+// and prematurely declaring a transient fault permanent forfeits the
+// transfer (priority order: reliability over efficiency).
+FailureClass ClassifyCurlFailure(int curl_code, int http_status,
+                                 int state_error_code);
 
 // Pure range-scheduling state machine (WP-4; 02-ARCHITECTURE §6).
 //

@@ -21,11 +21,83 @@
 // rule directly.
 
 #include "XrdHttpTpcRScheduler.hh"
+#include "XrdHttpTpcRState.hh"
+
+#include <curl/curl.h>   // constants only; no link dependency
 
 #include <algorithm>
 #include <cassert>
 
 using namespace TPCR;
+
+FailureClass TPCR::ClassifyCurlFailure(int curl_code, int http_status,
+                                       int state_error_code)
+{
+    // 1. Errors our own callbacks recorded take precedence: they describe
+    //    exactly what went wrong regardless of how libcurl surfaced it
+    //    (usually as CURLE_WRITE_ERROR after the callback aborted).
+    switch (state_error_code) {
+        case State::errRangeNotHonored:
+        case State::errRangeMismatch:
+        case State::errLengthMismatch:
+            // The source demonstrably misimplements ranged GETs (FR-8).
+            return FailureClass::Permanent;
+        case State::errWrite:
+        case State::errFlush:
+        case State::errClose:
+            // Local storage failure: retrying the network cannot help.
+            return FailureClass::Permanent;
+        default:
+            break;
+    }
+
+    // 2. HTTP status classes (FR-12).
+    if (http_status >= 400) {
+        switch (http_status) {
+            case 408: case 429:
+            case 500: case 502: case 503: case 504:
+                return FailureClass::Retryable;
+            case 401: case 403:
+                // Mid-session auth flap: worth one full re-probe (WP-5),
+                // then permanent -- the session cannot refresh its token.
+                return FailureClass::AuthRetry;
+            default:
+                return FailureClass::Permanent;
+        }
+    }
+
+    // 3. Transport-level CURLcodes (FR-12).
+    switch (curl_code) {
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_RESOLVE_PROXY:
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_PARTIAL_FILE:
+        case CURLE_GOT_NOTHING:
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:
+            return FailureClass::Retryable;
+        case CURLE_SSL_CONNECT_ERROR:
+        case CURLE_PEER_FAILED_VERIFICATION:
+        case CURLE_SSL_CERTPROBLEM:
+        case CURLE_SSL_CIPHER:
+        case CURLE_SSL_CACERT_BADFILE:
+        case CURLE_SSL_ISSUER_ERROR:
+        case CURLE_USE_SSL_FAILED:
+            // TLS handshake/verification problems are configuration or
+            // security failures, not blips (FR-12).
+            return FailureClass::Permanent;
+        case CURLE_WRITE_ERROR:
+            // Our write callback aborted without recording a reason: with
+            // the recorded-error cases handled above, this is the >1 KiB
+            // error-body path or an internal inconsistency -- permanent.
+            return FailureClass::Permanent;
+        default:
+            // Unknown transport error: default to retryable (bounded by the
+            // per-range cap and recovery budget) -- see the declaration.
+            return FailureClass::Retryable;
+    }
+}
 
 Scheduler::Scheduler(const Limits &limits, Clock clock, uint32_t jitter_seed)
     : m_limits(limits),

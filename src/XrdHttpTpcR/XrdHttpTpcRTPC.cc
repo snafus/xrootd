@@ -1194,6 +1194,9 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
     // The above requires the server to utilize the same IP, that was used to
     // start the TPC, for the resolution of the given TPC instead of
     // using any of the IPs available.
+    // Kept as a named variable: the scheduler loop applies the same
+    // interface pin to every extra transfer handle it creates (SUB-5).
+    std::string iface_ip;
     if (m_fixed_route) {
         char ip[64];
         char ipType = 0;
@@ -1208,6 +1211,7 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
         } else {
             logTransferEvent(LogMask::Info, rec, "LOCAL IP", ip);
             curl_easy_setopt(curl, CURLOPT_INTERFACE, ip);
+            iface_ip = ip;
         }
     }
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
@@ -1328,20 +1332,17 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
         return resp_result;
     }
     // Fresh pull transfers start at offset 0; the resume path (WP-8) seeds
-    // the journal watermark W here instead.  Entry capacity matches the
-    // request block size so one range fills one entry in the common case;
-    // entries themselves are created on demand (WP-1), no longer a fixed
-    // streams-derived pool.
-    Stream stream(std::move(fh), 0, streams > 1 ? m_block_size : m_small_block_size, m_log);
+    // the journal watermark W here instead.  Entry capacity equals the
+    // scheduler's range size (tpcr.blocksize = slab size), so one range
+    // fills one entry in the common case.
+    Stream stream(std::move(fh), 0, m_tpcr.block_size, m_log);
     State state(0, stream, curl, false, req.tpcForwardCreds);
     state.SetupHeaders(req);
     state.SetContentLength(sourceFileContentLength);
 
-    if (streams > 1) {
-        return RunCurlWithStreams(req, state, streams, rec);
-    } else {
-        return RunCurlWithUpdates(curl, req, state, rec);
-    }
+    // FR-7: every pull -- streams=1 included -- runs through the range
+    // scheduler.  There is exactly one pull code path.
+    return RunPullScheduler(req, state, stream, streams, resource, iface_ip, rec);
 }
 
 /******************************************************************************/

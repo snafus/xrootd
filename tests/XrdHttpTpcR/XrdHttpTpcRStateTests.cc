@@ -153,6 +153,33 @@ TEST_F(XrdHttpTpcRStateTests, HeaderParserRejectsGarbageContentLength) {
   EXPECT_EQ(StateTestPeer::Header(state, "Content-Length: banana\r\n"), 0);
 }
 
+TEST_F(XrdHttpTpcRStateTests, InstallHandlersRestoresOptionsAfterReset) {
+  // T-U8 (SUB-5): curl_easy_reset wipes EVERY option; the ConfigureHandle
+  // sequence (of which InstallHandlers + RebindHeaders is the State-owned
+  // part) must restore them.  CURLOPT_PRIVATE is the one introspectable
+  // option, so it stands proxy for the set here; the full behavioral check
+  // (callbacks actually firing after a reset) runs in the integration
+  // fault-injection tests, where handles are reset by real retries.
+  // Stale CURLOPT_RANGE is impossible structurally: the only place a range
+  // is set is SetTransferParameters, called at every single issue.
+  TPCR::State state(m_curl, false);
+  char *priv = nullptr;
+  ASSERT_EQ(CURLE_OK, curl_easy_getinfo(m_curl, CURLINFO_PRIVATE, &priv));
+  EXPECT_EQ(reinterpret_cast<TPCR::State *>(priv), &state)
+      << "InstallHandlers must set CURLOPT_PRIVATE";
+
+  curl_easy_reset(m_curl);
+  priv = nullptr;
+  ASSERT_EQ(CURLE_OK, curl_easy_getinfo(m_curl, CURLINFO_PRIVATE, &priv));
+  EXPECT_EQ(nullptr, priv) << "reset must have wiped the options";
+
+  state.InstallHandlers(m_curl);
+  state.RebindHeaders();
+  ASSERT_EQ(CURLE_OK, curl_easy_getinfo(m_curl, CURLINFO_PRIVATE, &priv));
+  EXPECT_EQ(reinterpret_cast<TPCR::State *>(priv), &state)
+      << "re-install must restore the options";
+}
+
 // ---------------------------------------------------------------------------
 // T-U7: range-response validation (FR-8, FR-9; BUG-2, BUG-3).
 //
