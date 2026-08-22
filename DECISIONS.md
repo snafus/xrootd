@@ -78,6 +78,24 @@ uses `http.exthandler xrdtpcr +notls …`; the WP-13 admin guide must document t
 plain-HTTP deployments (production WLCG deployments use TLS and are unaffected).
 Touches: CON-2 documentation.
 
+**2026-08-23 / WP-6 — Backend semantics matrix results (M2 gate).**
+Testbed: Ubuntu 22.04, ext4, POSIX OSS via `oss.localroot`.  Results
+(tests/XrdHttpTpcR/integration/backend_matrix.sh, all passing):
+- (a) fsync-then-kill-9: data present after process death — the API ordering the
+  checkpoint (SUB-1) relies on holds.  True power-loss durability is a hardware test;
+  recorded as out of scope for this environment (the ordering argument, not the medium,
+  is what WP-7 depends on).
+- (b) reopen `O_CREAT|O_WRONLY` without TRUNC + write at W: prefix intact, write lands —
+  the FR-20 resume open works on POSIX.
+- (c) temp→write→fsync→close→rename journal update: 300 randomized kill-9 interruptions,
+  zero torn journals observed — XRD-5's sequence holds on ext4.
+- (d) POSC (XRD-1) empirically confirmed: under `ofs.persist auto hold 3` a crashed
+  transfer's partial is unlinked at restart after the hold window, and the TPCR hasPOSC
+  startup warning fires; under default persistence the partial survives.
+**Supported-for-resume backend list as of M2: POSIX OSS.**  EC (XrdEC), CephFS, and
+proxy/PSS deployments are *unsupported until tested* (XRD-4) — see QUESTIONS.md Q-3.
+Touches: FR-18, FR-20, CON-3, XRD-1, XRD-4, XRD-5.
+
 **2026-08-22 / WP-0 — Verbatim ports keep their identifiers.**
 `XrdHttpTpcPMarkManager.*` and `XrdHttpTpcUtils.*` are copied with their original file
 names, class names and namespaces (`XrdHttpTpc::PMarkManager`, `XrdHttpTpcUtils`), per

@@ -9,6 +9,7 @@
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucPinPath.hh"
+#include "XrdSfs/XrdSfsFlags.hh"
 #include "XrdSfs/XrdSfsInterface.hh"
 #include "XrdHttp/XrdHttpProtocol.hh"
 #include "XrdOuc/XrdOucTUtils.hh"
@@ -231,6 +232,21 @@ bool TPCRHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
     if ((sfs_raw_ptr = myEnv->GetPtr("XrdSfsFileSystem*"))) {
         m_sfs = static_cast<XrdSfsFileSystem*>(sfs_raw_ptr);
         m_log.Emsg("Config", "Using filesystem object from the framework.");
+        // XRD-1: POSC-mode creates are auto-unlinked on crash/failed-close,
+        // which deletes exactly the partials cross-session resume (WP-8)
+        // exists to save.  The feature bit cannot distinguish `ofs.persist
+        // auto` (every create POSC'd -- fatal for resume) from manual mode
+        // (only opt-in creates -- TPCR never opts in), so warn loudly and
+        // point the admin at the requirement.
+        if (m_sfs->Features() & XrdSfs::hasPOSC) {
+            m_log.Emsg("Config",
+                "WARNING: persist-on-successful-close (POSC) is enabled on this "
+                "server. POSC-mode creates are automatically deleted after a "
+                "crash or failed close, which defeats TPCR cross-session resume. "
+                "If 'ofs.persist auto' is configured, resume-enabled TPC paths "
+                "will never find their partials; use manual/off persistence for "
+                "TPC-writable paths. (TPCR itself never requests POSC.)");
+        }
         return true;
     } else {
         m_log.Emsg("Config", "No filesystem object available to HTTP-TPC subsystem.  Internal error.");

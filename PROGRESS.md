@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** M1 COMPLETE (tag tpcr-m1). Next: WP-6 — backend semantics test matrix (M2 gate).
+**Current focus:** WP-7 — journal + checkpointing (record format, atomic update, lease, checkpoint engine).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
@@ -10,7 +10,7 @@
 | WP-3 Response validation | done | fdaac1ffc | 55/55 | Body-start + completion validation; expected/reported split; permanent-class error codes ready for FR-12. |
 | WP-4 Range scheduler | done | 2f8bf506d, b8c05c884, 224ecbd27, ad79aba00 | 73/73 unit + 18/18 integration | Pure FSM + curl loop; Multistream deleted; slab wiring done; T-P1 baseline: no regression, ~3x at 4 streams (loopback). |
 | WP-5 Degraded state | done | e936dcc1b | 76/76 unit + 29/29 integration; trace_check m1 clean | Full Tier-1 ladder; sticky tpc_status stock bug found+fixed; auth one-shot re-probe; push smoke added. |
-| WP-6 Backend semantics matrix | todo | | | |
+| WP-6 Backend semantics matrix | done | (this commit) | backend_matrix.sh 6/6 | POSIX leg green incl. empirical XRD-1 POSC unlink + hasPOSC warning. EC/Ceph/PSS unsupported-until-tested (Q-3). |
 | WP-7 Journal + checkpointing | todo | | | |
 | WP-8 Resume open path | todo | | | |
 | WP-9 Capability + client-visible | todo | | | |
