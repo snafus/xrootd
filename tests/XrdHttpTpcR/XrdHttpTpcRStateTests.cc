@@ -10,26 +10,38 @@
 // Plus header-parser behavior on malformed inputs, which both fixes depend on.
 
 #include "XrdHttpTpcR/XrdHttpTpcRState.hh"
+#include "XrdHttpTpcR/XrdHttpTpcRStream.hh"
+#include "XrdHttpTpcRMockSfsFile.hh"
+
+#include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysLogger.hh"
 
 #include <gtest/gtest.h>
 
 #include <curl/curl.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 // Named friend of TPCR::State (see XrdHttpTpcRState.hh): lets the tests feed
-// raw header lines through the private parser and read private fields without
-// production-visible setters.
+// raw header lines through the private parser, deliver body bytes through the
+// libcurl write callback, and read private fields without production-visible
+// setters.
 struct StateTestPeer {
   static int Header(TPCR::State &state, const std::string &line) {
     return state.Header(line);
   }
+  // Delivers body bytes exactly as libcurl would (through WriteCB).
+  static size_t WriteBody(TPCR::State &state, const std::string &body) {
+    // libcurl hands a non-const buffer; the callback never modifies it.
+    return TPCR::State::WriteCB(const_cast<char *>(body.data()), 1,
+                                body.size(), &state);
+  }
   static off_t StartOffset(const TPCR::State &state) {
     return state.m_start_offset;
-  }
-  static off_t ContentLength(const TPCR::State &state) {
-    return state.m_content_length;
   }
 };
 
@@ -100,20 +112,27 @@ TEST_F(XrdHttpTpcRStateTests, ResetAfterRequestClearsErrorState) {
 
 TEST_F(XrdHttpTpcRStateTests, ResetAfterRequestClearsResponseFields) {
   // The rest of the ResetAfterRequest checklist: response-derived fields must
-  // return to their constructed values.
+  // return to their constructed values.  (The transfer-level content length
+  // set by the handler is NOT per-request state and survives -- see the
+  // checklist comment in XrdHttpTpcRState.cc.)
   TPCR::State state(m_curl, false);
+  state.SetContentLength(999);
   FeedResponse(state, {"Content-Length: 12345\r\n",
                        "Repr-Digest: adler=:c4Ki0g==:\r\n"});
   ASSERT_EQ(state.GetStatusCode(), 206);
-  ASSERT_EQ(state.GetContentLength(), 12345);
+  ASSERT_EQ(state.GetReportedLength(), 12345);
+  ASSERT_EQ(state.GetContentLength(), 999)
+      << "response Content-Length must not overwrite the transfer's length (BUG-3)";
   ASSERT_FALSE(state.GetReprDigest().empty());
 
   state.ResetAfterRequest();
 
   EXPECT_EQ(state.GetStatusCode(), -1);
-  EXPECT_EQ(state.GetContentLength(), -1);
+  EXPECT_EQ(state.GetReportedLength(), -1);
+  EXPECT_EQ(state.GetContentLength(), 999) << "transfer-level, not per-request";
   EXPECT_TRUE(state.GetReprDigest().empty());
   EXPECT_EQ(state.BytesTransferred(), 0);
+  EXPECT_FALSE(state.RangeRequested());
 }
 
 TEST_F(XrdHttpTpcRStateTests, HeaderParserRejectsMalformedInput) {
@@ -132,6 +151,173 @@ TEST_F(XrdHttpTpcRStateTests, HeaderParserRejectsGarbageContentLength) {
   TPCR::State state(m_curl, false);
   ASSERT_GT(StateTestPeer::Header(state, "HTTP/1.1 200 OK\r\n"), 0);
   EXPECT_EQ(StateTestPeer::Header(state, "Content-Length: banana\r\n"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// T-U7: range-response validation (FR-8, FR-9; BUG-2, BUG-3).
+//
+// These drive a real transfer State (with a memory-backed Stream) through
+// the same callbacks libcurl uses, for each malformed-source scenario.
+// ---------------------------------------------------------------------------
+
+class XrdHttpTpcRStateRangeTests : public XrdHttpTpcRStateTests {
+protected:
+  void SetUp() override {
+    XrdHttpTpcRStateTests::SetUp();
+    m_logger = std::make_unique<XrdSysLogger>(STDERR_FILENO, 0);
+    m_log = std::make_unique<XrdSysError>(m_logger.get(), "StateRangeTest");
+    auto file = std::make_unique<MemorySfsFile>();
+    m_file = file.get();
+    m_stream = std::make_unique<TPCR::Stream>(std::move(file), 0, 64, *m_log);
+  }
+
+  // A transfer state with a pending ranged request [offset, offset+length).
+  std::unique_ptr<TPCR::State> RangedState(off_t offset, size_t length) {
+    auto state = std::make_unique<TPCR::State>(0, *m_stream, m_curl,
+                                               /*push=*/false,
+                                               /*tpcForwardCreds=*/false);
+    state->SetTransferParameters(offset, length);
+    return state;
+  }
+
+  // Feeds a status line + headers, mimicking a source's range response.
+  static void Respond(TPCR::State &state, const std::string &status_line,
+                      const std::vector<std::string> &headers) {
+    ASSERT_GT(StateTestPeer::Header(state, status_line), 0);
+    for (const auto &header : headers) {
+      ASSERT_GT(StateTestPeer::Header(state, header), 0);
+    }
+  }
+
+  std::unique_ptr<XrdSysLogger> m_logger;
+  std::unique_ptr<XrdSysError> m_log;
+  MemorySfsFile *m_file = nullptr;
+  std::unique_ptr<TPCR::Stream> m_stream;
+};
+
+TEST_F(XrdHttpTpcRStateRangeTests, Status200ToRangedRequestIsRejected) {
+  // BUG-2's worst case: the source ignores Range and streams the whole file.
+  // Not one body byte may reach the stream (FR-8).
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 200 OK\r\n", {"Content-Length: 4096\r\n"});
+
+  EXPECT_EQ(0u, StateTestPeer::WriteBody(*state, "garbagegarbage"));
+  EXPECT_EQ(TPCR::State::errRangeNotHonored, state->GetErrorCode());
+  EXPECT_NE(std::string::npos,
+            state->GetErrorMessage().find("does not honor Range requests"));
+  EXPECT_TRUE(m_file->Writes().empty()) << "no byte may reach the file";
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, MissingContentRangeIsRejected) {
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 206 Partial Content\r\n", {"Content-Length: 8\r\n"});
+
+  EXPECT_EQ(0u, StateTestPeer::WriteBody(*state, "abcdefgh"));
+  EXPECT_EQ(TPCR::State::errRangeMismatch, state->GetErrorCode());
+  EXPECT_NE(std::string::npos,
+            state->GetErrorMessage().find("no Content-Range"));
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, MismatchedContentRangeIsRejected) {
+  // The source answered a *different* range: writing it at our start offset
+  // would corrupt the file (FR-8: exact echo required).
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 206 Partial Content\r\n",
+          {"Content-Range: bytes 8-15/4096\r\n", "Content-Length: 8\r\n"});
+
+  EXPECT_EQ(0u, StateTestPeer::WriteBody(*state, "abcdefgh"));
+  EXPECT_EQ(TPCR::State::errRangeMismatch, state->GetErrorCode());
+  EXPECT_NE(std::string::npos,
+            state->GetErrorMessage().find("does not echo the requested range"));
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, ContentLengthMismatchIsRejected) {
+  // FR-9 / BUG-3: the response's Content-Length must be validated against
+  // the expectation -- never adopted as the expectation.
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 206 Partial Content\r\n",
+          {"Content-Range: bytes 0-7/4096\r\n", "Content-Length: 4096\r\n"});
+
+  EXPECT_EQ(0u, StateTestPeer::WriteBody(*state, "abcdefgh"));
+  EXPECT_EQ(TPCR::State::errLengthMismatch, state->GetErrorCode());
+  EXPECT_NE(std::string::npos,
+            state->GetErrorMessage().find("does not match the requested range length"));
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, MalformedContentRangeFailsHeaderParse) {
+  auto state = RangedState(0, 8);
+  ASSERT_GT(StateTestPeer::Header(*state, "HTTP/1.1 206 Partial Content\r\n"), 0);
+  // Returning 0 from the header callback aborts the request in libcurl.
+  EXPECT_EQ(StateTestPeer::Header(*state, "Content-Range: bytes x-y/z\r\n"), 0);
+  EXPECT_EQ(StateTestPeer::Header(*state, "Content-Range: bytes 5-2/10\r\n"), 0)
+      << "end below start";
+  EXPECT_EQ(StateTestPeer::Header(*state, "Content-Range: bytes 0-7\r\n"), 0)
+      << "missing complete-length part";
+  EXPECT_EQ(StateTestPeer::Header(*state, "Content-Range: elephants 0-7/8\r\n"), 0)
+      << "unknown unit";
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, ValidRangeResponseIsAcceptedAndCompletes) {
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 206 Partial Content\r\n",
+          {"Content-Range: bytes 0-7/4096\r\n", "Content-Length: 8\r\n"});
+
+  EXPECT_EQ(8u, StateTestPeer::WriteBody(*state, "abcdefgh"));
+  EXPECT_TRUE(state->ValidateRangeResponse(true))
+      << state->GetErrorMessage();
+  EXPECT_EQ(TPCR::State::errNone, state->GetErrorCode());
+  // The bytes sit in the reorder buffer until flushed (entry not full).
+  EXPECT_EQ(0, m_stream->Flush());
+  ASSERT_EQ(1u, m_file->Writes().size());
+  EXPECT_EQ(0, m_file->Writes()[0].first);
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, ContentRangeWithWildcardLengthIsAccepted) {
+  // "bytes 0-7/*" is valid per RFC 9110; the total is not our yardstick.
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 206 Partial Content\r\n",
+          {"Content-Range: bytes 0-7/*\r\n"});
+  EXPECT_EQ(8u, StateTestPeer::WriteBody(*state, "abcdefgh"));
+  EXPECT_TRUE(state->ValidateRangeResponse(true)) << state->GetErrorMessage();
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, OverDeliveryIsRejectedMidBody) {
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 206 Partial Content\r\n",
+          {"Content-Range: bytes 0-7/4096\r\n"});
+
+  // 12 bytes against an 8-byte range: the excess must never reach the file.
+  // The callback signals abort to libcurl by returning anything other than
+  // the byte count it was handed.
+  EXPECT_NE(12u, StateTestPeer::WriteBody(*state, "abcdefghijkl"));
+  EXPECT_EQ(TPCR::State::errLengthMismatch, state->GetErrorCode());
+  EXPECT_NE(std::string::npos,
+            state->GetErrorMessage().find("more bytes than the requested range"));
+  EXPECT_TRUE(m_file->Writes().empty());
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, UnderDeliveryIsCaughtAtCompletion) {
+  auto state = RangedState(0, 8);
+  Respond(*state, "HTTP/1.1 206 Partial Content\r\n",
+          {"Content-Range: bytes 0-7/4096\r\n"});
+
+  EXPECT_EQ(4u, StateTestPeer::WriteBody(*state, "abcd"));
+  // Body-start validation passed; the completion check must catch the gap
+  // (this is what FinishCurlXfer runs when libcurl reports the request done).
+  EXPECT_FALSE(state->ValidateRangeResponse(true));
+  EXPECT_EQ(TPCR::State::errLengthMismatch, state->GetErrorCode());
+  EXPECT_NE(std::string::npos,
+            state->GetErrorMessage().find("different byte count than requested"));
+}
+
+TEST_F(XrdHttpTpcRStateRangeTests, NonRangedRequestAccepts200) {
+  // The transitional single-stream pull is a whole-object GET: a 200 with
+  // no Content-Range is the correct response there.
+  auto state = std::make_unique<TPCR::State>(0, *m_stream, m_curl, false, false);
+  Respond(*state, "HTTP/1.1 200 OK\r\n", {"Content-Length: 8\r\n"});
+  EXPECT_EQ(8u, StateTestPeer::WriteBody(*state, "abcdefgh"));
+  EXPECT_TRUE(state->ValidateRangeResponse(true));
+  EXPECT_EQ(TPCR::State::errNone, state->GetErrorCode());
 }
 
 } // namespace

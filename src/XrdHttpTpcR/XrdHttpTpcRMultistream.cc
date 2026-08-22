@@ -63,7 +63,7 @@ public:
 
     CURLM *Get() const {return m_handle;}
 
-    void FinishCurlXfer(CURL *curl) {
+    void FinishCurlXfer(CURL *curl, CURLcode xfer_result) {
         CURLMcode mres = curl_multi_remove_handle(m_handle, curl);
         if (mres) {
             std::stringstream ss;
@@ -75,6 +75,15 @@ public:
              state_iter != m_states.end();
              state_iter++) {
             if (curl == (*state_iter)->GetHandle()) {
+                // FR-8 completion gate: a request libcurl reports as cleanly
+                // finished must have delivered exactly the requested range.
+                // Run before the error/status snapshot below so a violation
+                // propagates like any other error.  (Validation records a
+                // permanent-class error code and message on the state.)
+                if (xfer_result == CURLE_OK &&
+                    (*state_iter)->GetStatusCode() < 400) {
+                    (*state_iter)->ValidateRangeResponse(true);
+                }
                 m_bytes_transferred += (*state_iter)->BytesTransferred();
                 int error_code = (*state_iter)->GetErrorCode();
                 if (error_code && !m_error_code) {
@@ -359,7 +368,7 @@ int TPCRHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
             if (msg && (msg->msg == CURLMSG_DONE)) {
                 CURL *easy_handle = msg->easy_handle;
                 res = msg->data.result;
-                mch.FinishCurlXfer(easy_handle);
+                mch.FinishCurlXfer(easy_handle, res);
                 // If any requests fail, cut off the entire transfer.
                 if (res != CURLE_OK) {
                     break;
@@ -419,7 +428,7 @@ int TPCRHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
         msg = curl_multi_info_read(multi_handle, &msgq);
         if (msg && (msg->msg == CURLMSG_DONE)) {
             CURL *easy_handle = msg->easy_handle;
-            mch.FinishCurlXfer(easy_handle);
+            mch.FinishCurlXfer(easy_handle, msg->data.result);
             if (res == CURLE_OK || res == static_cast<CURLcode>(-1))
                 res = msg->data.result;  // Transfer result will be examined below.
         }

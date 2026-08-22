@@ -32,6 +32,12 @@ public:
         errWrite   = 1,  // Failure while writing the received data to the local file.
         errFlush   = 2,  // Failure while flushing the local file.
         errClose   = 3,  // Failure while closing the local file.
+        // Range-response validation failures (FR-8/FR-9; WP-3).  All of them
+        // are permanent-class: the source is misbehaving, retrying cannot
+        // help (FR-12 classification consumes these at WP-4).
+        errRangeNotHonored = 4,  // Non-206 success status to a ranged request.
+        errRangeMismatch   = 5,  // Content-Range absent or not echoing the request.
+        errLengthMismatch  = 6,  // Reported or delivered length != requested range length.
         errTimeout = 10  // The transfer did not make any progress within the timeout.
     };
 
@@ -111,6 +117,27 @@ public:
 
     off_t GetContentLength() const {return m_content_length;}
 
+    // Content-Length as claimed by the current HTTP response.  Kept strictly
+    // separate from both the transfer's known content length and the
+    // requested range length (FR-9 / BUG-3: the stock code let the response
+    // header overwrite the expectation it was supposed to be checked
+    // against).
+    off_t GetReportedLength() const {return m_reported_length;}
+
+    // Validates the current response against the requested range (FR-8).
+    // Called once when the body starts (completion=false: status must be
+    // 206, Content-Range must exactly echo the request, a reported
+    // Content-Length must equal the range length) and once when libcurl
+    // reports the request complete (completion=true: additionally the
+    // delivered byte count must equal the range length).  On violation,
+    // records a permanent-class error code and a distinct, greppable
+    // message, and returns false.  No-op (true) for non-ranged requests.
+    bool ValidateRangeResponse(bool completion);
+
+    // True once this state has a pending ranged request (SetTransferParameters
+    // was called for the current issue).
+    bool RangeRequested() const {return m_range_request;}
+
     const std::map<std::string, std::string> & GetReprDigest() const { return m_repr_digests; }
 
     int GetErrorCode() const {return m_error_code;}
@@ -137,8 +164,14 @@ public:
     CURL *GetHandle() const {return m_curl;}
 
     // Returns true if at least one byte of the response has been received,
-    // but not the entire contents of the response.
-    bool BodyTransferInProgress() const {return m_offset && (m_offset != m_content_length);}
+    // but not the entire contents of the response.  For ranged requests the
+    // yardstick is the length we requested, never the length the response
+    // claimed (BUG-3).
+    bool BodyTransferInProgress() const {
+        return m_offset &&
+               (m_offset != (m_range_request ? m_expected_length
+                                             : m_content_length));
+    }
 
     // Duplicate the current state; all settings are copied over, but those
     // related to the transient state are reset as if from a constructor.
@@ -194,6 +227,9 @@ private:
     static size_t HeaderCB(char *buffer, size_t size, size_t nitems,
                            void *userdata);
     int Header(const std::string &header);
+    // Strict parser for "Content-Range: bytes X-Y/Z|*" (FR-8); false on
+    // malformed input, which fails the request.
+    bool ParseContentRange(const std::string &header_value);
     static size_t WriteCB(void *buffer, size_t size, size_t nitems, void *userdata);
     ssize_t Write(char *buffer, size_t size);
     /**
@@ -211,8 +247,18 @@ private:
     off_t m_start_offset;  // offset where we started in the file.
     int m_status_code;  // status code from HTTP response.
     int m_error_code; // error code from underlying stream operations.
-    off_t m_content_length;  // value of Content-Length header, if we received one.
+    off_t m_content_length;  // known total content length of the transfer (set by the handler).
     off_t m_push_length; // For push transfers, the size of the file on our server.
+
+    // --- Per-request response validation state (WP-3, FR-8/FR-9). ---
+    // All of these are transient and reconstructed by ResetAfterRequest.
+    off_t m_expected_length = -1;   // range length we asked for (SetTransferParameters).
+    off_t m_reported_length = -1;   // Content-Length claimed by the response.
+    off_t m_resp_range_start = -1;  // parsed Content-Range first byte.
+    off_t m_resp_range_end = -1;    // parsed Content-Range last byte (inclusive).
+    bool m_range_request = false;   // a Range header was set for this request.
+    bool m_seen_content_range = false;  // response carried a Content-Range.
+    bool m_body_validated = false;  // ValidateRangeResponse(false) already ran.
     Stream *m_stream;  // stream corresponding to this transfer.
     CURL *m_curl;  // libcurl handle
     struct curl_slist *m_headers; // any headers we set as part of the libcurl request.

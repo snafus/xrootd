@@ -1,7 +1,11 @@
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+
+#include <strings.h>
 
 #include "XrdVersion.hh"
 #include "XrdHttp/XrdHttpExtHandler.hh"
@@ -37,6 +41,13 @@ void State::Move(State &other)
     m_status_code = other.m_status_code;
     m_content_length = other.m_content_length;
     m_push_length = other.m_push_length;
+    m_expected_length = other.m_expected_length;
+    m_reported_length = other.m_reported_length;
+    m_resp_range_start = other.m_resp_range_start;
+    m_resp_range_end = other.m_resp_range_end;
+    m_range_request = other.m_range_request;
+    m_seen_content_range = other.m_seen_content_range;
+    m_body_validated = other.m_body_validated;
     m_stream = other.m_stream;
     m_curl = other.m_curl;
     m_headers = other.m_headers;
@@ -212,19 +223,33 @@ void State::SetupHeadersForHEAD(XrdHttpExtReq &req) {
 //   m_repr_digests       digests parsed from the current response   -> clear
 //   m_error_buf          error text of the current request          -> clear
 //   m_error_code         error class of the current request        -> errNone
+//   m_expected_length    range length of the current request        -> -1
+//   m_reported_length    Content-Length claimed by the response     -> -1
+//   m_resp_range_start   parsed Content-Range start                 -> -1
+//   m_resp_range_end     parsed Content-Range end                   -> -1
+//   m_range_request      a Range was set for the current request    -> false
+//   m_seen_content_range response carried Content-Range             -> false
+//   m_body_validated     body-start validation already ran          -> false
 // NOT reset (they describe the transfer, not the request):
 //   m_start_offset, m_stream, m_curl, m_headers*, m_push,
-//   m_is_transfer_state, tpcForwardCreds, m_finalize_error_*
+//   m_is_transfer_state, tpcForwardCreds, m_finalize_error_*,
+//   m_content_length (the transfer's total length, set by the handler)
 void State::ResetAfterRequest() {
     m_offset = 0;
     m_status_code = -1;
-    m_content_length = -1;
     m_push_length = -1;
     m_recv_all_headers = false;
     m_recv_status_line = false;
     m_repr_digests.clear();
     m_error_buf.clear();
     m_error_code = errNone;
+    m_expected_length = -1;
+    m_reported_length = -1;
+    m_resp_range_start = -1;
+    m_resp_range_end = -1;
+    m_range_request = false;
+    m_seen_content_range = false;
+    m_body_validated = false;
 }
 
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)
@@ -266,10 +291,25 @@ int State::Header(const std::string &header) {
             if (header_name == "content-length")
             {
                 try {
-                    m_content_length = std::stoll(header_value);
+                    // BUG-3 fix: this records what the response *claims*
+                    // (m_reported_length); it must never overwrite the
+                    // expected range length set by SetTransferParameters.
+                    // ValidateRangeResponse compares the two.
+                    m_reported_length = std::stoll(header_value);
                 } catch (...) {
                     // Header unparseable -- not a great sign, fail request.
                     //printf("Content-length header unparseable\n");
+                    return 0;
+                }
+            }
+            if (header_name == "content-range")
+            {
+                // FR-8: parse "bytes <start>-<end>/<total|*>" strictly; a
+                // Content-Range we cannot parse is a malformed response and
+                // fails the request (returning 0 aborts the transfer in
+                // libcurl).  The parsed values are checked against the
+                // request in ValidateRangeResponse.
+                if (!ParseContentRange(header_value)) {
                     return 0;
                 }
             }
@@ -300,6 +340,16 @@ size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) 
         else
             return size*nitems;
     }  // Status indicates failure.
+    // FR-8: before the first body byte of a ranged request is accepted, the
+    // response must prove it honors the range (206, echoed Content-Range,
+    // consistent Content-Length).  Returning 0 aborts the transfer before
+    // any misdirected byte can reach the reorder buffers.
+    if (!obj->m_body_validated) {
+        obj->m_body_validated = true;
+        if (!obj->ValidateRangeResponse(false)) {
+            return 0;
+        }
+    }
     return obj->Write(static_cast<char*>(buffer), size*nitems);
 }
 
@@ -327,6 +377,14 @@ size_t State::PushRespCB(void *buffer, size_t size, size_t nitems, void *userdat
 }
 
 ssize_t State::Write(char *buffer, size_t size) {
+    // FR-8: over-delivery on a ranged request is a source malfunction; stop
+    // before a byte beyond the requested range can land in the stream.
+    if (m_range_request &&
+        m_offset + static_cast<off_t>(size) > m_expected_length) {
+        m_error_buf = "source delivered more bytes than the requested range";
+        m_error_code = errLengthMismatch;
+        return -1;
+    }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
     if (retval == SFS_ERROR) {
         m_error_buf = m_stream->GetErrorMessage();
@@ -400,10 +458,111 @@ State *State::Duplicate() {
 void State::SetTransferParameters(off_t offset, size_t size) {
     m_start_offset = offset;
     m_offset = 0;
-    m_content_length = size;
+    // BUG-3 fix: the requested range length lives in its own field; the
+    // response's Content-Length is recorded separately (m_reported_length)
+    // and validated against this, never allowed to overwrite it.
+    m_expected_length = static_cast<off_t>(size);
+    m_range_request = true;
     std::stringstream ss;
     ss << offset << "-" << (offset+size-1);
     curl_easy_setopt(m_curl, CURLOPT_RANGE, ss.str().c_str());
+}
+
+// Parses a Content-Range header value of the form
+//   bytes <start>-<end>/<total|*>
+// (leading whitespace tolerated, as header values arrive with the separator
+// space).  Returns false on anything it cannot parse strictly.
+bool State::ParseContentRange(const std::string &header_value) {
+    const char *cursor = header_value.c_str();
+    while (*cursor == ' ' || *cursor == '\t') {cursor++;}
+    if (strncasecmp(cursor, "bytes", 5)) {return false;}
+    cursor += 5;
+    while (*cursor == ' ' || *cursor == '\t') {cursor++;}
+
+    char *end = nullptr;
+    errno = 0;
+    long long start = strtoll(cursor, &end, 10);
+    if (errno || end == cursor || start < 0 || *end != '-') {return false;}
+    cursor = end + 1;
+    long long last = strtoll(cursor, &end, 10);
+    if (errno || end == cursor || last < start || *end != '/') {return false;}
+    cursor = end + 1;
+    // The complete length is either "*" or a number; it is not used for
+    // validation (the requested range is the yardstick), but a malformed
+    // field still fails the parse.
+    if (*cursor == '*') {
+        cursor++;
+    } else {
+        strtoll(cursor, &end, 10);
+        if (errno || end == cursor) {return false;}
+        cursor = end;
+    }
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {cursor++;}
+    if (*cursor != '\0') {return false;}
+
+    m_resp_range_start = static_cast<off_t>(start);
+    m_resp_range_end = static_cast<off_t>(last);
+    m_seen_content_range = true;
+    return true;
+}
+
+bool State::ValidateRangeResponse(bool completion) {
+    if (!m_range_request) {
+        // Whole-object requests (push responses, the transitional
+        // single-stream pull) validate nothing here.
+        return true;
+    }
+    // Every error below is permanent-class (FR-12): the source demonstrably
+    // does not implement ranged GETs correctly, so retrying is pointless and
+    // continuing risks corrupting the destination.
+    if (m_status_code != 206) {
+        std::stringstream ss;
+        if (m_status_code == 200) {
+            // The canonical failure: source ignored Range and is streaming
+            // the whole file to every connection (BUG-2's silent corruption
+            // path in the stock handler).
+            ss << "source does not honor Range requests (status 200 to a ranged request)";
+        } else {
+            ss << "source returned unexpected status " << m_status_code
+               << " to a ranged request";
+        }
+        m_error_buf = ss.str();
+        m_error_code = errRangeNotHonored;
+        return false;
+    }
+    if (!m_seen_content_range) {
+        m_error_buf = "source response has no Content-Range header for a ranged request";
+        m_error_code = errRangeMismatch;
+        return false;
+    }
+    if (m_resp_range_start != m_start_offset ||
+        m_resp_range_end != m_start_offset + m_expected_length - 1) {
+        std::stringstream ss;
+        ss << "source Content-Range does not echo the requested range"
+           << " (requested " << m_start_offset << "-"
+           << (m_start_offset + m_expected_length - 1)
+           << ", response " << m_resp_range_start << "-" << m_resp_range_end << ")";
+        m_error_buf = ss.str();
+        m_error_code = errRangeMismatch;
+        return false;
+    }
+    if (m_reported_length >= 0 && m_reported_length != m_expected_length) {
+        std::stringstream ss;
+        ss << "source response Content-Length " << m_reported_length
+           << " does not match the requested range length " << m_expected_length;
+        m_error_buf = ss.str();
+        m_error_code = errLengthMismatch;
+        return false;
+    }
+    if (completion && m_offset != m_expected_length) {
+        std::stringstream ss;
+        ss << "source delivered a different byte count than requested"
+           << " (got " << m_offset << ", requested " << m_expected_length << ")";
+        m_error_buf = ss.str();
+        m_error_code = errLengthMismatch;
+        return false;
+    }
+    return true;
 }
 
 bool State::Finalize()

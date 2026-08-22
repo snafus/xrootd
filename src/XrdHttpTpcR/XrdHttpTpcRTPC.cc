@@ -689,8 +689,10 @@ int TPCRHandler::PerformHEADRequest(CURL *curl, XrdHttpExtReq &req, State &state
     }
 
     success = true;
+    // The size a HEAD reports is response data: read the reported length
+    // (the "expected" length field does not exist for a bodyless probe).
     ss << "Successfully determined remote file information for pull request: "
-       << "size=" << state.GetContentLength();
+       << "size=" << state.GetReportedLength();
     if(state.GetReprDigest().size()) {
       unsigned int cksumIndex = 1;
       for(const auto & [cksumType,cksumValue]: state.GetReprDigest()) {
@@ -712,7 +714,7 @@ int TPCRHandler::GetRemoteFileInfoTPCPull(CURL *curl, XrdHttpExtReq &req, uint64
     if ((result = PerformHEADRequest(curl, req, state, success, rec)) || !success) {
         return result;
     }
-    contentLength = state.GetContentLength();
+    contentLength = state.GetReportedLength();
     reprDigest = state.GetReprDigest();
     return result;
 }
