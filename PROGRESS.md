@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** WP-5 — degraded state (Tier-1 recovery: teardown/rebuild, re-HEAD revalidation, recovery budget).
+**Current focus:** M1 COMPLETE (tag tpcr-m1). Next: WP-6 — backend semantics test matrix (M2 gate).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
@@ -9,7 +9,7 @@
 | WP-2 Slab pool | done | (this commit) | 35/35 TPCR+stock; ASan+TSan clean | Pool + tpcr.{blocksize,mempool.max,streams.max} + BUG-10 clamp. Entry wiring at WP-4 (see DECISIONS). |
 | WP-3 Response validation | done | fdaac1ffc | 55/55 | Body-start + completion validation; expected/reported split; permanent-class error codes ready for FR-12. |
 | WP-4 Range scheduler | done | 2f8bf506d, b8c05c884, 224ecbd27, ad79aba00 | 73/73 unit + 18/18 integration | Pure FSM + curl loop; Multistream deleted; slab wiring done; T-P1 baseline: no regression, ~3x at 4 streams (loopback). |
-| WP-5 Degraded state | todo | | | |
+| WP-5 Degraded state | done | e936dcc1b | 76/76 unit + 29/29 integration; trace_check m1 clean | Full Tier-1 ladder; sticky tpc_status stock bug found+fixed; auth one-shot re-probe; push smoke added. |
 | WP-6 Backend semantics matrix | todo | | | |
 | WP-7 Journal + checkpointing | todo | | | |
 | WP-8 Resume open path | todo | | | |
