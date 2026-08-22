@@ -6,10 +6,13 @@
 #ifndef __XRD_TPCR_STATE_HH__
 #define __XRD_TPCR_STATE_HH__
 
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 // Forward dec'ls
+struct StateTestPeer;
 class XrdSfsFile;
 class XrdHttpExtReq;
 typedef void CURL;
@@ -174,6 +177,12 @@ public:
     std::string GetConnectionDescription();
 
 private:
+    // Test seam: the unit tests (T-U2 State hygiene, T-U7 response validation)
+    // must drive the private header parser and inspect per-request state.
+    // Production code must not gain setters for these, so the tests get a
+    // single named friend instead.
+    friend struct ::StateTestPeer;
+
     bool InstallHandlers(CURL *curl);
 
     // Record a failure that happened while flushing or closing the local file.

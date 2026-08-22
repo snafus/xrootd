@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# trace_check -- requirement-to-test traceability gate for TPCR (05-TEST-PLAN.md).
+#
+# Every requirement/bug id in the scope of a milestone must be referenced by at
+# least one test source under tests/XrdHttpTpcR/.  A referenced id means the id
+# string appears in a test file (tests name the ids they verify in comments,
+# per the test plan's "every test lists the requirements it verifies" rule).
+#
+# Usage: trace_check [m1|m2|m3|all]     (default: the current milestone, m1)
+# Exit code 0 = traceability complete for the scope; 1 = ids missing (listed).
+
+set -u
+
+SCOPE="${1:-m1}"
+TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Requirement ids per milestone scope, from 01-REQUIREMENTS / 03-IMPLEMENTATION-PLAN.
+# Scopes are cumulative: m2 includes m1, m3 includes m2, all includes everything
+# (adding the perf/scale NFRs that only the T-P/T-S runs can satisfy).
+M1_IDS=(
+  FR-1 FR-2 FR-7 FR-8 FR-9 FR-10 FR-11 FR-12 FR-13 FR-14 FR-15 FR-16
+  FR-30 FR-31
+  NFR-1 NFR-6 NFR-7
+  CON-2 CON-4 CON-6
+  BUG-1 BUG-2 BUG-3 BUG-4 BUG-5 BUG-6 BUG-7 BUG-8 BUG-9 BUG-10 BUG-11 BUG-12 BUG-13
+)
+M2_IDS=(
+  FR-3 FR-4 FR-5 FR-6 FR-17 FR-18 FR-19 FR-20 FR-21 FR-22 FR-23 FR-24 FR-25
+  CON-3
+)
+M3_IDS=(
+  FR-26 FR-27 FR-28 FR-29
+)
+ALL_EXTRA_IDS=(
+  NFR-2 NFR-3 NFR-4 NFR-5
+)
+
+case "$SCOPE" in
+  m1)  IDS=("${M1_IDS[@]}") ;;
+  m2)  IDS=("${M1_IDS[@]}" "${M2_IDS[@]}") ;;
+  m3)  IDS=("${M1_IDS[@]}" "${M2_IDS[@]}" "${M3_IDS[@]}") ;;
+  all) IDS=("${M1_IDS[@]}" "${M2_IDS[@]}" "${M3_IDS[@]}" "${ALL_EXTRA_IDS[@]}") ;;
+  *) echo "usage: $(basename "$0") [m1|m2|m3|all]" >&2; exit 2 ;;
+esac
+
+missing=0
+for id in "${IDS[@]}"; do
+  # Word-boundary match so FR-1 does not satisfy FR-10 etc.
+  if ! grep -rqE "\b${id}\b" "$TESTS_DIR" --include='*.cc' --include='*.py' \
+        --include='*.sh' 2>/dev/null; then
+    echo "MISSING: ${id} has no referencing test in ${TESTS_DIR}"
+    missing=$((missing + 1))
+  fi
+done
+
+if [ "$missing" -eq 0 ]; then
+  echo "trace_check: all $(printf '%s\n' "${IDS[@]}" | wc -l | tr -d ' ') ids in scope '${SCOPE}' are referenced by tests."
+  exit 0
+else
+  echo "trace_check: ${missing} id(s) missing for scope '${SCOPE}'."
+  exit 1
+fi

@@ -25,6 +25,8 @@ add_subdirectory( XrdSsiTests )
 
 add_subdirectory(XrdHttpTpc)
 
+add_subdirectory(XrdHttpTpcR)
+
 add_subdirectory(XrdPfcTests)
 
 add_subdirectory(XrdXrootdTests)
