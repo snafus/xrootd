@@ -412,6 +412,62 @@ TEST_F(XrdHttpTpcRStreamTests, CommitHookSeesEveryByteInOrderExactlyOnce) {
 }
 
 // ---------------------------------------------------------------------------
+// WP-4: pooled reorder entries (NFR-1, BUG-11).
+// ---------------------------------------------------------------------------
+
+TEST_F(XrdHttpTpcRStreamTests, EntriesDrawFromSlabPoolAndReturnOnDrain) {
+  XrdSysLogger logger(STDERR_FILENO, 0);
+  XrdSysError log(&logger, "StreamTest");
+  auto file = std::make_unique<MemorySfsFile>();
+  auto raw_file = file.get();
+
+  TPCR::SlabPool pool(8, 4 * 8);  // 4 slabs of 8 bytes
+  auto client = pool.RegisterClient();
+  TPCR::Stream stream(std::move(file), 0, 8, log);
+  stream.SetSlabSource([&]() { return pool.Acquire(client); });
+
+  // Out-of-order arrival forces buffering: entries must come from the pool.
+  ASSERT_EQ(8, stream.Write(8, "ijklmnop", 8, false));
+  ASSERT_EQ(8, stream.Write(16, "qrstuvwx", 8, false));
+  EXPECT_EQ(2 * 8u, pool.BytesAllocated() - 8 * pool.FreeSlabs())
+      << "two slabs leased for two buffered entries";
+  EXPECT_EQ(0u, stream.OverflowEntries());
+
+  // The head arrives; everything cascades to the file and (after trim) the
+  // slabs return to the pool.
+  ASSERT_EQ(8, stream.Write(0, "abcdefgh", 8, false));
+  EXPECT_EQ(24, stream.CommittedOffset());
+  EXPECT_EQ(AsBytes("abcdefghijklmnopqrstuvwx"), raw_file->Data());
+  EXPECT_TRUE(stream.Finalize());
+  // Finalize clears the entries; every slab must be back.
+  EXPECT_EQ(pool.BytesAllocated() / 8, pool.FreeSlabs());
+}
+
+TEST_F(XrdHttpTpcRStreamTests, PoolExhaustionFallsBackToHeapWithoutLoss) {
+  XrdSysLogger logger(STDERR_FILENO, 0);
+  XrdSysError log(&logger, "StreamTest");
+  auto file = std::make_unique<MemorySfsFile>();
+  auto raw_file = file.get();
+
+  TPCR::SlabPool pool(8, 8);  // a single slab
+  auto client = pool.RegisterClient();
+  TPCR::Stream stream(std::move(file), 0, 8, log);
+  stream.SetSlabSource([&]() { return pool.Acquire(client); });
+
+  // Two buffered entries needed, one slab available: the second entry must
+  // fall back to heap -- data in hand is never dropped (NFR-1's never-fail
+  // contract applies to scheduling, not to delivered bytes).
+  ASSERT_EQ(8, stream.Write(8, "ijklmnop", 8, false));
+  ASSERT_EQ(8, stream.Write(16, "qrstuvwx", 8, false));
+  EXPECT_EQ(1u, stream.OverflowEntries()) << "fallback must be observable";
+
+  ASSERT_EQ(8, stream.Write(0, "abcdefgh", 8, false));
+  EXPECT_EQ(0, stream.Flush());
+  EXPECT_EQ(AsBytes("abcdefghijklmnopqrstuvwx"), raw_file->Data());
+  EXPECT_TRUE(stream.Finalize());
+}
+
+// ---------------------------------------------------------------------------
 // T-U5: adversarial arrival orders, property-style.
 // ---------------------------------------------------------------------------
 

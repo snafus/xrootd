@@ -44,6 +44,8 @@
 
 #include "XrdSfs/XrdSfsInterface.hh"
 
+#include "XrdHttpTpcRSlabPool.hh"
+
 #include <functional>
 #include <memory>
 #include <vector>
@@ -131,6 +133,17 @@ public:
     // Must not be changed while writes are in flight.
     void SetCommitHook(CommitHook hook) {m_commit_hook = std::move(hook);}
 
+    // Supplies pooled buffers for the reorder entries (NFR-1, BUG-11).  The
+    // source may return an empty Slab ("none available"); the stream then
+    // falls back to a private heap buffer rather than losing data -- the
+    // scheduler makes that rare by reserving a slab per issued range, and
+    // OverflowEntries() exposes how often the fallback fired.  Data already
+    // handed to the stream must always find a home (the pool's never-fail
+    // contract applies to *scheduling*, not to bytes in hand).
+    using SlabSource = std::function<SlabPool::Slab()>;
+    void SetSlabSource(SlabSource source) {m_slab_source = std::move(source);}
+    size_t OverflowEntries() const {return m_overflow_entries;}
+
     void DumpBuffers() const;
 
     // Flush and finalize the stream.  If all data has been sent to the underlying
@@ -148,10 +161,26 @@ private:
 
     class Entry {
     public:
-        Entry(size_t capacity) :
+        // Heap-backed entry (no pool configured, or pool exhausted).  The
+        // buffer is deliberately uninitialized: the entry tracks its own
+        // valid length and never reads bytes it did not write (BUG-11: the
+        // stock code value-initialized 16 MiB per block cycle).
+        explicit Entry(size_t capacity) :
             m_offset(-1),
             m_capacity(capacity),
-            m_size(0)
+            m_size(0),
+            m_own(new char[capacity]),
+            m_data(m_own.get())
+        {}
+
+        // Pool-backed entry: the buffer belongs to the server-global slab
+        // pool and returns there when the entry is destroyed (NFR-1).
+        explicit Entry(SlabPool::Slab slab) :
+            m_offset(-1),
+            m_capacity(slab.Capacity()),
+            m_size(0),
+            m_slab(std::move(slab)),
+            m_data(m_slab.Data())
         {}
 
         bool Available() const {return m_offset == -1;}
@@ -170,7 +199,7 @@ private:
             if (!force && (m_size != m_capacity)) {
                 return 0;
             }
-            ssize_t retval = stream.WriteImpl(m_offset, &m_buffer[0], m_size);
+            ssize_t retval = stream.WriteImpl(m_offset, m_data, m_size);
             // Currently the only valid negative value is SFS_ERROR (-1); checking for
             // all negative values to future-proof the code.
             if (retval < 0) {
@@ -179,7 +208,6 @@ private:
             if (static_cast<size_t>(retval) == m_size) {
                 m_offset = -1;
                 m_size = 0;
-                m_buffer.clear();
                 return retval;
             }
             // Short write: legal SFS behavior (BUG-6 family).  The stream's
@@ -188,7 +216,7 @@ private:
             // offset and drains on a later pass.  (The stock code returned an
             // error here, leaving the entry inconsistent with the offset the
             // stream had already advanced.)
-            memmove(&m_buffer[0], &m_buffer[0] + retval, m_size - retval);
+            memmove(m_data, m_data + retval, m_size - retval);
             m_offset += retval;
             m_size -= static_cast<size_t>(retval);
             return retval;
@@ -207,14 +235,9 @@ private:
                 size = to_accept;
             }
 
-            // Inflate the underlying buffer if needed.
-            ssize_t new_bytes_needed = (m_size + size) - m_buffer.size();
-            if (new_bytes_needed > 0) {
-                m_buffer.resize(m_capacity);
-            }
-
-            // Finally, do the copy.
-            memcpy(&m_buffer[0] + m_size, buf, size);
+            // Finally, do the copy (the backing buffer is fixed-size
+            // and never zero-filled -- BUG-11).
+            memcpy(m_data + m_size, buf, size);
             m_size += size;
             if (m_offset == -1) {
                 m_offset = offset;
@@ -234,10 +257,13 @@ private:
             return (m_size > 0) && (m_offset == stream.m_offset);
         }
 
-        off_t m_offset;  // Offset within file that m_buffer[0] represents.
+        off_t m_offset;  // Offset within file that m_data[0] represents.
         size_t m_capacity;
         size_t m_size;  // Number of bytes held in buffer.
-        std::vector<char> m_buffer;
+        // Exactly one of the two owns the storage; m_data points at it.
+        SlabPool::Slab m_slab;           // pool-backed (empty if heap-backed)
+        std::unique_ptr<char[]> m_own;   // heap-backed (null if pool-backed)
+        char *m_data;
     };
 
     // Hands bytes to the underlying file at the committed offset, advancing
@@ -283,6 +309,8 @@ private:
     XrdSysError &m_log;
     std::string m_error_buf;
     CommitHook m_commit_hook;
+    SlabSource m_slab_source;
+    size_t m_overflow_entries = 0;  // heap fallbacks; should stay ~0 (NFR-1)
 };
 }
 

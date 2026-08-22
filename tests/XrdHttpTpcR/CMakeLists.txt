@@ -38,7 +38,8 @@ gtest_discover_tests(xrdhttptpcr-pool-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10
 if(TARGET XrdServer)
   add_executable(xrdhttptpcr-stream-unit-tests
           XrdHttpTpcRStreamTests.cc
-          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc)
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc)
 
   target_link_libraries(xrdhttptpcr-stream-unit-tests
           XrdServer
@@ -53,7 +54,8 @@ if(TARGET XrdServer)
   add_executable(xrdhttptpcr-state-unit-tests
           XrdHttpTpcRStateTests.cc
           ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRState.cc
-          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc)
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc)
 
   target_link_libraries(xrdhttptpcr-state-unit-tests
           XrdServer

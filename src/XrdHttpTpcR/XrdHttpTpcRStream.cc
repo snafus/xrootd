@@ -176,6 +176,18 @@ Stream::EmptyEntry()
     for (auto &entry : m_buffers) {
         if (entry->Available()) {return entry.get();}
     }
+    // Prefer a pooled slab (NFR-1); fall back to a private heap buffer when
+    // the pool has nothing -- bytes already in hand must never be dropped.
+    // The scheduler keeps the fallback rare by reserving a slab per issued
+    // range; OverflowEntries() makes any residual pressure observable.
+    if (m_slab_source) {
+        auto slab = m_slab_source();
+        if (slab) {
+            m_buffers.push_back(std::make_unique<Entry>(std::move(slab)));
+            return m_buffers.back().get();
+        }
+        m_overflow_entries++;
+    }
     m_buffers.push_back(std::make_unique<Entry>(m_buffer_size));
     return m_buffers.back().get();
 }
