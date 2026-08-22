@@ -5,14 +5,51 @@
  * The abstraction layer is necessary to do the necessary buffering
  * of multi-stream writes where the underlying filesystem only
  * supports single-stream writes.
+ *
+ * TPCR rework (WP-1) relative to the stock TPC Stream:
+ *
+ *  - Construction is seeded with an initial offset so that a resumed
+ *    transfer can continue writing at the committed watermark W instead
+ *    of byte 0 (FR-20).  All offsets remain absolute file offsets.
+ *
+ *  - Write() returns the number of bytes *fully accepted* (written to the
+ *    file or safely buffered).  The stock code could return a short count
+ *    while still buffering the remainder, making the caller re-send bytes
+ *    that were already accepted -- a double-write (BUG-6).  Acceptance is
+ *    now all-or-error: a remainder that cannot be accepted is a stream
+ *    failure, never a short return.
+ *
+ *  - Buffer occupancy is no longer an admission signal.  The stock design
+ *    coupled scheduling, memory and write ordering through a fixed pool of
+ *    entries and the AvailableBuffers() count, which both stalled and
+ *    hard-failed transfers when out-of-order arrival fragmented ranges
+ *    across entries (BUG-7).  Entries are now created on demand and
+ *    retired when empty; the scheduler instead governs admission with
+ *    CommittedOffset() and ReorderSpan() (the byte distance covered by
+ *    data buffered ahead of the committed offset).  Hard memory bounds
+ *    arrive with the slab pool (WP-2) and the scheduler window (WP-4).
+ *
+ *  - WriteImpl() carries the in-order commit hook: every byte handed to
+ *    the underlying file passes through it exactly once, at strictly
+ *    ascending offsets, by construction.  The streaming digests (WP-10)
+ *    attach here; until then the hook is an interface only.
+ *
+ * Unchanged invariants: data is handed to the file strictly in order
+ * (required for HDFS/RADOS-class backends), and writes below the current
+ * committed offset are rejected as a logic error.
  */
+
+#ifndef __XRD_TPCR_STREAM_HH__
+#define __XRD_TPCR_STREAM_HH__
 
 #include "XrdSfs/XrdSfsInterface.hh"
 
+#include <functional>
 #include <memory>
 #include <vector>
 #include <string>
 
+#include <cassert>
 #include <cstring>
 
 struct stat;
@@ -22,17 +59,24 @@ class XrdSysError;
 namespace TPCR {
 class Stream {
 public:
-    Stream(std::unique_ptr<XrdSfsFile> fh, size_t max_blocks, size_t buffer_size, XrdSysError &log)
+    // Invoked from WriteImpl for every byte range successfully handed to the
+    // underlying file: strictly in-order, no gaps, no duplicates.  This is
+    // the digest hook point (WP-10); it must not fail and must not block.
+    using CommitHook =
+        std::function<void(off_t offset, const char *buffer, size_t size)>;
+
+    // initial_offset seeds the committed offset: a fresh transfer passes 0,
+    // a resumed transfer passes the journal's watermark W.  buffer_size is
+    // the capacity of each reorder entry and should equal the scheduler's
+    // block size, so that one range fits one entry in the common case.
+    Stream(std::unique_ptr<XrdSfsFile> fh, off_t initial_offset,
+           size_t buffer_size, XrdSysError &log)
         : m_open_for_write(false),
-          m_avail_count(max_blocks),
+          m_buffer_size(buffer_size),
           m_fh(std::move(fh)),
-          m_offset(0),
+          m_offset(initial_offset),
           m_log(log)
     {
-        m_buffers.reserve(max_blocks);
-        for (size_t idx=0; idx < max_blocks; idx++) {
-            m_buffers.push_back(std::make_unique<Entry>(buffer_size));
-        }
         m_open_for_write = true;
     }
 
@@ -50,8 +94,9 @@ public:
     // skip the buffering and always write (this should only be done at the
     // end of a stream!).
     //
-    // Returns the number of bytes written; on error, returns -1 and sets
-    // the error code and error message for the stream
+    // Returns the number of bytes fully accepted -- always `size` on
+    // success (BUG-6: never a short count with the remainder buffered).
+    // On error, returns SFS_ERROR and sets the stream's error message.
     ssize_t Write(off_t offset, const char *buffer, size_t size, bool force);
 
     // Force the data still held in the re-ordering buffers out to the underlying
@@ -68,7 +113,23 @@ public:
     // Returns 0 on success; SFS_ERROR on failure.
     ssize_t Flush() {return Write(m_offset, nullptr, 0, true);}
 
-    size_t AvailableBuffers() const {return m_avail_count;}
+    // The number of bytes contiguously handed to the underlying file so far
+    // (absolute offset).  This is the scheduler's commit candidate: the
+    // checkpoint engine turns it into the durable watermark W by sync()ing
+    // the file before persisting it (SUB-1).  Note the three-counter rule
+    // (SUB-3): this is "committed", which is neither "scheduled" nor
+    // "received".
+    off_t CommittedOffset() const {return m_offset;}
+
+    // The byte distance between the committed offset and the end of the
+    // furthest buffered data.  The scheduler bounds this by the configured
+    // reorder window when admitting new ranges (NFR-1); it replaces the
+    // stock buffer-occupancy admission signal.
+    size_t ReorderSpan() const;
+
+    // Install (or clear, by passing nullptr) the in-order commit hook.
+    // Must not be changed while writes are in flight.
+    void SetCommitHook(CommitHook hook) {m_commit_hook = std::move(hook);}
 
     void DumpBuffers() const;
 
@@ -99,30 +160,44 @@ private:
         // number of bytes written (0 if the buffer is not eligible for a write
         // yet) or SFS_ERROR.  On success the buffer is emptied and becomes
         // available again.
+        //
+        // Only full buffers are written unless force is set: a full buffer is
+        // exactly one aligned block, which keeps the writes the underlying
+        // filesystem sees block-sized in the common case.  (The stock code
+        // had a second reason -- occupancy-based admission -- which is gone.)
         ssize_t Write(Stream &stream, bool force) {
             if (Available() || !CanWrite(stream)) {return 0;}
-            // Only full buffer writes are accepted unless the stream forces a flush
-            // (i.e., we are at EOF) because the multistream code uses buffer occupancy
-            // to determine how many streams are currently in-flight.  If we do an early
-            // write, then the buffer will be empty and the multistream code may decide
-            // to start another request (which we don't have the capacity to serve!).
             if (!force && (m_size != m_capacity)) {
                 return 0;
             }
             ssize_t retval = stream.WriteImpl(m_offset, &m_buffer[0], m_size);
             // Currently the only valid negative value is SFS_ERROR (-1); checking for
             // all negative values to future-proof the code.
-            if ((retval < 0) || (static_cast<size_t>(retval) != m_size)) {
+            if (retval < 0) {
                 return -1;
             }
-            m_offset = -1;
-            m_size = 0;
-            m_buffer.clear();
+            if (static_cast<size_t>(retval) == m_size) {
+                m_offset = -1;
+                m_size = 0;
+                m_buffer.clear();
+                return retval;
+            }
+            // Short write: legal SFS behavior (BUG-6 family).  The stream's
+            // committed offset advanced by retval, so drop the written prefix
+            // and keep the tail -- it stays contiguous with the committed
+            // offset and drains on a later pass.  (The stock code returned an
+            // error here, leaving the entry inconsistent with the offset the
+            // stream had already advanced.)
+            memmove(&m_buffer[0], &m_buffer[0] + retval, m_size - retval);
+            m_offset += retval;
+            m_size -= static_cast<size_t>(retval);
             return retval;
         }
 
         size_t Accept(off_t offset, const char *buf, size_t size) {
-            // Validate acceptance criteria.
+            // Validate acceptance criteria: an empty entry accepts data at any
+            // offset; a non-empty entry only accepts an exactly-contiguous
+            // extension of what it already holds.
             if ((m_offset != -1) && (offset != m_offset + static_cast<ssize_t>(m_size))) {
                 return 0;
             }
@@ -147,11 +222,6 @@ private:
             return size;
         }
 
-        void ShrinkIfUnused() {
-           if (!Available()) {return;}
-           m_buffer.shrink_to_fit();
-        }
-
         off_t GetOffset() const {return m_offset;}
         size_t GetCapacity() const {return m_capacity;}
         size_t GetSize() const {return m_size;}
@@ -170,11 +240,17 @@ private:
         std::vector<char> m_buffer;
     };
 
+    // Hands bytes to the underlying file at the committed offset, advancing
+    // it and driving the commit hook.  Enforces the in-order invariant
+    // (NFR-7): a call at any offset other than the committed offset is an
+    // internal logic error that fails the stream.
     ssize_t WriteImpl(off_t offset, const char *buffer, size_t size);
 
     // Copies as much of [buffer, buffer+size) as possible into the buffers that
     // are already holding data and can be extended contiguously.  This is pure
-    // bookkeeping: it never touches the underlying filesystem.
+    // bookkeeping: it never touches the underlying filesystem.  Empty entries
+    // are skipped: they are handed out explicitly by Write() so that data
+    // placement stays deliberate.
     //
     // Returns the number of bytes consumed.
     size_t AcceptIntoBuffers(off_t offset, const char *buffer, size_t size);
@@ -184,20 +260,30 @@ private:
     // can in turn make another buffer writable.  Only completely full buffers
     // are written unless force is set (see Entry::Write).
     //
-    // This is the only place where m_avail_count is computed.
-    //
     // Returns the number of buffers written out, or SFS_ERROR.
     ssize_t FlushBuffers(bool force);
 
-    // Returns the first empty buffer, or nullptr if all of them hold data.
-    Entry *FirstAvailableBuffer();
+    // Returns an empty entry, creating one if none exists.  Entries are
+    // created on demand and trimmed when empty (see Write), so the entry
+    // count tracks the actual reorder pressure instead of a fixed pool size.
+    Entry *EmptyEntry();
+
+    // True if any entry currently holds data awaiting reordering.
+    bool AnyBufferedData() const;
+
+    // Erase empty entries, keeping the vector's footprint proportional to
+    // the data actually buffered.  Called when buffered pressure drops.
+    void TrimEmptyEntries();
 
     bool m_open_for_write;
-    size_t m_avail_count;
+    size_t m_buffer_size;  // Capacity of each reorder entry.
     std::unique_ptr<XrdSfsFile> m_fh;
-    off_t m_offset;
+    off_t m_offset;  // Committed offset: bytes contiguously handed to m_fh.
     std::vector<std::unique_ptr<Entry>> m_buffers;
     XrdSysError &m_log;
     std::string m_error_buf;
+    CommitHook m_commit_hook;
 };
 }
+
+#endif // __XRD_TPCR_STREAM_HH__

@@ -1148,6 +1148,8 @@ int TPCRHandler::ProcessPushReq(const std::string & resource, XrdHttpExtReq &req
     }
     curl_easy_setopt(curl, CURLOPT_URL, resource.c_str());
 
+    // Push mode reads from the local file; the reorder buffering is unused
+    // (buffer_size 0) and push never resumes (initial offset 0, CON-6).
     Stream stream(std::move(fh), 0, 0, m_log);
     State state(0, stream, curl, true, req.tpcForwardCreds);
     state.SetupHeaders(req);
@@ -1312,7 +1314,12 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
         fh->close();
         return resp_result;
     }
-    Stream stream(std::move(fh), streams * m_pipelining_multiplier, streams > 1 ? m_block_size : m_small_block_size, m_log);
+    // Fresh pull transfers start at offset 0; the resume path (WP-8) seeds
+    // the journal watermark W here instead.  Entry capacity matches the
+    // request block size so one range fills one entry in the common case;
+    // entries themselves are created on demand (WP-1), no longer a fixed
+    // streams-derived pool.
+    Stream stream(std::move(fh), 0, streams > 1 ? m_block_size : m_small_block_size, m_log);
     State state(0, stream, curl, false, req.tpcForwardCreds);
     state.SetupHeaders(req);
     state.SetContentLength(sourceFileContentLength);

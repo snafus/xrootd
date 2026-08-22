@@ -406,16 +406,6 @@ void State::SetTransferParameters(off_t offset, size_t size) {
     curl_easy_setopt(m_curl, CURLOPT_RANGE, ss.str().c_str());
 }
 
-int State::AvailableBuffers() const
-{
-    return m_stream->AvailableBuffers();
-}
-
-void State::DumpBuffers() const
-{
-    m_stream->DumpBuffers();
-}
-
 bool State::Finalize()
 {
     if (!m_stream->Finalize()) {

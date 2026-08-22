@@ -222,42 +222,21 @@ private:
         }
     }
 
+    // Admission is governed by idle handles only.  The stock code also keyed
+    // on Stream buffer occupancy, which both stalled and hard-failed
+    // transfers once out-of-order arrival fragmented ranges across entries
+    // (BUG-7); entries are elastic now (WP-1), and the byte-bounded limits
+    // that replace occupancy -- the slab pool budget and the reorder-window
+    // admission -- arrive with WP-2/WP-4.
     bool CanStartTransfer(bool log_reason) const {
         size_t idle_handles = m_avail_handles.size();
-        size_t transfer_in_progress = 0;
-        for (std::vector<State*>::const_iterator state_iter = m_states.begin();
-             state_iter != m_states.end();
-             state_iter++) {
-            for (std::vector<CURL*>::const_iterator handle_iter = m_active_handles.begin();
-                 handle_iter != m_active_handles.end();
-                 handle_iter++) {
-                if (*handle_iter == (*state_iter)->GetHandle()) {
-                    transfer_in_progress += (*state_iter)->BodyTransferInProgress();
-                    break;
-                }
-            }
-        }
         if (!idle_handles) {
             if (log_reason) {
                 m_log.Emsg("CanStartTransfer", "Unable to start transfers as no idle CURL handles are available.");
             }
             return false;
         }
-        ssize_t available_buffers = m_states[0]->AvailableBuffers();
-        // To be conservative, set aside buffers for any transfers that have been activated
-        // but don't have their first responses back yet.
-        available_buffers -= (m_active_handles.size() - transfer_in_progress);
-        if (log_reason && (available_buffers == 0)) {
-            std::stringstream ss;
-            ss << "Unable to start transfers as no buffers are available.  Available buffers: " <<
-                m_states[0]->AvailableBuffers() << ", Active curl handles: " << m_active_handles.size()
-                << ", Transfers in progress: " << transfer_in_progress;
-            m_log.Emsg("CanStartTransfer", ss.str().c_str());
-            if (m_states[0]->AvailableBuffers() == 0) {
-                m_states[0]->DumpBuffers();
-            }
-        }
-        return available_buffers > 0;
+        return true;
     }
 
     CURLM *m_handle;
