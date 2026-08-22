@@ -148,9 +148,37 @@ bool TPCRHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
             } else {
                 m_first_timeout = 2*m_timeout;
             }
+        } else if (!strncmp("tpcr.", val, 5)) {
+            // TPCR-specific directives (FR-30).  Parsing lives in
+            // TPCR::Config so it is unit-testable (T-U3); any unknown
+            // tpcr.* directive or bad value is fatal -- fail fast rather
+            // than run with a silently-defaulted typo.
+            std::string directive = val;
+            if (!(val = Config.GetWord())) {
+                Config.Close();
+                m_log.Emsg("Config", directive.c_str(), "value not specified");
+                return false;
+            }
+            std::string err;
+            if (!m_tpcr.Set(directive, val, err)) {
+                Config.Close();
+                m_log.Emsg("Config", err.c_str());
+                return false;
+            }
         }
     }
     Config.Close();
+
+    // The slab pool is server-global and sized once from the parsed config
+    // (NFR-1).  Every transfer's reorder buffers draw from this budget.
+    m_slab_pool.reset(new SlabPool(m_tpcr.block_size, m_tpcr.mempool_max));
+    {
+        std::stringstream pool_ss;
+        pool_ss << "TPCR slab pool: slab size " << m_tpcr.block_size
+                << " bytes, budget " << m_tpcr.mempool_max
+                << " bytes, streams cap " << m_tpcr.streams_max;
+        m_log.Log(LogMask::Info, "Config", pool_ss.str().c_str());
+    }
 
     // Internal override: allow xrdtpc to use a different ca dir from the one prepared by the xrootd
     // framework.  meant for exceptional situations where the site might need a specially-prepared set

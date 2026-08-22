@@ -18,6 +18,20 @@ target_link_libraries(xrdhttptpcr-unit-tests
 
 gtest_discover_tests(xrdhttptpcr-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
 
+# T-U6 slab pool and T-U3 config: pure TPCR code, no server libs needed.
+add_executable(xrdhttptpcr-pool-unit-tests
+        XrdHttpTpcRSlabPoolTests.cc
+        XrdHttpTpcRConfigTests.cc
+        ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc
+        ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRConfig.cc)
+
+target_link_libraries(xrdhttptpcr-pool-unit-tests
+        GTest::gtest
+        GTest::gtest_main
+        ${CMAKE_THREAD_LIBS_INIT})
+
+gtest_discover_tests(xrdhttptpcr-pool-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
+
 if(TARGET XrdServer)
   add_executable(xrdhttptpcr-stream-unit-tests
           XrdHttpTpcRStreamTests.cc

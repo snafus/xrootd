@@ -1248,19 +1248,30 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
     {
         auto streams_header = XrdOucTUtils::caseInsensitiveFind(req.headers,"x-number-of-streams");
         if (streams_header != req.headers.end()) {
-            int stream_req = -1;
+            long stream_req = -1;
             try {
                 stream_req = std::stol(streams_header->second);
             } catch (...) { // Handled below
             }
-            if (stream_req < 0 || stream_req > 100) {
+            // Negative or unparseable stays a client error, as stock.
+            if (stream_req < 0) {
                 std::stringstream ss;
                 ss << "Invalid request for number of streams";
                 rec.status = 400;
                 logTransferEvent(LogMask::Info, rec, "INVALID_REQUEST", ss.str());
                 return req.SendSimpleResp(rec.status, NULL, NULL, generateClientErr(ss, rec).c_str(), 0);
             }
-            streams = stream_req == 0 ? 1 : stream_req;
+            // BUG-10 / NFR-1: values above the configured cap are clamped,
+            // not rejected -- existing orchestrator configs keep working,
+            // and per-transfer memory stays bounded by the pool budget.
+            bool clamped = false;
+            streams = static_cast<int>(m_tpcr.ClampStreams(stream_req, clamped));
+            if (clamped) {
+                std::stringstream ss;
+                ss << "X-Number-Of-Streams " << stream_req
+                   << " clamped to configured maximum " << m_tpcr.streams_max;
+                logTransferEvent(LogMask::Info, rec, "STREAMS_CLAMPED", ss.str());
+            }
         }
     }
     rec.streams = streams;

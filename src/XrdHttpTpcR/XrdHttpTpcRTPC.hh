@@ -12,6 +12,8 @@
 
 #include "XrdTls/XrdTlsTempCA.hh"
 #include "XrdHttpTpcPMarkManager.hh"
+#include "XrdHttpTpcRConfig.hh"
+#include "XrdHttpTpcRSlabPool.hh"
 
 #include <curl/curl.h>
 #include <openssl/ssl.h>
@@ -218,6 +220,14 @@ private:
     static const int m_pipelining_multiplier = 16;
 
     bool usingEC; // indicate if XrdEC is used
+
+    // Parsed tpcr.* configuration (FR-30); populated by Configure().
+    TPCR::Config m_tpcr;
+
+    // Server-global slab pool backing the reorder buffers (NFR-1); sized
+    // from m_tpcr at Configure().  The scheduler (WP-4) reserves a slab per
+    // in-flight range through this pool.
+    std::unique_ptr<SlabPool> m_slab_pool;
 
     static bool allowMissingCRL;
 
