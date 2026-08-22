@@ -66,4 +66,15 @@ if(TARGET XrdServer)
           GTest::gtest_main)
 
   gtest_discover_tests(xrdhttptpcr-state-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
+
+  # Integration: real xrootd + TPCR handler against the fault-injectable
+  # mock source (T-I1, T-I2, early T-I3/T-I4).  Skips (127) when python3,
+  # curl, or the built artifacts are unavailable.
+  add_test(NAME XrdHttpTpcR::integration
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/tpcr_test.sh
+                   ${CMAKE_BINARY_DIR})
+  set_tests_properties(XrdHttpTpcR::integration PROPERTIES
+                       SKIP_RETURN_CODE 127
+                       TIMEOUT 600
+                       LABELS "integration")
 endif()
