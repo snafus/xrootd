@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** WP-4 — range scheduler (FSM, retry classification, backoff, ConfigureHandle, slab wiring).
+**Current focus:** WP-5 — degraded state (Tier-1 recovery: teardown/rebuild, re-HEAD revalidation, recovery budget).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
@@ -8,7 +8,7 @@
 | WP-1 Stream rework | done | 8bba3eeb8 | 22/22 TPCR, 32/32 incl. stock | CommittedOffset/ReorderSpan surface; BUG-6/7 dispositions in; commit hook ready for WP-10. |
 | WP-2 Slab pool | done | (this commit) | 35/35 TPCR+stock; ASan+TSan clean | Pool + tpcr.{blocksize,mempool.max,streams.max} + BUG-10 clamp. Entry wiring at WP-4 (see DECISIONS). |
 | WP-3 Response validation | done | fdaac1ffc | 55/55 | Body-start + completion validation; expected/reported split; permanent-class error codes ready for FR-12. |
-| WP-4 Range scheduler | todo | | | |
+| WP-4 Range scheduler | done | 2f8bf506d, b8c05c884, 224ecbd27, ad79aba00 | 73/73 unit + 18/18 integration | Pure FSM + curl loop; Multistream deleted; slab wiring done; T-P1 baseline: no regression, ~3x at 4 streams (loopback). |
 | WP-5 Degraded state | todo | | | |
 | WP-6 Backend semantics matrix | todo | | | |
 | WP-7 Journal + checkpointing | todo | | | |

@@ -48,6 +48,36 @@ gcc 11's ThreadSanitizer runtime is incompatible with the high ASLR entropy of t
 kernel 6.8 testbed ("unexpected memory mapping"); sanitizer runs use
 `setarch $(uname -m) -R <binary>`.  ASan needs no workaround.  Touches: T-U6 procedure.
 
+**2026-08-22 / WP-4 — Retry re-fetches only the undelivered remainder.**
+02 §6 does not specify what happens to bytes a failed range already delivered.  Decision:
+they are kept.  They are validated 206 data accepted in order by the Stream, so the retry
+shrinks the range to the remainder rather than purging and re-fetching.  This removes any
+need for a purge API, guarantees no byte is delivered twice (FR-10's exactly-once over
+issue history), and keeps the Stream's prior-offset guard as a hard invariant.  Trust
+model equals stock: data received through the TLS/TCP channel before a failure is as
+trustworthy as data received before a success.  Touches: FR-10, FR-13, FR-25 groundwork.
+
+**2026-08-22 / WP-4 — Handles are NOT reset after clean completions.**
+SUB-5 requires full reconfiguration after every reset; it does not require a reset per
+request.  A clean completion keeps the handle (and its live connection + TLS session);
+per-request state is rebuilt by ResetAfterRequest and every issue sets CURLOPT_RANGE
+afresh.  Only cancelled/failed handles are reset+reconfigured.  Resetting per range would
+force a TLS handshake per 16 MiB block — a needless NFR-2 regression.  Touches: SUB-5,
+NFR-2.
+
+**2026-08-22 / WP-4 — Two scheduler translation units.**
+The 03 file map lists XrdHttpTpcRScheduler.{cc,hh}; the implementation splits the pure
+FSM (XrdHttpTpcRSchedulerCore.cc, curl-free, exhaustively unit-tested) from the curl
+loop (XrdHttpTpcRScheduler.cc).  Same surface, better testability.  Touches: file map
+only.
+
+**2026-08-22 / WP-4 — `+notls` required on non-TLS deployments.**
+XrdHttp only loads ext handlers lacking the `+notls` tag from its HTTPS initialization
+path; on a server without TLS they are silently never loaded.  The integration harness
+uses `http.exthandler xrdtpcr +notls …`; the WP-13 admin guide must document this for
+plain-HTTP deployments (production WLCG deployments use TLS and are unaffected).
+Touches: CON-2 documentation.
+
 **2026-08-22 / WP-0 — Verbatim ports keep their identifiers.**
 `XrdHttpTpcPMarkManager.*` and `XrdHttpTpcUtils.*` are copied with their original file
 names, class names and namespaces (`XrdHttpTpc::PMarkManager`, `XrdHttpTpcUtils`), per
