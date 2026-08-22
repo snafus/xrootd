@@ -44,6 +44,17 @@ struct CurlDeleter {
 };
 using ManagedCurlHandle = std::unique_ptr<CURL, CurlDeleter>;
 
+// Wait for activity on a curl multi handle, or until timeout_ms expires.
+//
+// BUG-9 fix: when libcurl holds no file descriptors (during connect, DNS
+// resolution, or -- once the TPCR scheduler exists -- while every range sits
+// in a retry backoff), curl_multi_wait() returns immediately and the caller
+// busy-spins until the next perf marker.  curl_multi_poll() (libcurl >= 7.66)
+// waits properly in that situation; on older libcurl we emulate it with a
+// bounded sleep.  All transfer loops must use this instead of calling
+// curl_multi_wait() directly.
+CURLMcode MultiWait(CURLM *multi_handle, int timeout_ms);
+
 
 class TPCRHandler : public XrdHttpExtHandler {
 public:

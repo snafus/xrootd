@@ -419,9 +419,7 @@ int TPCRHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
         if (max_sleep_time <= 0) {
             continue;
         }
-        int fd_count;
-        mres = curl_multi_wait(multi_handle, NULL, 0, max_sleep_time*1000,
-                               &fd_count);
+        mres = MultiWait(multi_handle, max_sleep_time*1000);
         if (mres != CURLM_OK) {
             break;
         }

@@ -56,7 +56,12 @@ void State::Move(State &other)
     other.m_curl = NULL;
     other.m_headers = NULL;
     other.m_stream = NULL;
-    other.m_repr_digests = m_repr_digests;
+    // BUG-4 fix: the stock code assigned this the wrong way around
+    // (other.m_repr_digests = m_repr_digests), overwriting the source's
+    // digests with our own (empty) map and losing them.  Move them over,
+    // matching the copy-then-clear treatment of the other fields.
+    m_repr_digests = std::move(other.m_repr_digests);
+    other.m_repr_digests.clear();
 }
 
 
@@ -187,6 +192,29 @@ void State::SetupHeadersForHEAD(XrdHttpExtReq &req) {
   }
 }
 
+// Reconstruct every field of transient (per-request) state, as if freshly
+// constructed.  A State object is reused across many range requests, and under
+// retry the same curl handle serves ranges that previously failed -- any field
+// missed here leaks state from one request into the next.
+//
+// BUG-5 fix: the stock code did not clear the error fields, so a handle that
+// had recorded an error once would misattribute that stale error text to
+// whichever later range happened to fail.
+//
+// Checklist of transient fields (keep in sync with the State data members;
+// when adding a member, decide explicitly whether it belongs here):
+//   m_offset             bytes received in the current request       -> 0
+//   m_status_code        HTTP status of the current response        -> -1
+//   m_content_length     length claimed by the current response     -> -1
+//   m_push_length        push-mode file size probe                  -> -1
+//   m_recv_all_headers   header-parser progress flag                -> false
+//   m_recv_status_line   header-parser progress flag                -> false
+//   m_repr_digests       digests parsed from the current response   -> clear
+//   m_error_buf          error text of the current request          -> clear
+//   m_error_code         error class of the current request        -> errNone
+// NOT reset (they describe the transfer, not the request):
+//   m_start_offset, m_stream, m_curl, m_headers*, m_push,
+//   m_is_transfer_state, tpcForwardCreds, m_finalize_error_*
 void State::ResetAfterRequest() {
     m_offset = 0;
     m_status_code = -1;
@@ -195,6 +223,8 @@ void State::ResetAfterRequest() {
     m_recv_all_headers = false;
     m_recv_status_line = false;
     m_repr_digests.clear();
+    m_error_buf.clear();
+    m_error_code = errNone;
 }
 
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)

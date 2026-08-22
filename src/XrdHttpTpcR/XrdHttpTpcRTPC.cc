@@ -33,6 +33,28 @@
 
 using namespace TPCR;
 
+CURLMcode TPCR::MultiWait(CURLM *multi_handle, int timeout_ms)
+{
+#if CURL_AT_LEAST_VERSION(7, 66, 0)
+    // curl_multi_poll waits for the full timeout even with zero file
+    // descriptors registered, which is exactly the semantic the transfer
+    // loops need; no fallback logic required.
+    return curl_multi_poll(multi_handle, NULL, 0, timeout_ms, NULL);
+#else
+    // Pre-7.66 emulation (see MultiWait declaration / BUG-9): if libcurl had
+    // nothing to wait on, curl_multi_wait returns at once -- sleep a bounded
+    // amount so the caller does not spin.  100 ms keeps the loop responsive
+    // to newly-connectable sockets while capping the spin at ~10 Hz.
+    int fd_count = 0;
+    CURLMcode mres = curl_multi_wait(multi_handle, NULL, 0, timeout_ms, &fd_count);
+    if (mres == CURLM_OK && fd_count == 0) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(std::min(timeout_ms, 100)));
+    }
+    return mres;
+#endif
+}
+
 XrdXrootdTpcMon* TPCRHandler::TPCLogRecord::tpcMonitor = 0;
 
 uint64_t TPCRHandler::m_monid{0};
@@ -884,8 +906,7 @@ int TPCRHandler::RunCurlWithUpdates(CURL *curl, XrdHttpExtReq &req, State &state
         if (max_sleep_time <= 0) {
             continue;
         }
-        int fd_count;
-        mres = curl_multi_wait(multi_handle, NULL, 0, max_sleep_time*1000, &fd_count);
+        mres = MultiWait(multi_handle, max_sleep_time*1000);
         if (mres != CURLM_OK) {
             break;
         }
