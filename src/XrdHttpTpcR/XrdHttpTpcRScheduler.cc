@@ -30,6 +30,7 @@
 #include "XrdHttpTpcRState.hh"
 #include "XrdHttpTpcRStream.hh"
 #include "XrdHttpTpcRScheduler.hh"
+#include "XrdHttpTpcRJournal.hh"
 
 #include "XrdSys/XrdSysError.hh"
 
@@ -124,6 +125,7 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
                                   const std::string &resource_url,
                                   const std::string &interface_ip,
                                   const SourceValidators &baseline,
+                                  Checkpointer *checkpointer,
                                   TPCLogRecord &rec)
 {
     std::vector<State*> states;
@@ -131,7 +133,8 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
     try {
         int retval = RunPullSchedulerImpl(req, state, stream, streams,
                                           resource_url, interface_ip,
-                                          baseline, states, owned_handles, rec);
+                                          baseline, checkpointer,
+                                          states, owned_handles, rec);
         for (auto *each : states) {delete each;}
         return retval;
     } catch (std::runtime_error &e) {
@@ -154,6 +157,7 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                                       const std::string &resource_url,
                                       const std::string &interface_ip,
                                       const SourceValidators &baseline,
+                                      Checkpointer *checkpointer,
                                       std::vector<State*> &states,
                                       std::vector<ManagedCurlHandle> &owned_handles,
                                       TPCLogRecord &rec)
@@ -554,10 +558,18 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                 }
                 // Probe failed retryably: pause, then re-HEAD again.
             }
-            // Pause between probes, keeping markers flowing (FR-15).
+            // Pause between probes, keeping markers flowing (FR-15) and the
+            // lease renewed (FR-22: expiry is 2 x checkpoint.secs; the timed
+            // checkpoint trigger renews it even with zero commit progress,
+            // and the data sync it implies is a no-op on a quiet handle).
             const time_t pause_end = time(NULL) + probe_pause;
             while (time(NULL) < pause_end) {
                 if (!marker_tick()) {return DegradedResult::ClientGone;}
+                if (checkpointer) {
+                    checkpointer->MaybeCheckpoint(stream,
+                                                  stream.CommittedOffset(),
+                                                  time(NULL));
+                }
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
             probe_pause = std::min(probe_pause * 2, 15);
@@ -591,11 +603,13 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             }
             if (SendPerfMarker(req, rec, states, bytes)) {
                 // SUB-6: a failed chunk write means the client is gone.
-                // Stop scheduling and exit WITHOUT further client writes.
-                // (FR-17 final checkpoint runs here once WP-7 lands.)
+                // Stop scheduling; the client_gone path below flushes,
+                // takes the FR-17 final checkpoint, and exits WITHOUT
+                // further client writes.
                 logTransferEvent(LogMask::Error, rec, "PERFMARKER_FAIL",
                     "Failed to send a perf marker to the TPC client; client disconnected");
-                return -1;
+                client_gone = true;
+                break;
             }
             // Global stall backstop, stock semantics (SUB-11: outermost of
             // the three timers; operators' existing tuning still applies).
@@ -741,9 +755,14 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
 
         if (aborted) {break;}
 
-        // Commit advance drives the window (and, from WP-7, checkpoints).
+        // Commit advance drives the window and the checkpoint engine
+        // (FR-19; the SUB-1 data-sync-then-journal ordering lives inside).
         refresh_commit_clock();
         sched.AdvanceCommitted(stream.CommittedOffset());
+        if (checkpointer) {
+            checkpointer->MaybeCheckpoint(stream, stream.CommittedOffset(),
+                                          time(NULL));
+        }
         // Return excess slab reservations to the pool.
         while (slab_stash.size() > sched.InFlight()) {slab_stash.pop_back();}
 
@@ -802,12 +821,17 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
     }
 
     if (client_gone) {
-        // SUB-6: the client connection is dead.  Stop entirely, take the
-        // final checkpoint (WP-7 stub), and exit WITHOUT attempting any
-        // further write to the client -- this is a distinct event, not a
-        // transfer failure.
+        // SUB-6: the client connection is dead.  Stop entirely, flush what
+        // the reorder buffers hold, take the FR-17 final checkpoint, and
+        // exit WITHOUT attempting any further write to the client -- this
+        // is a distinct event, not a transfer failure: no verdict was
+        // sent, so a shared-filesystem retry can resume from W.
+        stream.Flush();
+        if (checkpointer) {
+            checkpointer->FinalCheckpoint(stream, stream.CommittedOffset());
+        }
         logTransferEvent(LogMask::Info, rec, "CLIENT_DISCONNECT",
-            "Client connection lost during recovery; exiting without verdict");
+            "Client connection lost; checkpointed and exiting without verdict");
         return -1;
     }
 
@@ -829,9 +853,13 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
     rec.bytes_transferred = received_bytes();
     if (abort_status) {rec.tpc_status = abort_status;}
 
-    // FR-17: on any admitted failure a final checkpoint (data sync + journal
-    // update) is taken before the failure chunk.  No-op until WP-7 lands the
-    // journal; the call site is deliberately in place already.
+    // FR-17: on any admitted failure the final checkpoint (data sync +
+    // journal update) is taken BEFORE the failure chunk goes out, so a
+    // shared-filesystem retry can resume even though orchestrator cleanup
+    // may render it moot.
+    if (aborted && checkpointer) {
+        checkpointer->FinalCheckpoint(stream, stream.CommittedOffset());
+    }
 
     std::stringstream final_ss;
     bool success = false;
@@ -854,6 +882,22 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             << stream.CommittedOffset() << " of " << content_length;
         logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL", ss2.str());
         final_ss << generateClientErr(ss2, rec);
+    } else if (checkpointer && !([&]() {
+                   // FR-23 success ordering: final data sync -> [checksum
+                   // injection, WP-11] -> journal delete; only then close
+                   // and only then the success chunk.
+                   std::string cleanup_err;
+                   if (!checkpointer->SuccessCleanup(stream, cleanup_err)) {
+                       std::stringstream ss2;
+                       ss2 << cleanup_err;
+                       logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL",
+                                        cleanup_err);
+                       final_ss << generateClientErr(ss2, rec);
+                       return false;
+                   }
+                   return true;
+               })()) {
+        // final_ss already carries the failure message.
     } else if (!states[0]->Finalize()) {
         std::stringstream ss2;
         ss2 << "Failed to finalize and close file handle.";

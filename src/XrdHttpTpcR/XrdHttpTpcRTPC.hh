@@ -14,6 +14,7 @@
 #include "XrdHttpTpcPMarkManager.hh"
 #include "XrdHttpTpcRConfig.hh"
 #include "XrdHttpTpcRScheduler.hh"
+#include "XrdHttpTpcRJournal.hh"
 #include "XrdHttpTpcRSlabPool.hh"
 
 #include <curl/curl.h>
@@ -183,17 +184,21 @@ private:
 
     // The WP-4 range-scheduler transfer loop: drives ALL pull transfers,
     // including streams=1 (FR-7).  Defined in XrdHttpTpcRScheduler.cc.
+    // checkpointer is nullable: resume disabled, or journal creation
+    // failed (both degrade to stock single-session behavior, CON-3).
     int RunPullScheduler(XrdHttpExtReq &req, TPCR::State &state,
                          TPCR::Stream &stream, size_t streams,
                          const std::string &resource_url,
                          const std::string &interface_ip,
                          const TPCR::SourceValidators &baseline,
+                         TPCR::Checkpointer *checkpointer,
                          TPCLogRecord &rec);
     int RunPullSchedulerImpl(XrdHttpExtReq &req, TPCR::State &state,
                              TPCR::Stream &stream, size_t streams,
                              const std::string &resource_url,
                              const std::string &interface_ip,
                              const TPCR::SourceValidators &baseline,
+                             TPCR::Checkpointer *checkpointer,
                              std::vector<TPCR::State*> &states,
                              std::vector<ManagedCurlHandle> &owned_handles,
                              TPCLogRecord &rec);

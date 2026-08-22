@@ -1392,10 +1392,45 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
     state.SetupHeaders(req);
     state.SetContentLength(sourceFileContentLength);
 
+    // Journal creation at open time (FR-18; 02 §4 case (a)): creating it
+    // now, not at the first checkpoint, bounds the never-resumable window
+    // to transfers that die before the open completes.  Failure to create
+    // it only disables resume for this transfer (CON-3: degrade safely).
+    std::unique_ptr<TPCR::JournalStore> journal_store;
+    std::unique_ptr<TPCR::Checkpointer> checkpointer;
+    if (m_tpcr.resume) {
+        const std::string dest_path =
+            full_url.substr(0, full_url.find('?'));
+        journal_store.reset(new TPCR::JournalStore(
+            m_sfs, dest_path, m_tpcr.journal_suffix, &req.GetSecEntity()));
+        TPCR::JournalRecord record;
+        record.committed = 0;
+        record.source_url = TPCR::NormalizeSourceUrl(resource);
+        record.validators = sourceValidators;
+        record.lease_owner = TPCR::JournalRecord::NewLeaseOwner();
+        record.created = record.updated = time(NULL);
+        record.lease_expiry =
+            record.created + 2 * (int64_t)m_tpcr.checkpoint_secs;
+        record.block_size = m_tpcr.block_size;
+        record.streams = (uint32_t)streams;
+        std::string journal_err;
+        if (journal_store->Commit(record, journal_err)) {
+            checkpointer.reset(new TPCR::Checkpointer(
+                *journal_store, record, m_tpcr.checkpoint_bytes,
+                m_tpcr.checkpoint_secs, m_log));
+            logTransferEvent(LogMask::Debug, rec, "JOURNAL_CREATED",
+                             journal_store->JournalPath());
+        } else {
+            logTransferEvent(LogMask::Warning, rec, "JOURNAL_DISABLED",
+                "journal creation failed; resume disabled for this transfer: "
+                + journal_err);
+        }
+    }
+
     // FR-7: every pull -- streams=1 included -- runs through the range
     // scheduler.  There is exactly one pull code path.
     return RunPullScheduler(req, state, stream, streams, resource, iface_ip,
-                            sourceValidators, rec);
+                            sourceValidators, checkpointer.get(), rec);
 }
 
 /******************************************************************************/

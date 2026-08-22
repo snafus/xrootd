@@ -67,6 +67,30 @@ if(TARGET XrdServer)
 
   gtest_discover_tests(xrdhttptpcr-state-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
 
+  # T-U11 journal record: needs XrdOucCRC (XrdUtils) and the Stream/SlabPool
+  # objects the journal translation unit references.
+  add_executable(xrdhttptpcr-journal-unit-tests
+          XrdHttpTpcRJournalTests.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRJournal.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc)
+
+  target_link_libraries(xrdhttptpcr-journal-unit-tests
+          XrdServer
+          XrdUtils
+          GTest::gtest
+          GTest::gtest_main)
+
+  gtest_discover_tests(xrdhttptpcr-journal-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
+
+  # Ops tool (shipped per WP-13): dumps a TPCR journal for inspection.
+  add_executable(tpcr-journal-dump
+          tpcr-journal-dump.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRJournal.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc)
+  target_link_libraries(tpcr-journal-dump XrdServer XrdUtils)
+
   # Integration: real xrootd + TPCR handler against the fault-injectable
   # mock source (T-I1, T-I2, early T-I3/T-I4).  Skips (127) when python3,
   # curl, or the built artifacts are unavailable.
@@ -77,4 +101,16 @@ if(TARGET XrdServer)
                        SKIP_RETURN_CODE 127
                        TIMEOUT 600
                        LABELS "integration")
+
+  # WP-6 backend semantics matrix (M2 gate) and WP-7 crash matrix (T-I5).
+  add_test(NAME XrdHttpTpcR::backend_matrix
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/backend_matrix.sh
+                   ${CMAKE_BINARY_DIR})
+  set_tests_properties(XrdHttpTpcR::backend_matrix PROPERTIES
+                       SKIP_RETURN_CODE 127 TIMEOUT 300 LABELS "integration")
+  add_test(NAME XrdHttpTpcR::crash_matrix
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/crash_matrix.sh
+                   ${CMAKE_BINARY_DIR})
+  set_tests_properties(XrdHttpTpcR::crash_matrix PROPERTIES
+                       SKIP_RETURN_CODE 127 TIMEOUT 600 LABELS "integration")
 endif()

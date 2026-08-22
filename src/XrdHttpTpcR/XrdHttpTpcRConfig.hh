@@ -56,6 +56,18 @@ struct Config {
     // curl's low-speed limits and the global stall timeout -- SUB-11).
     unsigned range_timeout = 60;                  // tpcr.range.timeout
 
+    // --- WP-7 ---
+    // Cross-session resume master switch (recommended off on non-shared-FS
+    // deployments -- 02 §12).  Consumed by WP-8's open path; the journal
+    // machinery honors it from WP-7 (no journal written when off).
+    bool     resume = true;                       // tpcr.resume
+    // Sidecar journal suffix (FR-18).
+    std::string journal_suffix = ".xrdtpcr";      // tpcr.journal.suffix
+    // Checkpoint cadence (FR-19): every checkpoint_bytes of commit advance
+    // or checkpoint_secs, whichever first.  Defaults 4 GiB / 60 s.
+    uint64_t checkpoint_bytes = 4ULL << 30;       // tpcr.checkpoint.bytes
+    unsigned checkpoint_secs = 60;                // tpcr.checkpoint.secs
+
     // --- WP-5 ---
     // Recovery budget (FR-16): the degraded state may ride through a total
     // source outage for this many seconds of zero commit progress before

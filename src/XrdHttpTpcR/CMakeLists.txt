@@ -22,6 +22,7 @@ add_library(${XrdHttpTPCR} MODULE
   XrdHttpTpcRConfig.cc       XrdHttpTpcRConfig.hh
   XrdHttpTpcRConfigure.cc
   XrdHttpTpcPMarkManager.cc  XrdHttpTpcPMarkManager.hh
+  XrdHttpTpcRJournal.cc      XrdHttpTpcRJournal.hh
   XrdHttpTpcRScheduler.cc    XrdHttpTpcRScheduler.hh
   XrdHttpTpcRSchedulerCore.cc
   XrdHttpTpcRSlabPool.cc     XrdHttpTpcRSlabPool.hh

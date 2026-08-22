@@ -88,6 +88,10 @@ public:
 
     int Read(off_t offset, char *buffer, size_t size);
 
+    // Forwards to XrdSfsFile::sync(): the checkpoint's durability step
+    // (SUB-1).  On POSIX OSS this is a real fsync (XRD-4).
+    int Sync() {return m_fh->sync();}
+
     // Writes a buffer of a given size to an offset.
     // This will often keep the buffer in memory in to present the underlying
     // filesystem with a single stream of data (required for HDFS); further,

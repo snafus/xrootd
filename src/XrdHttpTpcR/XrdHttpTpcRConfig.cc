@@ -186,6 +186,51 @@ bool Config::Set(const std::string &directive, const std::string &value,
         range_timeout = static_cast<unsigned>(seconds);
         return true;
     }
+    if (directive == "tpcr.resume") {
+        bool flag;
+        if (!ParseBool(value, flag)) {
+            bad << directive << " value '" << value << "' is not a boolean";
+            err = bad.str();
+            return false;
+        }
+        resume = flag;
+        return true;
+    }
+    if (directive == "tpcr.journal.suffix") {
+        // Must be a plausible filename suffix: non-empty, no path
+        // separators, bounded (it rides on every journal path).
+        if (value.empty() || value.size() > 64 ||
+            value.find('/') != std::string::npos || value[0] != '.') {
+            bad << directive << " value '" << value
+                << "' must start with '.' and contain no '/' (max 64 chars)";
+            err = bad.str();
+            return false;
+        }
+        journal_suffix = value;
+        return true;
+    }
+    if (directive == "tpcr.checkpoint.bytes") {
+        uint64_t size;
+        if (!ParseSize(value, size) || size < (1ULL << 20)) {
+            bad << directive << " value '" << value
+                << "' is not a valid size (>= 1m)";
+            err = bad.str();
+            return false;
+        }
+        checkpoint_bytes = size;
+        return true;
+    }
+    if (directive == "tpcr.checkpoint.secs") {
+        uint64_t seconds;
+        if (!ParseDuration(value, seconds) || seconds < 5 || seconds > 3600) {
+            bad << directive << " value '" << value
+                << "' is not a valid duration in [5s, 1h]";
+            err = bad.str();
+            return false;
+        }
+        checkpoint_secs = static_cast<unsigned>(seconds);
+        return true;
+    }
     if (directive == "tpcr.recovery.maxsecs") {
         uint64_t seconds;
         if (!ParseDuration(value, seconds) || seconds < 5 || seconds > 86400) {
