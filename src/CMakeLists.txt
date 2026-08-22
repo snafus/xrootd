@@ -119,6 +119,7 @@ if( NOT XRDCL_ONLY )
 
   add_subdirectory( XrdHttp )
   add_subdirectory( XrdHttpTpc )
+  add_subdirectory( XrdHttpTpcR )
 
   add_subdirectory( XrdMacaroons )
   add_subdirectory( XrdVoms )

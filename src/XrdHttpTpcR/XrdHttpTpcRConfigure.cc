@@ -1,0 +1,259 @@
+
+#include "XrdHttpTpcRTPC.hh"
+
+#include <climits>
+#include <dlfcn.h>
+#include <fcntl.h>
+
+#include "XrdOuc/XrdOuca2x.hh"
+#include "XrdOuc/XrdOucEnv.hh"
+#include "XrdOuc/XrdOucStream.hh"
+#include "XrdOuc/XrdOucPinPath.hh"
+#include "XrdSfs/XrdSfsInterface.hh"
+#include "XrdHttp/XrdHttpProtocol.hh"
+#include "XrdOuc/XrdOucTUtils.hh"
+
+using namespace TPCR;
+
+
+bool TPCRHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
+{
+    XrdOucEnv cfgEnv;
+    XrdOucStream Config(&m_log, getenv("XRDINSTANCE"), &cfgEnv, "=====> ");
+
+    m_log.setMsgMask(LogMask::Warning | LogMask::Error);
+
+    // test if XrdEC is used
+    usingEC = getenv("XRDCL_EC")? true : false;
+    // Test if the CRL checking is enabled
+    allowMissingCRL = (bool) myEnv->GetInt("http.allowmissingcrl");
+    std::string authLib;
+    std::string authLibParms;
+    int cfgFD = open(configfn, O_RDONLY, 0);
+    if (cfgFD < 0) {
+        m_log.Emsg("Config", errno, "open config file", configfn);
+        return false;
+    }
+    Config.Attach(cfgFD);
+    static const char *cvec[] = { "*** http tpc plugin config:", 0 };
+    Config.Capture(cvec);
+    const char *val;
+    while ((val = Config.GetMyFirstWord())) {
+        if (!strcmp("http.desthttps", val)) {
+            if (!(val = Config.GetWord())) {
+                Config.Close();
+                m_log.Emsg("Config", "http.desthttps value not specified");
+                return false;
+            }
+            if (!strcmp("1", val) || !strcasecmp("yes", val) || !strcasecmp("true", val)) {
+                m_desthttps = true;
+            } else if (!strcmp("0", val) || !strcasecmp("no", val) || !strcasecmp("false", val)) {
+                m_desthttps = false;
+            } else {
+                Config.Close();
+                m_log.Emsg("Config", "https.desthttps value is invalid", val);
+                return false;
+            }
+        } else if (!strcmp("tpc.allow", val)) {
+            if (!(val = Config.GetWord())) {
+                Config.Close();
+                m_log.Emsg("Config", "tpc.allow value not specified");
+                return false;
+            }
+            if (strcmp(val, "local") == 0) {
+              m_allow_local = true;
+            } else if (strcmp(val, "private") == 0) {
+              m_allow_private = true;
+            } else {
+                Config.Close();
+                m_log.Emsg("Config", "tpc.allow value is invalid", val);
+                return false;
+            }
+        } else if (!strcmp("tpc.deny", val)) {
+            if (!(val = Config.GetWord())) {
+                Config.Close();
+                m_log.Emsg("Config", "tpc.deny value not specified");
+                return false;
+            }
+            if (strcmp(val, "local") == 0) {
+              m_allow_local = false;
+            } else if (strcmp(val, "private") == 0) {
+              m_allow_private = false;
+            } else {
+                Config.Close();
+                m_log.Emsg("Config", "tpc.deny value is invalid", val);
+                return false;
+            }
+        } else if (!strcmp("tpc.trace", val)) {
+            if (!ConfigureLogger(Config)) {
+                Config.Close();
+                return false;
+            }
+        } else if (!strcmp("tpc.fixed_route", val)) {
+            if (!(val = Config.GetWord())) {
+                Config.Close();
+                m_log.Emsg("Config", "tpc.fixed_route value not specified");
+                return false;
+            }
+            if (!strcmp("1", val) || !strcasecmp("yes", val) || !strcasecmp("true", val)) {
+                m_fixed_route= true;
+            } else if (!strcmp("0", val) || !strcasecmp("no", val) || !strcasecmp("false", val)) {
+                m_fixed_route= false;
+            } else {
+                Config.Close();
+                m_log.Emsg("Config", "tpc.fixed_route value is invalid", val);
+                return false;
+            }
+        } else if (!strcmp("tpc.header2cgi",val)) {
+            // header2cgi parsing
+            if(XrdHttpProtocol::parseHeader2CGI(Config,m_log,hdr2cgimap)){
+              Config.Close();
+              return false;
+            }
+            // remove authorization header2cgi parsing as it will anyway be added to the CGI before the file open
+            // by the HTTP/TPC logic
+            auto authHdr = XrdOucTUtils::caseInsensitiveFind(hdr2cgimap,"authorization");
+            if(authHdr != hdr2cgimap.end()) {
+              hdr2cgimap.erase(authHdr);
+            }
+        } else if (!strcmp("tpc.low_speed", val)) {
+            if (!(val = Config.GetWord())) {
+                Config.Close();
+                m_log.Emsg("Config", "tpc.low_speed rate not specified.");
+                return false;
+            }
+
+            long long low_speed_limit;
+            if (XrdOuca2x::a2sz(m_log, "low speed rate", val, &low_speed_limit, 0, LONG_MAX)) {
+                return false;
+            }
+            m_low_speed_limit = static_cast<long>(low_speed_limit);
+
+            if ((val = Config.GetWord())) {
+                int low_speed_time;
+                if (XrdOuca2x::a2tm(m_log, "low speed time", val, &low_speed_time, 1)) {
+                    return false;
+                }
+                m_low_speed_time = low_speed_time;
+            }
+        } else if (!strcmp("tpc.timeout", val)) {
+            if (!(val = Config.GetWord())) {
+                Config.Close();
+                m_log.Emsg("Config","tpc.timeout value not specified.");  return false;
+            }
+            if (XrdOuca2x::a2tm(m_log, "timeout value", val, &m_timeout, 0)) return false;
+                // First byte timeout can be set separately from the continuous timeout.
+            if ((val = Config.GetWord())) {
+                if (XrdOuca2x::a2tm(m_log, "first byte timeout value", val, &m_first_timeout, 0)) return false;
+            } else {
+                m_first_timeout = 2*m_timeout;
+            }
+        }
+    }
+    Config.Close();
+
+    // Internal override: allow xrdtpc to use a different ca dir from the one prepared by the xrootd
+    // framework.  meant for exceptional situations where the site might need a specially-prepared set
+    // of cas only for tpc (such as trying out various workarounds for libnss).  Explicitly disables
+    // the NSS hack below.
+    auto env_cadir = getenv("XRDTPC_CADIR");
+    if (env_cadir) m_cadir = env_cadir;
+
+    // Sharing a single pre-parsed CA/CRL store between transfers relies on
+    // CURLOPT_SSL_CTX_FUNCTION, which only libcurl's OpenSSL, mbedTLS and wolfSSL
+    // backends implement; the others reject it with CURLE_NOT_BUILT_IN.  libcurl
+    // checks this against the backend selected at run time rather than at build
+    // time, so probe an actual handle, and do it here so that an unsupported build
+    // is reported at startup instead of silently costing memory per transfer.
+    {
+        ManagedCurlHandle probe(curl_easy_init());
+        m_sslctx_supported = probe &&
+            curl_easy_setopt(probe.get(), CURLOPT_SSL_CTX_FUNCTION,
+                             ssl_ctx_callback) == CURLE_OK;
+        if (!m_sslctx_supported) {
+            m_log.Emsg("Config", "libcurl does not support CURLOPT_SSL_CTX_FUNCTION; "
+                       "each transfer will parse the CA and CRL bundles for itself, "
+                       "which costs significant memory per concurrent transfer.");
+        }
+    }
+
+    const char *cadir = nullptr, *cafile = nullptr;
+    if ((cadir = env_cadir ? env_cadir : myEnv->Get("http.cadir"))) {
+        m_cadir = cadir;
+        if (!env_cadir) {
+            // Only ask for the pre-parsed store when we can actually install it;
+            // maintaining one costs tens of MB that the fallback path never reads.
+            m_ca_file.reset(new XrdTlsTempCA(&m_log, m_cadir, m_sslctx_supported));
+            if (!m_ca_file->IsValid()) {
+                m_log.Emsg("Config", "CAs / CRL generation for libcurl failed.");
+                return false;
+            }
+        }
+    }
+    if ((cafile = myEnv->Get("http.cafile"))) {
+        m_cafile = cafile;
+    }
+
+    if (!cadir && !cafile) {
+        // We do not necessary need TLS to perform HTTP TPC transfers, just log that these values were not specified
+        m_log.Emsg("Config", "neither xrd.tls cadir nor certfile value specified; is TLS enabled?");
+    }
+
+    void *sfs_raw_ptr;
+    if ((sfs_raw_ptr = myEnv->GetPtr("XrdSfsFileSystem*"))) {
+        m_sfs = static_cast<XrdSfsFileSystem*>(sfs_raw_ptr);
+        m_log.Emsg("Config", "Using filesystem object from the framework.");
+        return true;
+    } else {
+        m_log.Emsg("Config", "No filesystem object available to HTTP-TPC subsystem.  Internal error.");
+        return false;
+    }
+    return true;
+}
+
+bool TPCRHandler::ConfigureLogger(XrdOucStream &config_obj)
+{
+    char *val = config_obj.GetWord();
+    if (!val || !val[0])
+    {   
+        m_log.Emsg("Config", "tpc.trace requires at least one directive [all | error | warning | info | debug | none]");
+        return false;
+    }
+    // If the config option is given, reset the log mask.
+    m_log.setMsgMask(0);
+    
+    do {
+        if (!strcasecmp(val, "all"))
+        {   
+            m_log.setMsgMask(m_log.getMsgMask() | LogMask::All);
+        }
+        else if (!strcasecmp(val, "error"))
+        {   
+            m_log.setMsgMask(m_log.getMsgMask() | LogMask::Error);
+        }
+        else if (!strcasecmp(val, "warning"))
+        {   
+            m_log.setMsgMask(m_log.getMsgMask() | LogMask::Warning);
+        }
+        else if (!strcasecmp(val, "info"))
+        {   
+            m_log.setMsgMask(m_log.getMsgMask() | LogMask::Info);
+        }
+        else if (!strcasecmp(val, "debug"))
+        {   
+            m_log.setMsgMask(m_log.getMsgMask() | LogMask::Debug);
+        }
+        else if (!strcasecmp(val, "none"))
+        {   
+            m_log.setMsgMask(0);
+        }
+        else
+        {   
+            m_log.Emsg("Config", "tpc.trace encountered an unknown directive (valid values: [all | error | warning | info | debug | none]):", val);
+            return false;
+        }
+        val = config_obj.GetWord();
+    } while (val);
+    
+    return true;
+}
