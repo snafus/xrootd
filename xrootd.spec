@@ -490,6 +490,7 @@ fi
 %{_bindir}/frm_xfragent
 %{_bindir}/frm_xfrd
 %{_bindir}/mpxstats
+%{_bindir}/tpcr-journal-dump
 %{_bindir}/wait41
 %{_bindir}/xrdacctest
 %{_bindir}/xrdpfc_print
@@ -607,6 +608,7 @@ fi
 %{_libdir}/libXrdFileCache-6.so
 %{_libdir}/libXrdHttp-6.so
 %{_libdir}/libXrdHttpTPC-6.so
+%{_libdir}/libXrdHttpTPCR-6.so
 %{_libdir}/libXrdHttpCors-6.so
 %{_libdir}/libXrdMacaroons-6.so
 %{_libdir}/libXrdN2No2p-6.so

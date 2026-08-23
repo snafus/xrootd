@@ -15,6 +15,37 @@ OPTIONS capability header, an informational `resumable-from:` field on failure
 chunks, an optional `X-Resume: F` client header). Push mode is the stock code,
 unchanged and without resumption.
 
+## Building and deploying
+
+TPCR builds as part of the normal xrootd build — no extra switches; it is
+compiled whenever HTTP support is (libcurl present):
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --parallel
+```
+
+Artifacts: `build/lib/libXrdHttpTPCR-6.so` and `build/bin/tpcr-journal-dump`.
+`cmake --install build` places them in the standard libdir/bindir.
+
+**RPM:** the shipped `xrootd.spec` packages `libXrdHttpTPCR-6.so` in
+`xrootd-server-libs` and `tpcr-journal-dump` in `xrootd-server` — the same
+subpackages that carry the stock TPC handler and server tools, so a plain
+
+```
+./gen-tarball.sh && rpmbuild -tb xrootd-*.tar.gz
+```
+
+on an EL build host produces RPMs that include TPCR; deploying them on a
+gateway that already runs xrootd-server adds the handler with no new
+package to track. **Debian:** the `debian/` packaging includes the same two
+artifacts in `xrootd-server-plugins` and `xrootd-server`.
+
+Rolling out: install the updated server packages on the HTTP gateways, add
+the `http.exthandler` line (below) plus any `tpcr.*` tuning, and restart
+xrootd. Rollback is reverting the config line — the stock handler is still
+in the same package.
+
 ## Loading the handler
 
 ```

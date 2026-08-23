@@ -5,6 +5,7 @@
 /usr/bin/frm_xfragent
 /usr/bin/frm_xfrd
 /usr/bin/mpxstats
+/usr/bin/tpcr-journal-dump
 /usr/bin/wait41
 /usr/bin/xrdacctest
 /usr/bin/xrdpfc_print
