@@ -107,6 +107,28 @@ both the partial file and its journal are visible:
   next attempt; orchestrator retry backoffs longer than ~2 minutes (at
   defaults) never see it.
 
+### Interoperability with standard remote storage
+
+All improvements are unilateral — they run on this (destination) gateway,
+and the remote source sees an ordinary HTTP client. TPCR requires of a
+pull source only what stock multistream TPC already requires: HEAD plus
+ranged GETs (206) over multiple connections, with credentials forwarded
+exactly as stock. Any dCache/EOS/StoRM/xrootd endpoint that serves WLCG
+HTTP-TPC today qualifies, and the parallel-range throughput gains need
+nothing further from the far end.
+
+Optional source capabilities enable optional features, degrading safely
+when absent: no strong validators (ETag/Last-Modified) means cross-session
+resume under the default `strong` policy refuses and runs fresh
+(in-session recovery still works — length is always revalidated); no
+`Repr-Digest` means the end-to-end digest gate does not engage (the local
+checksum is still computed and stored). A source that ignores `Range`
+outright gets a clean permanent failure rather than corruption. Note that
+parallelism follows the client's `X-Number-Of-Streams` (FTS requests this
+by default); a single-stream request keeps the resilience and resume but
+little of the throughput gain. Push mode is stock-verbatim by design:
+unchanged performance, no resume — the remote destination owns its writes.
+
 ### Mixed clusters and partial rollout
 
 Running TPCR on some gateways and stock TPC on others is **safe**: the wire
