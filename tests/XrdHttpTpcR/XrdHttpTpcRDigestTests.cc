@@ -136,7 +136,7 @@ TEST(XrdHttpTpcRDigestTests, RestoreRejectsMismatchedWatermark) {
   EXPECT_TRUE(restored.Restore(blob, 3000, err)) << err;
   // Garbage blobs are rejected, never crash.
   EXPECT_FALSE(restored.Restore("short", 3000, err));
-  EXPECT_FALSE(restored.Restore(std::string(29, '\\xff'), 3000, err));
+  EXPECT_FALSE(restored.Restore(std::string(29, '\xff'), 3000, err));
 }
 
 TEST(XrdHttpTpcRDigestTests, EpochsPartitionTheContent) {

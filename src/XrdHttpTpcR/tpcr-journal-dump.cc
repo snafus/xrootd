@@ -50,8 +50,20 @@ int DumpOne(const char *path)
         fprintf(stderr, "%s: cannot open\n", path);
         return 1;
     }
-    std::string raw((std::istreambuf_iterator<char>(in)),
-                    std::istreambuf_iterator<char>());
+    // Plain size-then-read (istreambuf_iterator trips a GCC 13
+    // -Wnull-dereference false positive in <streambuf> at -O2).
+    in.seekg(0, std::ios::end);
+    const std::streamoff len = in.tellg();
+    in.seekg(0, std::ios::beg);
+    std::string raw;
+    if (len > 0) {
+        raw.resize(static_cast<size_t>(len));
+        in.read(&raw[0], static_cast<std::streamsize>(len));
+    }
+    if (!in) {
+        fprintf(stderr, "%s: read failed\n", path);
+        return 1;
+    }
     JournalRecord record;
     std::string err;
     if (!JournalRecord::Parse(raw.data(), raw.size(), record, err)) {
