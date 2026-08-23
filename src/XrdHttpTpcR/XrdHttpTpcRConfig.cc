@@ -255,6 +255,17 @@ bool Config::Set(const std::string &directive, const std::string &value,
         gc_age_secs = seconds;
         return true;
     }
+    if (directive == "tpcr.verify.tailbytes") {
+        uint64_t size;
+        // 0 is a legitimate (documented, risky) value: verification off.
+        if (!ParseSize(value, size)) {
+            bad << directive << " value '" << value << "' is not a valid size";
+            err = bad.str();
+            return false;
+        }
+        verify_tailbytes = size;
+        return true;
+    }
     if (directive == "tpcr.recovery.maxsecs") {
         uint64_t seconds;
         if (!ParseDuration(value, seconds) || seconds < 5 || seconds > 86400) {

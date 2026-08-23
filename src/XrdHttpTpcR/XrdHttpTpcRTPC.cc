@@ -26,6 +26,10 @@
 #include <stdexcept>
 #include <thread>
 
+#include "XrdCks/XrdCksAssist.hh"
+#include "XrdOuc/XrdOucCRC.hh"
+#include "XrdSfs/XrdSfsFAttr.hh"
+
 #include "XrdHttpTpcRDigest.hh"
 #include "XrdHttpTpcRState.hh"
 #include "XrdHttpTpcRStream.hh"
@@ -1223,6 +1227,123 @@ int TPCRHandler::ProcessPushReq(const std::string & resource, XrdHttpExtReq &req
 /*            T P C H a n d l e r : : P r o c e s s P u l l R e q             */
 /******************************************************************************/
   
+bool TPCRHandler::VerifyResumeTail(const std::string &dest_path,
+                                   const TPCR::JournalRecord &journal,
+                                   const XrdSecEntity *client,
+                                   uint64_t tail_bytes, std::string &reason)
+{
+    // Epochs overlapping [W - tail, W), each verified over its FULL interval
+    // (a partial interval cannot be checked against its digest).  Cost is
+    // bounded by tail + one checkpoint interval.
+    const off_t watermark = journal.committed;
+    const off_t tail_start =
+        watermark > off_t(tail_bytes) ? watermark - off_t(tail_bytes) : 0;
+
+    // A dedicated RDONLY handle: the resume write-open happens later and
+    // carries side effects; this read has none (XRD-6 stays intact).
+    std::unique_ptr<XrdSfsFile> file(m_sfs->newFile());
+    if (!file || file->open(dest_path.c_str(), SFS_O_RDONLY, 0, client, "") !=
+                     SFS_OK) {
+        reason = "could not open the partial for tail verification";
+        return false;
+    }
+
+    std::vector<char> buffer(4 * 1024 * 1024);
+    size_t epochs_checked = 0;
+    for (const auto &epoch : journal.epochs) {
+        const off_t epoch_end = off_t(epoch.offset) + off_t(epoch.length);
+        if (epoch_end <= tail_start) {continue;}       // below the tail span
+        if (epoch_end > watermark || epoch.length == 0) {
+            // Defensive (SUB-9): an epoch past W can only come from a
+            // forged or corrupt record the CRC happened to bless.
+            reason = "journal epoch extends past the watermark";
+            file->close();
+            return false;
+        }
+        uint32_t crc = 0;
+        off_t cursor = off_t(epoch.offset);
+        off_t remaining = off_t(epoch.length);
+        while (remaining > 0) {
+            const XrdSfsXferSize want = XrdSfsXferSize(
+                std::min<off_t>(remaining, off_t(buffer.size())));
+            const XrdSfsXferSize got = file->read(cursor, buffer.data(), want);
+            if (got != want) {
+                reason = "short read during tail verification";
+                file->close();
+                return false;
+            }
+            crc = XrdOucCRC::Calc32C(buffer.data(), size_t(got), crc);
+            cursor += got;
+            remaining -= got;
+        }
+        if (crc != epoch.crc32c) {
+            std::stringstream ss;
+            ss << "epoch [" << epoch.offset << ", " << epoch_end
+               << ") CRC mismatch: destination data does not match what the "
+               << "journal attested";
+            reason = ss.str();
+            file->close();
+            return false;
+        }
+        epochs_checked++;
+    }
+    file->close();
+    if (m_log.getMsgMask() & LogMask::Debug) {
+        std::stringstream ss;
+        ss << "tail verification passed: " << epochs_checked
+           << " epoch(s) over [" << tail_start << ", " << watermark << ")";
+        m_log.Emsg("TailVerify", ss.str().c_str());
+    }
+    return true;
+}
+
+void TPCRHandler::InjectChecksum(const std::string &dest_path,
+                                 const std::string &adler_hex,
+                                 const XrdSecEntity *client, TPCLogRecord &rec)
+{
+    // XRD-2 mandatory ordering, enforced by the call site: the destination
+    // is CLOSED before we stat, so the mtime we bind into the attribute is
+    // the settled one.  A stale-mtime attribute is a SILENT performance
+    // failure (the checksum manager quietly recalculates terabytes), which
+    // is why the negative test in T-I10 exists.
+    struct stat settled;
+    XrdOucErrInfo error;
+    if (m_sfs->stat(dest_path.c_str(), &settled, error, client) != SFS_OK) {
+        logTransferEvent(LogMask::Info, rec, "CKSUM_INJECT_SKIP",
+                         "destination stat failed; checksum not injected");
+        return;
+    }
+    std::vector<char> attr_data =
+        XrdCksAttrData("adler32", adler_hex.c_str(), settled.st_mtime);
+    if (attr_data.empty()) {
+        logTransferEvent(LogMask::Info, rec, "CKSUM_INJECT_SKIP",
+                         "could not build checksum attribute data");
+        return;
+    }
+    std::string attr_name = XrdCksAttrName("adler32");
+
+    XrdSfsFACtl ctl(dest_path.c_str(), nullptr, 1);
+    ctl.rqst = XrdSfsFACtl::faSet;
+    ctl.info = new XrdSfsFAInfo[1];   // freed by ~XrdSfsFACtl
+    ctl.info[0].Name = const_cast<char *>(attr_name.c_str());
+    ctl.info[0].NLen = short(attr_name.size());
+    ctl.info[0].Value = attr_data.data();
+    ctl.info[0].VLen = int(attr_data.size());
+
+    if (m_sfs->FAttr(&ctl, error, client) != SFS_OK ||
+        ctl.info[0].faRC != 0) {
+        // FR-27: no store / unsupported backend => skip silently (Info-level
+        // trace only); a subsequent checksum query just recalculates.
+        std::stringstream ss;
+        ss << "checksum attribute set failed (rc="
+           << ctl.info[0].faRC << "); store not updated";
+        logTransferEvent(LogMask::Info, rec, "CKSUM_INJECT_SKIP", ss.str());
+        return;
+    }
+    logTransferEvent(LogMask::Debug, rec, "CKSUM_INJECTED",
+                     "adler32 " + adler_hex + " -> " + attr_name);
+}
+
 int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) {
     TPCLogRecord rec(req,TpcType::Pull);
     rec.allow_local = m_allow_local;
@@ -1475,6 +1596,14 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
                 return req.SendSimpleResp(409, NULL,
                     const_cast<char *>(retry_hdr.str().c_str()),
                     const_cast<char *>(body.str().c_str()), 0);
+            } else if (m_tpcr.verify_tailbytes > 0 && journal.committed > 0 &&
+                       !VerifyResumeTail(dest_path, journal,
+                                         &req.GetSecEntity(),
+                                         m_tpcr.verify_tailbytes, reason)) {
+                // FR-28: the tail of the partial no longer matches what the
+                // journal attested (torn write, external tampering, or a
+                // lying backend) -- resume would build on bad bytes.
+                reject("reason=tail-verify (" + reason + ")");
             } else if (journal.committed > 0 &&
                        !digests.Restore(journal.digest_state,
                                         journal.committed, reason)) {
@@ -1636,8 +1765,8 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
     // FR-7: every pull -- streams=1 included -- runs through the range
     // scheduler.  There is exactly one pull code path.
     return RunPullScheduler(req, state, stream, streams, resource, iface_ip,
-                            sourceValidators, checkpointer.get(), &digests,
-                            rec);
+                            dest_path, sourceValidators, checkpointer.get(),
+                            &digests, rec);
 }
 
 /******************************************************************************/

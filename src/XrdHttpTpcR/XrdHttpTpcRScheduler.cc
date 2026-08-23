@@ -125,6 +125,7 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
                                   Stream &stream, size_t streams,
                                   const std::string &resource_url,
                                   const std::string &interface_ip,
+                                  const std::string &dest_path,
                                   const SourceValidators &baseline,
                                   Checkpointer *checkpointer,
                                   TransferDigests *digests,
@@ -135,8 +136,8 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
     try {
         int retval = RunPullSchedulerImpl(req, state, stream, streams,
                                           resource_url, interface_ip,
-                                          baseline, checkpointer, digests,
-                                          states, owned_handles, rec);
+                                          dest_path, baseline, checkpointer,
+                                          digests, states, owned_handles, rec);
         for (auto *each : states) {delete each;}
         return retval;
     } catch (std::runtime_error &e) {
@@ -158,6 +159,7 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                                       Stream &stream, size_t streams,
                                       const std::string &resource_url,
                                       const std::string &interface_ip,
+                                      const std::string &dest_path,
                                       const SourceValidators &baseline,
                                       Checkpointer *checkpointer,
                                       TransferDigests *digests,
@@ -963,6 +965,13 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL", ss2.str());
         final_ss << generateClientErr(ss2, rec);
     } else {
+        // FR-27 via the XRD-2 route: the file is now CLOSED (Finalize just
+        // ran); inject the adler32 into the checksum store bound to the
+        // settled mtime, then -- and only then -- attest success.
+        if (digests) {
+            InjectChecksum(dest_path, digests->AdlerHex(),
+                           &req.GetSecEntity(), rec);
+        }
         final_ss << "success: Created";
         success = true;
     }

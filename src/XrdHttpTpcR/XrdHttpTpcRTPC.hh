@@ -152,6 +152,27 @@ private:
     // and, later, the journal (FR-21).
     int GetRemoteFileInfoTPCPull(CURL *curl, XrdHttpExtReq &req, uint64_t & contentLength, std::map<std::string,std::string> & reprDigest, bool & success, TPCLogRecord &rec, TPCR::SourceValidators *validators = nullptr);
 
+    // FR-28 resume-time tail verification: re-reads the journal epochs
+    // overlapping the last `tail_bytes` below W through a dedicated RDONLY
+    // SFS handle and compares their CRC32C against the journal.  Returns
+    // false with a reason on mismatch/short-read -- the caller rejects the
+    // resume.  This (plus the validator ladder) is the defense that keeps a
+    // forged journal from making the server skip bytes it never wrote
+    // (SUB-9).
+    bool VerifyResumeTail(const std::string &dest_path,
+                          const TPCR::JournalRecord &journal,
+                          const XrdSecEntity *client, uint64_t tail_bytes,
+                          std::string &reason);
+
+    // FR-27 checksum-store injection via the XRD-2 route: the file is
+    // already CLOSED; stat the settled mtime, build the checksum xattr with
+    // XrdCksAttrData bound to THAT mtime, and set it through the SFS FAttr
+    // interface.  Any failure logs and skips silently (a checksum query
+    // then simply recalculates -- correct, just slower).
+    void InjectChecksum(const std::string &dest_path,
+                        const std::string &adler_hex,
+                        const XrdSecEntity *client, TPCLogRecord &rec);
+
     // Mid-session source re-probe on a dedicated easy handle (SUB-7: the
     // transfer states and the multi handle are never touched).  Returns
     // true and fills `fresh` when the HEAD succeeded; false on transport
@@ -191,6 +212,7 @@ private:
                          TPCR::Stream &stream, size_t streams,
                          const std::string &resource_url,
                          const std::string &interface_ip,
+                         const std::string &dest_path,
                          const TPCR::SourceValidators &baseline,
                          TPCR::Checkpointer *checkpointer,
                          TPCR::TransferDigests *digests,
@@ -199,6 +221,7 @@ private:
                              TPCR::Stream &stream, size_t streams,
                              const std::string &resource_url,
                              const std::string &interface_ip,
+                             const std::string &dest_path,
                              const TPCR::SourceValidators &baseline,
                              TPCR::Checkpointer *checkpointer,
                              TPCR::TransferDigests *digests,

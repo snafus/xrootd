@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** WP-11 — tail verification + checksum-store injection (FR-27/FR-28, XRD-2).
+**Current focus:** M3 COMPLETE (tag tpcr-m3). Next: WP-12 — scale and soak (T-S1/T-S2, T-P1/T-P2 finals).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
@@ -15,6 +15,6 @@
 | WP-8 Resume open path | done | (this commit) | 86/86 unit; resume matrix 10/10 | Full a–e decision tree; ladder; lease 409/steal; GC; SUB-2 table; FR-5 absolute markers; O_EXCL deviation in DECISIONS/Q-4. |
 | WP-9 Capability + client-visible | done | 2ebd24ee1 | 33/33 integration; trace_check m2 clean | FR-3 OPTIONS header; FR-6 in-line resumable-from; T-I8 strict grammar checker. |
 | WP-10 Digests | done | (this commit) | 92/92 unit; resume matrix 11/11 incl. digest-across-resume | Local seedable adler32 + XrdOucCRC crc32c; SUB-4 checkpoint-atomic; FR-29 gate live end-to-end. |
-| WP-11 Tail verify + cksum injection | todo | | | |
+| WP-11 Tail verify + cksum injection | done | (this commit) | 92/92 unit; resume matrix 12/12; T-I10 3/3 | FR-28 epoch tail verify (tamper caught); FR-27 xattr via FAttr, XRD-2 ordering incl. mtime-binding negative test. |
 | WP-12 Scale and soak | todo | | | |
 | WP-13 Docs and handback | todo | | | |

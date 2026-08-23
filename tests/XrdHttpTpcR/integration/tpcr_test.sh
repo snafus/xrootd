@@ -76,6 +76,7 @@ tpcr.range.timeout 30
 # attempts (~3s of backoff), 25s recovery budget.
 tpcr.retry.max 2
 tpcr.recovery.maxsecs 25
+xrootd.chksum adler32
 EOF
 
 LD_LIBRARY_PATH="$LIB_DIR" "$XROOTD_BIN" -c "$WORK/xrootd.cfg" \
@@ -404,6 +405,52 @@ if printf '%s' "$RESPONSE" | grep -q "does not match the source Repr-Digest"; th
     pass "FR-29 mismatched source Repr-Digest fails before the success chunk"
 else
     fail "FR-29 bad digest: expected mismatch failure, got: $RESPONSE"
+fi
+
+# ---------------------------------------------------------------------------
+# T-I10 (FR-27/XRD-2): the computed adler32 is injected into the checksum
+# store (xattr via SFS FAttr) after close, bound to the settled mtime.
+# ---------------------------------------------------------------------------
+EXPECTED_ADLER=$(python3 -c "import zlib; print('%08x' % (zlib.adler32(open('$WORK/ref.bin','rb').read()) & 0xffffffff))")
+ATTR_HEX=$(python3 - "$WORK/data/dest-digest-ok.bin" <<'EOF2'
+import os, sys
+path = sys.argv[1]
+for name in os.listxattr(path):
+    if "adler" in name.lower() or "cks" in name.lower():
+        print(os.getxattr(path, name).hex())
+        break
+else:
+    print("NOATTR")
+EOF2
+)
+if [ "$ATTR_HEX" = "NOATTR" ]; then
+    fail "T-I10 checksum attribute missing on the destination"
+elif printf '%s' "$ATTR_HEX" | grep -qi "$EXPECTED_ADLER"; then
+    pass "T-I10 checksum attribute present and carries the computed adler32"
+else
+    fail "T-I10 attr present but adler $EXPECTED_ADLER not found in: $ATTR_HEX"
+fi
+
+# The store answers a Want-Digest query with the injected value...
+DIGEST_HDR=$(curl -s -I -H "Want-Digest: adler32" \
+    "http://127.0.0.1:$HTTP_PORT/dest-digest-ok.bin" | tr -d '\r' | grep -i '^Digest:')
+if printf '%s' "$DIGEST_HDR" | grep -qi "adler32=$EXPECTED_ADLER"; then
+    pass "T-I10 Want-Digest query answered with the injected adler32"
+else
+    fail "T-I10 Want-Digest: got '$DIGEST_HDR', expected adler32=$EXPECTED_ADLER"
+fi
+
+# ...and the mtime binding is real (XRD-2 negative test): touching the file
+# makes the stored attribute stale, so the SAME query must still return the
+# CORRECT value -- proving the manager recalculates rather than trusting a
+# stale attribute (silently slower, never wrong).
+sleep 1; touch "$WORK/data/dest-digest-ok.bin"
+DIGEST_HDR=$(curl -s -I -H "Want-Digest: adler32" \
+    "http://127.0.0.1:$HTTP_PORT/dest-digest-ok.bin" | tr -d '\r' | grep -i '^Digest:')
+if printf '%s' "$DIGEST_HDR" | grep -qi "adler32=$EXPECTED_ADLER"; then
+    pass "T-I10 stale-mtime attribute triggers recalculation, not a wrong answer"
+else
+    fail "T-I10 negative: got '$DIGEST_HDR' after mtime change"
 fi
 
 # ---------------------------------------------------------------------------

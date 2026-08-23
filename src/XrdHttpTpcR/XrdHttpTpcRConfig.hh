@@ -76,6 +76,11 @@ struct Config {
     // Lazy GC (FR-24): a journal older than this is discarded on the next
     // COPY that encounters it.  Tune to the orchestrator retry horizon.
     uint64_t gc_age_secs = 24 * 3600;             // tpcr.gc.age (default 24h)
+    // FR-28 resume paranoia: re-read and CRC-verify this many bytes below W
+    // against the journal's epoch digests before resuming.  0 disables --
+    // in multi-tenant namespaces that also disables the forged-journal
+    // defense (SUB-9), so the admin guide warns against it there.
+    uint64_t verify_tailbytes = 1ULL << 30;       // tpcr.verify.tailbytes
 
     // --- WP-5 ---
     // Recovery budget (FR-16): the degraded state may ride through a total

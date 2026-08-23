@@ -351,6 +351,33 @@ else
 fi
 kill "$XRD_PID" 2>/dev/null
 
+# ---------------------------------------------------------------------------
+# 12. T-I9 tamper detection (FR-28): flip one byte BELOW W between sessions
+#     -> tail verification rejects the resume -> fresh -> correct content.
+# ---------------------------------------------------------------------------
+crash_transfer "/r12.bin"
+python3 - "$WORK/data/r12.bin" "$W_CRASH" <<'EOF2'
+import sys
+path, watermark = sys.argv[1], int(sys.argv[2])
+victim = max(0, watermark - 4096)     # well inside the committed prefix
+with open(path, "r+b") as handle:
+    handle.seek(victim)
+    original = handle.read(1)
+    handle.seek(victim)
+    handle.write(bytes([original[0] ^ 0xFF]))
+EOF2
+sleep 11
+start_server
+copy "/r12.bin" -H "Overwrite: T"
+if printf '%s' "$RESPONSE" | grep -q "success: Created" \
+   && cmp -s "$REF" "$WORK/data/r12.bin" \
+   && server_log | grep -q "reason=tail-verify"; then
+    pass "12: single flipped byte below W caught by tail verification (T-I9)"
+else
+    fail "12: $(printf '%s' "$RESPONSE" | tail -c 200)"
+fi
+kill "$XRD_PID" 2>/dev/null
+
 echo
 if [ "$FAILURES" -eq 0 ]; then echo "RESUME MATRIX (T-I6): ALL PASSED"; exit 0; fi
 echo "$FAILURES resume matrix check(s) FAILED"; exit 1
