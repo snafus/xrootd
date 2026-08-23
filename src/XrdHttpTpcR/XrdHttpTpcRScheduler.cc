@@ -252,10 +252,14 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         "Initial transfer response sent to the TPC client");
 
     // Received-bytes accounting (SUB-3: markers report *received*, the
-    // journal will record *committed*, the FSM tracks *scheduled*).
+    // journal records *committed*, the FSM tracks *scheduled*).  Markers
+    // are ABSOLUTE (FR-5): a resumed session reports the seeded prefix W
+    // plus this session's bytes, so orchestrator progress/stall heuristics
+    // see a transfer of the whole file.
+    const off_t marker_base = stream.CommittedOffset();
     off_t harvested_bytes = 0;
     auto received_bytes = [&]() -> off_t {
-        off_t bytes = harvested_bytes;
+        off_t bytes = marker_base + harvested_bytes;
         for (const auto &slot : slots) {
             if (slot.busy) {bytes += slot.state->BytesTransferred();}
         }

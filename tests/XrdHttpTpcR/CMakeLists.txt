@@ -113,4 +113,10 @@ if(TARGET XrdServer)
                    ${CMAKE_BINARY_DIR})
   set_tests_properties(XrdHttpTpcR::crash_matrix PROPERTIES
                        SKIP_RETURN_CODE 127 TIMEOUT 600 LABELS "integration")
+  # WP-8 resume decision matrix (T-I6, T-I13 leg).
+  add_test(NAME XrdHttpTpcR::resume_matrix
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/resume_matrix.sh
+                   ${CMAKE_BINARY_DIR})
+  set_tests_properties(XrdHttpTpcR::resume_matrix PROPERTIES
+                       SKIP_RETURN_CODE 127 TIMEOUT 900 LABELS "integration")
 endif()

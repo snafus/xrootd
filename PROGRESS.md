@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** WP-8 — resume open path (decision tree, validator ladder, lease acquisition, GC).
+**Current focus:** WP-9 — capability + client-visible additions (OPTIONS capability, resumable-from).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
@@ -12,7 +12,7 @@
 | WP-5 Degraded state | done | e936dcc1b | 76/76 unit + 29/29 integration; trace_check m1 clean | Full Tier-1 ladder; sticky tpc_status stock bug found+fixed; auth one-shot re-probe; push smoke added. |
 | WP-6 Backend semantics matrix | done | (this commit) | backend_matrix.sh 6/6 | POSIX leg green incl. empirical XRD-1 POSC unlink + hasPOSC warning. EC/Ceph/PSS unsupported-until-tested (Q-3). |
 | WP-7 Journal + checkpointing | done | (this commit) | 85/85 unit; crash matrix 3/3 | Journal format+CRC, SFS store, Checkpointer with SUB-1 ordering; FR-17/23 on all exit paths; tpcr-journal-dump shipped. |
-| WP-8 Resume open path | todo | | | |
+| WP-8 Resume open path | done | (this commit) | 86/86 unit; resume matrix 10/10 | Full a–e decision tree; ladder; lease 409/steal; GC; SUB-2 table; FR-5 absolute markers; O_EXCL deviation in DECISIONS/Q-4. |
 | WP-9 Capability + client-visible | todo | | | |
 | WP-10 Digests | todo | | | |
 | WP-11 Tail verify + cksum injection | todo | | | |

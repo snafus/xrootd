@@ -1295,10 +1295,14 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
     if (query_header != req.headers.end()) {
         redirect_resource = query_header->second;
     }
-    XrdSfsFileOpenMode mode = SFS_O_CREAT;
-    auto overwrite_header = XrdOucTUtils::caseInsensitiveFind(req.headers,"overwrite");
-    if ((overwrite_header == req.headers.end()) || (overwrite_header->second == "T")) {
-        if (! usingEC) mode = SFS_O_TRUNC;
+    // SUB-2: the Overwrite decision participates in the resume decision
+    // tree below; the actual open mode is chosen there.
+    bool overwrite_allowed = true;
+    {
+        auto overwrite_header = XrdOucTUtils::caseInsensitiveFind(req.headers,"overwrite");
+        if (overwrite_header != req.headers.end() && overwrite_header->second != "T") {
+            overwrite_allowed = false;
+        }
     }
     int streams = 1;
     {
@@ -1364,9 +1368,171 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
             return 0;
         }
     }
+    // =====================================================================
+    //          Resume decision tree (WP-8; 02-ARCHITECTURE §4 cases a-e)
+    // =====================================================================
+    const std::string dest_path = full_url.substr(0, full_url.find('?'));
+    off_t resume_offset = 0;
+    bool resuming = false;
+    std::unique_ptr<TPCR::JournalStore> journal_store;
+    TPCR::JournalRecord record;          // the record this session will own
+    bool have_record = false;            // record already committed on disk
+
+    if (m_tpcr.resume) {
+        journal_store.reset(new TPCR::JournalStore(
+            m_sfs, dest_path, m_tpcr.journal_suffix, &req.GetSecEntity()));
+
+        // FR-4: X-Resume: F forces a fresh transfer; absence permits resume.
+        bool force_fresh = false;
+        {
+            auto resume_header =
+                XrdOucTUtils::caseInsensitiveFind(req.headers, "x-resume");
+            if (resume_header != req.headers.end() &&
+                (resume_header->second == "F" || resume_header->second == "f")) {
+                force_fresh = true;
+            }
+        }
+
+        TPCR::JournalRecord journal;
+        std::string load_err;
+        const bool journal_present = journal_store->Exists();
+        const bool journal_valid =
+            journal_present && journal_store->Load(journal, load_err);
+        const time_t now = time(NULL);
+
+        // Rejecting a resume logs the coded reason (FR-31) and drops the
+        // journal; the fresh path below then takes over per Overwrite.
+        auto reject = [&](const std::string &reason) {
+            logTransferEvent(LogMask::Info, rec, "RESUME_REJECTED", reason);
+            std::string remove_err;
+            journal_store->Remove(remove_err);   // best effort
+        };
+
+        if (force_fresh) {
+            if (journal_present) {reject("reason=client-forced (X-Resume: F)");}
+        } else if (!journal_present) {
+            // Cases (a) and (d): no journal.  A journal-less partial is
+            // indistinguishable from a stale foreign file (FR-25) and gets
+            // stock Overwrite treatment below.
+        } else if (!journal_valid) {
+            reject("reason=journal-invalid (" + load_err + ")");
+        } else if (journal.Age(now) > (int64_t)m_tpcr.gc_age_secs) {
+            // FR-24 lazy GC: past the orchestrator retry horizon.
+            logTransferEvent(LogMask::Info, rec, "GC_DISCARD",
+                "journal older than tpcr.gc.age; discarding");
+            std::string remove_err;
+            journal_store->Remove(remove_err);
+        } else {
+            struct stat dest_stat;
+            XrdOucErrInfo stat_error;
+            const bool have_partial =
+                m_sfs->stat(dest_path.c_str(), &dest_stat, stat_error,
+                            &req.GetSecEntity()) == SFS_OK;
+            std::string reason;
+            if (!have_partial) {
+                // Case (e): journal without a partial -- common under POSC,
+                // which unlinks crashed creates (XRD-1).
+                reject("reason=no-partial (journal without destination; POSC?)");
+            } else if (!TPCR::SourceValidators::ResumeAccepts(
+                           journal.validators, sourceValidators,
+                           m_tpcr.validators_length_only
+                               ? TPCR::SourceValidators::Policy::LengthOnly
+                               : TPCR::SourceValidators::Policy::Strong,
+                           reason)) {
+                // FR-21 ladder; FR-20 case (c).
+                reject("reason=validator (" + reason + ")");
+            } else if (dest_stat.st_size < journal.committed) {
+                // FR-20/FR-25: the partial was truncated or replaced; W no
+                // longer describes it.
+                reject("reason=dest-truncated (size below watermark)");
+            } else if (journal.LeaseLive(now)) {
+                // FR-22: live foreign lease -- another gateway is writing.
+                // 409 + Retry-After; touch nothing.
+                const long retry_after =
+                    (long)(journal.lease_expiry - (int64_t)now) + 1;
+                std::stringstream retry_hdr;
+                retry_hdr << "Retry-After: " << retry_after;
+                std::stringstream body;
+                body << "Transfer already in progress by another gateway; "
+                     << "retry after " << retry_after << "s";
+                rec.status = 409;
+                logTransferEvent(LogMask::Info, rec, "LEASE_CONFLICT",
+                                 body.str());
+                fh->close();
+                return req.SendSimpleResp(409, NULL,
+                    const_cast<char *>(retry_hdr.str().c_str()),
+                    const_cast<char *>(body.str().c_str()), 0);
+            } else {
+                // Resume -- case (b).  XRD-6 strict sequencing: acquire (or
+                // steal) the lease via atomic journal rewrite BEFORE opening
+                // the data file; opening first would create case-(a) side
+                // effects on a path another session may own.
+                if (journal.lease_expiry != 0) {
+                    logTransferEvent(LogMask::Info, rec, "LEASE_STEAL",
+                        "expired lease taken over");
+                }
+                journal.lease_owner = TPCR::JournalRecord::NewLeaseOwner();
+                journal.lease_expiry =
+                    (int64_t)now + 2 * (int64_t)m_tpcr.checkpoint_secs;
+                journal.attempts += 1;
+                journal.updated = (int64_t)now;
+                journal.streams = (uint32_t)streams;
+                std::string commit_err;
+                if (!journal_store->Commit(journal, commit_err)) {
+                    reject("reason=lease-write-failed (" + commit_err + ")");
+                } else {
+                    resuming = true;
+                    resume_offset = journal.committed;
+                    record = journal;
+                    have_record = true;
+                    std::stringstream ss;
+                    ss << "resuming from W=" << resume_offset
+                       << " (attempt " << journal.attempts << ")";
+                    logTransferEvent(LogMask::Info, rec, "RESUME_START",
+                                     ss.str());
+                }
+            }
+        }
+    }
+
+    // Open mode (SUB-2 table); never SFS_O_POSC (XRD-1):
+    //  - resume: plain SFS_O_WRONLY.  No TRUNC ever; and no SFS_O_CREAT,
+    //    because this tree's OFS maps SFS_O_CREAT to O_CREAT|O_EXCL, which
+    //    would refuse the existing partial -- FR-20 explicitly demands "no
+    //    O_EXCL semantics" (create-token authz consequence in DECISIONS.md).
+    //  - fresh + Overwrite T/absent: stock behavior -- TRUNC (which OFS
+    //    maps to O_CREAT|O_TRUNC) unless EC, which cannot truncate.
+    //  - fresh + Overwrite F: SFS_O_CREAT alone; its O_EXCL makes an
+    //    existing journal-less partial fail exactly as stock does (SUB-2).
+    XrdSfsFileOpenMode mode;
+    if (resuming) {
+        mode = SFS_O_WRONLY;
+    } else if (overwrite_allowed) {
+        mode = usingEC ? SFS_O_CREAT : SFS_O_TRUNC;
+    } else {
+        mode = SFS_O_CREAT;
+    }
+
     int open_result = OpenWaitStall(*fh, full_url, mode|SFS_O_WRONLY,
                                     0644 | SFS_O_MKPTH,
                                     req.GetSecEntity(), authz);
+    if (resuming && SFS_OK != open_result && SFS_REDIRECT != open_result) {
+        // Resume open failed (plain-write authz, or the partial vanished in
+        // the stat/open window).  Degrade to a fresh transfer (CON-3):
+        // resume must never fail a transfer stock would have carried.
+        logTransferEvent(LogMask::Info, rec, "RESUME_REJECTED",
+            "reason=open-failed (falling back to a fresh transfer)");
+        std::string remove_err;
+        journal_store->Remove(remove_err);
+        resuming = false;
+        have_record = false;
+        resume_offset = 0;
+        mode = overwrite_allowed ? (usingEC ? SFS_O_CREAT : SFS_O_TRUNC)
+                                 : SFS_O_CREAT;
+        open_result = OpenWaitStall(*fh, full_url, mode|SFS_O_WRONLY,
+                                    0644 | SFS_O_MKPTH,
+                                    req.GetSecEntity(), authz);
+    }
     if (SFS_REDIRECT == open_result) {
         int result = RedirectTransfer(curl, redirect_resource, req, fh->error, rec);
         return result;
@@ -1383,47 +1549,47 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
         fh->close();
         return resp_result;
     }
-    // Fresh pull transfers start at offset 0; the resume path (WP-8) seeds
-    // the journal watermark W here instead.  Entry capacity equals the
-    // scheduler's range size (tpcr.blocksize = slab size), so one range
-    // fills one entry in the common case.
-    Stream stream(std::move(fh), 0, m_tpcr.block_size, m_log);
+
+    // The Stream's committed offset seeds at W (0 fresh); all offsets stay
+    // absolute.  Entry capacity equals the scheduler's range size.
+    Stream stream(std::move(fh), resume_offset, m_tpcr.block_size, m_log);
     State state(0, stream, curl, false, req.tpcForwardCreds);
     state.SetupHeaders(req);
     state.SetContentLength(sourceFileContentLength);
 
-    // Journal creation at open time (FR-18; 02 §4 case (a)): creating it
-    // now, not at the first checkpoint, bounds the never-resumable window
-    // to transfers that die before the open completes.  Failure to create
-    // it only disables resume for this transfer (CON-3: degrade safely).
-    std::unique_ptr<TPCR::JournalStore> journal_store;
+    // Journal for FRESH transfers -- created at open time (FR-18; case (a)):
+    // this bounds the never-resumable window to transfers that die before
+    // the open completes.  Creation failure only disables resume for this
+    // transfer (CON-3: degrade safely).  Resumed transfers already committed
+    // their (lease-carrying) record above.
     std::unique_ptr<TPCR::Checkpointer> checkpointer;
-    if (m_tpcr.resume) {
-        const std::string dest_path =
-            full_url.substr(0, full_url.find('?'));
-        journal_store.reset(new TPCR::JournalStore(
-            m_sfs, dest_path, m_tpcr.journal_suffix, &req.GetSecEntity()));
-        TPCR::JournalRecord record;
-        record.committed = 0;
-        record.source_url = TPCR::NormalizeSourceUrl(resource);
-        record.validators = sourceValidators;
-        record.lease_owner = TPCR::JournalRecord::NewLeaseOwner();
-        record.created = record.updated = time(NULL);
-        record.lease_expiry =
-            record.created + 2 * (int64_t)m_tpcr.checkpoint_secs;
-        record.block_size = m_tpcr.block_size;
-        record.streams = (uint32_t)streams;
-        std::string journal_err;
-        if (journal_store->Commit(record, journal_err)) {
+    if (m_tpcr.resume && journal_store) {
+        if (!have_record) {
+            record = TPCR::JournalRecord();
+            record.committed = 0;
+            record.source_url = TPCR::NormalizeSourceUrl(resource);
+            record.validators = sourceValidators;
+            record.lease_owner = TPCR::JournalRecord::NewLeaseOwner();
+            record.created = record.updated = time(NULL);
+            record.lease_expiry =
+                record.created + 2 * (int64_t)m_tpcr.checkpoint_secs;
+            record.block_size = m_tpcr.block_size;
+            record.streams = (uint32_t)streams;
+            std::string journal_err;
+            if (journal_store->Commit(record, journal_err)) {
+                have_record = true;
+                logTransferEvent(LogMask::Debug, rec, "JOURNAL_CREATED",
+                                 journal_store->JournalPath());
+            } else {
+                logTransferEvent(LogMask::Warning, rec, "JOURNAL_DISABLED",
+                    "journal creation failed; resume disabled for this transfer: "
+                    + journal_err);
+            }
+        }
+        if (have_record) {
             checkpointer.reset(new TPCR::Checkpointer(
                 *journal_store, record, m_tpcr.checkpoint_bytes,
                 m_tpcr.checkpoint_secs, m_log));
-            logTransferEvent(LogMask::Debug, rec, "JOURNAL_CREATED",
-                             journal_store->JournalPath());
-        } else {
-            logTransferEvent(LogMask::Warning, rec, "JOURNAL_DISABLED",
-                "journal creation failed; resume disabled for this transfer: "
-                + journal_err);
         }
     }
 

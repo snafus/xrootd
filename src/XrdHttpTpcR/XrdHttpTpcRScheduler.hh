@@ -62,6 +62,21 @@ struct SourceValidators {
     std::string last_modified;
     std::map<std::string, std::string> repr_digests;
 
+    // Cross-session resume ladder (FR-21), strongest rung first:
+    //   matching Repr-Digest (same algorithm, same value)
+    //   > matching strong ETag (weak W/ ETags are ignored)
+    //   > matching Last-Modified AND length.
+    // Length must match in ALL cases.  Policy `strong` (default) refuses to
+    // resume when no rung is available; `length-only` accepts a bare length
+    // match (for controlled environments with known-immutable sources).
+    // `journal` is what the previous session recorded; `fresh` is this
+    // session's HEAD.  Returns true to resume; otherwise fills `reason`
+    // (the RESUME_REJECTED reason code, FR-31).
+    enum class Policy { Strong, LengthOnly };
+    static bool ResumeAccepts(const SourceValidators &journal,
+                              const SourceValidators &fresh, Policy policy,
+                              std::string &reason);
+
     // Mid-session comparison (FR-14): a *definite* change -- differing
     // length, ETag, Last-Modified, or any common digest algorithm's value --
     // makes the transfer a permanent failure.  A validator merely missing

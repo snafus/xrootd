@@ -13,6 +13,16 @@ default 16 MiB). This changes single-stream request granularity relative to stoc
 wire-compatible (they are ordinary ranged GETs) but visible in source-side logs and
 request counts. Proceeding per FR-10 at WP-4; flag here in case operators care.
 
+## Q-4 (WP-8 — review requested, not blocking)
+**Resume reopen authorization scope.** 02 §4 accepts create-scoped tokens for the resume
+reopen by passing SFS_O_CREAT; this tree maps SFS_O_CREAT to O_CREAT|O_EXCL, which
+refuses existing files, so the implementation opens with plain SFS_O_WRONLY (see
+DECISIONS.md).  Under authorization plugins that distinguish create from update scope, a
+create-only token cannot resume (the handler falls back to a fresh transfer, which the
+same token authorizes — safe but wasteful).  If create-token resume matters in
+production, the upstreamable fix is an OFS-level "create-or-open-existing" mode (no
+EXCL); flagging rather than deciding, per the operating rules.
+
 ## Q-3 (WP-6, informational — no block on M2 for POSIX)
 **Backend matrix coverage limited to POSIX.** This testbed offers no EC, CephFS, or
 proxy/PSS deployment, so those legs of the WP-6 matrix could not run; per the plan they

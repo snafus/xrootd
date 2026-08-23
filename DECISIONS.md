@@ -96,6 +96,24 @@ Testbed: Ubuntu 22.04, ext4, POSIX OSS via `oss.localroot`.  Results
 proxy/PSS deployments are *unsupported until tested* (XRD-4) — see QUESTIONS.md Q-3.
 Touches: FR-18, FR-20, CON-3, XRD-1, XRD-4, XRD-5.
 
+**2026-08-23 / WP-8 — Resume open uses plain SFS_O_WRONLY, not SFS_O_CREAT.**
+FR-20 prescribes `SFS_O_CREAT|SFS_O_WRONLY` "(no TRUNC, no O_EXCL semantics)" for the
+resume reopen; this tree's XrdOfs maps SFS_O_CREAT unconditionally to `O_CREAT|O_EXCL`
+(XrdOfs.cc:557), which would refuse the existing partial outright.  The two halves of
+FR-20 conflict on this tree; "no O_EXCL semantics" is the load-bearing half (the reopen
+must succeed on the partial), so the resume open passes plain `SFS_O_WRONLY`.
+Consequence: authorization for the reopen is write/update, not create — a client whose
+token carries *only* create scope may fail the resume open; the handler then falls back
+to a fresh transfer (safe: CON-3 degrade, transfer still succeeds via the stock path).
+Flagged for human review in QUESTIONS.md Q-4 since it weakens 02 §4's create-scope
+rationale.  A stat/open race (partial vanishing between the tree's stat and the open)
+lands in the same fresh-transfer fallback.  Touches: FR-20, CON-3, SUB-2.
+
+**2026-08-23 / WP-8 — tpcr.gc.age floor lowered to 10s.**
+Purely a validation bound (default stays 24h); a 60s floor made the lazy-GC integration
+scenario needlessly slow, and no correctness property depends on the floor.  Touches:
+FR-24, FR-30.
+
 **2026-08-22 / WP-0 — Verbatim ports keep their identifiers.**
 `XrdHttpTpcPMarkManager.*` and `XrdHttpTpcUtils.*` are copied with their original file
 names, class names and namespaces (`XrdHttpTpc::PMarkManager`, `XrdHttpTpcUtils`), per

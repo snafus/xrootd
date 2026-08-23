@@ -448,6 +448,69 @@ TEST(XrdHttpTpcRSchedulerTests, ValidatorMidSessionComparison) {
   EXPECT_TRUE(base.CompatibleMidSession(sparse, reason));
 }
 
+TEST(XrdHttpTpcRSchedulerTests, ResumeValidatorLadder) {
+  // FR-21 (T-I6 unit leg): rung order and the unconditional length gate.
+  using SV = TPCR::SourceValidators;
+  std::string reason;
+
+  SV journal;
+  journal.content_length = 1000;
+  journal.etag = "\"tag-1\"";
+  journal.last_modified = "Wed, 01 Jan 2025 00:00:00 GMT";
+  journal.repr_digests["adler"] = ":AAAA:";
+
+  // Identical -> resume on the digest rung.
+  SV fresh = journal;
+  EXPECT_TRUE(SV::ResumeAccepts(journal, fresh, SV::Policy::Strong, reason));
+
+  // Length gate dominates everything, both policies.
+  fresh = journal;
+  fresh.content_length = 999;
+  EXPECT_FALSE(SV::ResumeAccepts(journal, fresh, SV::Policy::Strong, reason));
+  EXPECT_NE(std::string::npos, reason.find("length"));
+  EXPECT_FALSE(SV::ResumeAccepts(journal, fresh, SV::Policy::LengthOnly, reason));
+
+  // Digest rung decides outright: mismatch rejects even with matching ETag.
+  fresh = journal;
+  fresh.repr_digests["adler"] = ":BBBB:";
+  EXPECT_FALSE(SV::ResumeAccepts(journal, fresh, SV::Policy::Strong, reason));
+  EXPECT_NE(std::string::npos, reason.find("Repr-Digest"));
+
+  // No common algorithm -> fall through to the ETag rung.
+  fresh = journal;
+  fresh.repr_digests.clear();
+  fresh.repr_digests["sha-256"] = ":CCCC:";
+  EXPECT_TRUE(SV::ResumeAccepts(journal, fresh, SV::Policy::Strong, reason))
+      << reason;
+
+  // Strong ETag mismatch rejects.
+  fresh = journal;
+  fresh.repr_digests.clear();
+  journal.repr_digests.clear();
+  fresh.etag = "\"tag-2\"";
+  EXPECT_FALSE(SV::ResumeAccepts(journal, fresh, SV::Policy::Strong, reason));
+  EXPECT_NE(std::string::npos, reason.find("ETag"));
+
+  // Weak ETags are ignored -> Last-Modified rung decides.
+  fresh = journal;
+  journal.etag = "W/\"weak-1\"";
+  fresh.etag = "W/\"weak-2\"";
+  EXPECT_TRUE(SV::ResumeAccepts(journal, fresh, SV::Policy::Strong, reason))
+      << reason;
+  fresh.last_modified = "Thu, 02 Jan 2025 00:00:00 GMT";
+  EXPECT_FALSE(SV::ResumeAccepts(journal, fresh, SV::Policy::Strong, reason));
+  EXPECT_NE(std::string::npos, reason.find("Last-Modified"));
+
+  // Nothing on offer: strong refuses, length-only accepts (FR-21 policy).
+  SV bare_journal, bare_fresh;
+  bare_journal.content_length = bare_fresh.content_length = 500;
+  EXPECT_FALSE(SV::ResumeAccepts(bare_journal, bare_fresh,
+                                 SV::Policy::Strong, reason));
+  EXPECT_NE(std::string::npos, reason.find("no acceptable validator"));
+  EXPECT_TRUE(SV::ResumeAccepts(bare_journal, bare_fresh,
+                                SV::Policy::LengthOnly, reason));
+}
+
 TEST(XrdHttpTpcRSchedulerTests, ClassificationTable) {
   // FR-12, table-driven.  Args: (curl code, http status, state error code).
   using S = TPCR::State;

@@ -289,6 +289,56 @@ bool SourceValidators::CompatibleMidSession(const SourceValidators &fresh,
     return true;
 }
 
+bool SourceValidators::ResumeAccepts(const SourceValidators &journal,
+                                     const SourceValidators &fresh,
+                                     Policy policy, std::string &reason)
+{
+    // Length is the unconditional gate (FR-21: "length must always match").
+    if (journal.content_length < 0 || fresh.content_length < 0) {
+        reason = "content length unavailable";
+        return false;
+    }
+    if (journal.content_length != fresh.content_length) {
+        reason = "content length mismatch (" +
+                 std::to_string(journal.content_length) + " -> " +
+                 std::to_string(fresh.content_length) + ")";
+        return false;
+    }
+    if (policy == Policy::LengthOnly) {
+        return true;
+    }
+
+    // Rung 1: a digest algorithm present on both sides decides outright.
+    for (const auto &[algorithm, value] : journal.repr_digests) {
+        auto match = fresh.repr_digests.find(algorithm);
+        if (match == fresh.repr_digests.end()) {continue;}
+        if (match->second == value) {return true;}
+        reason = "Repr-Digest (" + algorithm + ") mismatch";
+        return false;
+    }
+
+    // Rung 2: strong ETags (weak "W/" validators are ignored -- they only
+    // promise semantic, not byte, equivalence).
+    auto strong = [](const std::string &etag) {
+        return !etag.empty() && etag.rfind("W/", 0) != 0;
+    };
+    if (strong(journal.etag) && strong(fresh.etag)) {
+        if (journal.etag == fresh.etag) {return true;}
+        reason = "ETag mismatch";
+        return false;
+    }
+
+    // Rung 3: Last-Modified (already backed by the length gate above).
+    if (!journal.last_modified.empty() && !fresh.last_modified.empty()) {
+        if (journal.last_modified == fresh.last_modified) {return true;}
+        reason = "Last-Modified mismatch";
+        return false;
+    }
+
+    reason = "no acceptable validator offered (policy strong)";
+    return false;
+}
+
 void Scheduler::RequeueInFlight(time_t now)
 {
     for (auto &range : m_table) {

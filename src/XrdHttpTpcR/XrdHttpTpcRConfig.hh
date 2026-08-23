@@ -68,6 +68,15 @@ struct Config {
     uint64_t checkpoint_bytes = 4ULL << 30;       // tpcr.checkpoint.bytes
     unsigned checkpoint_secs = 60;                // tpcr.checkpoint.secs
 
+    // --- WP-8 ---
+    // FR-21 validator policy for cross-session resume: `strong` (default)
+    // refuses to resume when the source offers neither digest, strong ETag,
+    // nor Last-Modified; `length-only` for known-immutable sources.
+    bool validators_length_only = false;          // tpcr.validators.require
+    // Lazy GC (FR-24): a journal older than this is discarded on the next
+    // COPY that encounters it.  Tune to the orchestrator retry horizon.
+    uint64_t gc_age_secs = 24 * 3600;             // tpcr.gc.age (default 24h)
+
     // --- WP-5 ---
     // Recovery budget (FR-16): the degraded state may ride through a total
     // source outage for this many seconds of zero commit progress before

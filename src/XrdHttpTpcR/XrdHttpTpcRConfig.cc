@@ -231,6 +231,30 @@ bool Config::Set(const std::string &directive, const std::string &value,
         checkpoint_secs = static_cast<unsigned>(seconds);
         return true;
     }
+    if (directive == "tpcr.validators.require") {
+        if (value == "strong") {
+            validators_length_only = false;
+        } else if (value == "length-only") {
+            validators_length_only = true;
+        } else {
+            bad << directive << " value '" << value
+                << "' must be 'strong' or 'length-only'";
+            err = bad.str();
+            return false;
+        }
+        return true;
+    }
+    if (directive == "tpcr.gc.age") {
+        uint64_t seconds;
+        if (!ParseDuration(value, seconds) || seconds < 10) {
+            bad << directive << " value '" << value
+                << "' is not a valid duration (>= 10s)";
+            err = bad.str();
+            return false;
+        }
+        gc_age_secs = seconds;
+        return true;
+    }
     if (directive == "tpcr.recovery.maxsecs") {
         uint64_t seconds;
         if (!ParseDuration(value, seconds) || seconds < 5 || seconds > 86400) {
