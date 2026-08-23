@@ -285,7 +285,20 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             }
             if (!slot) {break;}
             // Reserve a slab for this range's buffering needs (NFR-1).
-            if (slab_client) {
+            // Two carve-outs keep this a backpressure valve rather than a
+            // deadlock (found by T-S2, 8 transfers over a 16-slab pool):
+            //   - an unused reservation already in the stash counts, so
+            //     reservations are not stacked per issue; and
+            //   - the reservation NEVER gates the transfer's only in-flight
+            //     range.  Stream entries that buffered out-of-order data
+            //     retain their slab for the transfer's lifetime, so under
+            //     saturation the whole budget can sit inside entries with
+            //     every client at its fair-share cap; refusing to issue
+            //     then starves all transfers into the global stall timeout.
+            //     Delivery itself never needs the pool (Stream falls back
+            //     to a window-bounded heap entry), so issuing slab-less is
+            //     always safe -- the pool only gates EXTRA parallelism.
+            if (slab_client && slab_stash.empty() && sched.InFlight() > 0) {
                 auto slab = m_slab_pool->Acquire(slab_client);
                 if (!slab) {
                     // Pool saturated: defer, the range stays PENDING.

@@ -121,3 +121,14 @@ the 03 file map ("verbatim + include-path fixes"). Only the references to the re
 `TPC` namespace (forward declaration of `TpcType`, `TPC::TPCHandler::OSS_TASK_OPAQUE`)
 are adjusted — without them the files do not compile. All symbols are local to the
 module, so no runtime clash with the stock library is possible. Touches: CON-6, FR-1.
+
+**2026-08-23 / WP-12 — Slab reservation is a valve, never a gate on the only in-flight range.**
+T-S2 (8 transfers over a 16-slab pool) exposed a pool-wide starvation: Stream entries
+that once buffered out-of-order bytes retain their slab for the transfer's lifetime, so
+under saturation the whole budget migrates into entries, every client sits at its
+fair-share cap, `issue_ready` refuses to issue, in-flight drops to zero, and the global
+stall timeout kills every transfer.  Fix: (a) an unused reservation already in the
+stash satisfies the next issue (reservations are not stacked), and (b) the reservation
+is skipped entirely when the transfer has nothing in flight — delivery never needs the
+pool (Stream's window-bounded heap fallback), so the pool gates only *extra*
+parallelism.  Verified: 3 consecutive T-S2 runs at 8/8.  Touches: NFR-1, FR-13, SUB-3.
