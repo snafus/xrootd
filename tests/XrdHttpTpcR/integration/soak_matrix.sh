@@ -21,6 +21,14 @@ BUILD_DIR="${1:?usage: soak_matrix.sh <build_dir> <results_file>}"
 RESULTS="${2:?results file}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="$BUILD_DIR/lib"
+# The plugin suffix tracks the tree version (a tagless CI checkout builds
+# -4, a v6.1.1 clone builds -6): discover it, never assume it.
+XRDHTTP_LIB=$(ls "$LIB_DIR"/libXrdHttp-[0-9]*.so 2>/dev/null | head -1)
+TPCR_LIB=$(ls "$LIB_DIR"/libXrdHttpTPCR-[0-9]*.so 2>/dev/null | head -1)
+STOCK_TPC_LIB=$(ls "$LIB_DIR"/libXrdHttpTPC-[0-9]*.so 2>/dev/null | head -1)
+[ -n "$XRDHTTP_LIB" ] || { echo "SKIP: libXrdHttp plugin missing"; exit 127; }
+[ -n "$TPCR_LIB" ]    || { echo "SKIP: libXrdHttpTPCR plugin missing"; exit 127; }
+[ -n "$STOCK_TPC_LIB" ] || { echo "SKIP: stock libXrdHttpTPC plugin missing"; exit 127; }
 
 command -v python3 >/dev/null || { echo "SKIP: python3"; exit 127; }
 [ -x "$BUILD_DIR/bin/xrootd" ] || { echo "SKIP: xrootd"; exit 127; }
@@ -70,7 +78,7 @@ all.adminpath $WORK/admin
 all.pidpath $WORK/admin
 oss.localroot $WORK/data
 xrd.port $PORT
-xrd.protocol XrdHttp:$PORT $LIB_DIR/libXrdHttp-6.so
+xrd.protocol XrdHttp:$PORT $XRDHTTP_LIB
 http.desthttps false
 tpc.allow local
 tpc.allow private
@@ -95,7 +103,7 @@ python3 "$SRC_DIR/mock_source.py" --port "$MOCK_PORT" --file "$WORK/ref.bin" \
     > "$WORK/mock.log" 2>&1 &
 PIDS+=($!)
 sleep 1
-write_cfg "$WORK/ts1.cfg" "http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+write_cfg "$WORK/ts1.cfg" "http.exthandler xrdtpcr +notls $TPCR_LIB
 tpc.trace all
 tpcr.blocksize 1m
 tpcr.window.bytes 4m
@@ -198,7 +206,7 @@ python3 "$SRC_DIR/mock_source.py" --port "$MOCK_PORT" --file "$WORK/ref.bin" \
     > "$WORK/mock2.log" 2>&1 &
 PIDS+=($!)
 sleep 1
-write_cfg "$WORK/ts2.cfg" "http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+write_cfg "$WORK/ts2.cfg" "http.exthandler xrdtpcr +notls $TPCR_LIB
 tpcr.blocksize 1m
 tpcr.window.bytes 8m
 tpcr.mempool.max 16m"
@@ -273,13 +281,13 @@ run_leg() {  # run_leg <label> <handler-cfg-lines...>; prints "wall cpu"
     python3 -c "print(f'{$t1 - $t0:.2f} {$c1 - $c0:.2f}')"
 }
 
-read STOCK_WALL STOCK_CPU <<< "$(run_leg "http.exthandler xrdtpc +notls $LIB_DIR/libXrdHttpTPC-6.so")"
-read DEFAULT_WALL DEFAULT_CPU <<< "$(run_leg "http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+read STOCK_WALL STOCK_CPU <<< "$(run_leg "http.exthandler xrdtpc +notls $STOCK_TPC_LIB")"
+read DEFAULT_WALL DEFAULT_CPU <<< "$(run_leg "http.exthandler xrdtpcr +notls $TPCR_LIB
 tpcr.blocksize 1m")"
-read DENSE_WALL DENSE_CPU <<< "$(run_leg "http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+read DENSE_WALL DENSE_CPU <<< "$(run_leg "http.exthandler xrdtpcr +notls $TPCR_LIB
 tpcr.blocksize 1m
 tpcr.checkpoint.bytes 8m")"
-read OFF_WALL OFF_CPU <<< "$(run_leg "http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+read OFF_WALL OFF_CPU <<< "$(run_leg "http.exthandler xrdtpcr +notls $TPCR_LIB
 tpcr.blocksize 1m
 tpcr.resume no")"
 
@@ -342,7 +350,7 @@ python3 "$SRC_DIR/mock_source.py" --port "$MOCK_PORT" --file "$WORK/ref.bin" \
     --stall "$STALL_SECS:1" > "$WORK/mock4.log" 2>&1 &
 PIDS+=($!)
 sleep 1
-write_cfg "$WORK/stall.cfg" "http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+write_cfg "$WORK/stall.cfg" "http.exthandler xrdtpcr +notls $TPCR_LIB
 tpcr.blocksize 1m"
 start_server "$WORK/stall.cfg"
 curl -s -X COPY "http://127.0.0.1:$PORT/stall.bin" \

@@ -27,6 +27,13 @@ set -u
 BUILD_DIR="${1:?usage: resume_matrix.sh <build_dir>}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="$BUILD_DIR/lib"
+# The plugin suffix tracks the tree version (a tagless CI checkout builds
+# -4, a v6.1.1 clone builds -6): discover it, never assume it.
+XRDHTTP_LIB=$(ls "$LIB_DIR"/libXrdHttp-[0-9]*.so 2>/dev/null | head -1)
+TPCR_LIB=$(ls "$LIB_DIR"/libXrdHttpTPCR-[0-9]*.so 2>/dev/null | head -1)
+STOCK_TPC_LIB=$(ls "$LIB_DIR"/libXrdHttpTPC-[0-9]*.so 2>/dev/null | head -1)
+[ -n "$XRDHTTP_LIB" ] || { echo "SKIP: libXrdHttp plugin missing"; exit 127; }
+[ -n "$TPCR_LIB" ]    || { echo "SKIP: libXrdHttpTPCR plugin missing"; exit 127; }
 DUMP="$BUILD_DIR/bin/tpcr-journal-dump"
 
 command -v python3 >/dev/null || { echo "SKIP: python3"; exit 127; }
@@ -52,11 +59,11 @@ all.adminpath $WORK/admin
 all.pidpath $WORK/admin
 oss.localroot $WORK/data
 xrd.port $PORT
-xrd.protocol XrdHttp:$PORT $LIB_DIR/libXrdHttp-6.so
+xrd.protocol XrdHttp:$PORT $XRDHTTP_LIB
 http.desthttps false
 tpc.allow local
 tpc.allow private
-http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+http.exthandler xrdtpcr +notls $TPCR_LIB
 tpc.trace all
 tpcr.blocksize 1m
 tpcr.window.bytes 4m

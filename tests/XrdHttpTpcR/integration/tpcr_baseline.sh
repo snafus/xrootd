@@ -20,6 +20,14 @@ RESULTS="${2:?results file}"
 SIZE_MIB="${3:-256}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="$BUILD_DIR/lib"
+# The plugin suffix tracks the tree version (a tagless CI checkout builds
+# -4, a v6.1.1 clone builds -6): discover it, never assume it.
+XRDHTTP_LIB=$(ls "$LIB_DIR"/libXrdHttp-[0-9]*.so 2>/dev/null | head -1)
+TPCR_LIB=$(ls "$LIB_DIR"/libXrdHttpTPCR-[0-9]*.so 2>/dev/null | head -1)
+STOCK_TPC_LIB=$(ls "$LIB_DIR"/libXrdHttpTPC-[0-9]*.so 2>/dev/null | head -1)
+[ -n "$XRDHTTP_LIB" ] || { echo "SKIP: libXrdHttp plugin missing"; exit 127; }
+[ -n "$TPCR_LIB" ]    || { echo "SKIP: libXrdHttpTPCR plugin missing"; exit 127; }
+[ -n "$STOCK_TPC_LIB" ] || { echo "SKIP: stock libXrdHttpTPC plugin missing"; exit 127; }
 WORK="$(mktemp -d /tmp/tpcr-perf-XXXXXX)"
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; rm -rf "$WORK"; }
@@ -59,7 +67,7 @@ all.adminpath $WORK/$name/admin
 all.pidpath $WORK/$name/admin
 oss.localroot $WORK/$name/data
 xrd.port $SERVER_PORT
-xrd.protocol XrdHttp:$SERVER_PORT $LIB_DIR/libXrdHttp-6.so
+xrd.protocol XrdHttp:$SERVER_PORT $XRDHTTP_LIB
 http.desthttps false
 tpc.allow local
 tpc.allow private
@@ -91,9 +99,9 @@ run_copy() {  # run_copy <port> <streams> <dest>; prints elapsed seconds
     python3 -c "print(f'{$t1 - $t0:.2f}')"
 }
 
-start_server tpcr "http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so"
+start_server tpcr "http.exthandler xrdtpcr +notls $TPCR_LIB"
 TPCR_PORT=$SERVER_PORT
-start_server stock "http.exthandler xrdtpc +notls $LIB_DIR/libXrdHttpTPC-6.so"
+start_server stock "http.exthandler xrdtpc +notls $STOCK_TPC_LIB"
 STOCK_PORT=$SERVER_PORT
 
 {

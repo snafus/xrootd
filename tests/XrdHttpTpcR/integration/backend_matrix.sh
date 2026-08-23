@@ -27,6 +27,13 @@ set -u
 BUILD_DIR="${1:?usage: backend_matrix.sh <build_dir>}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="$BUILD_DIR/lib"
+# The plugin suffix tracks the tree version (a tagless CI checkout builds
+# -4, a v6.1.1 clone builds -6): discover it, never assume it.
+XRDHTTP_LIB=$(ls "$LIB_DIR"/libXrdHttp-[0-9]*.so 2>/dev/null | head -1)
+TPCR_LIB=$(ls "$LIB_DIR"/libXrdHttpTPCR-[0-9]*.so 2>/dev/null | head -1)
+STOCK_TPC_LIB=$(ls "$LIB_DIR"/libXrdHttpTPC-[0-9]*.so 2>/dev/null | head -1)
+[ -n "$XRDHTTP_LIB" ] || { echo "SKIP: libXrdHttp plugin missing"; exit 127; }
+[ -n "$TPCR_LIB" ]    || { echo "SKIP: libXrdHttpTPCR plugin missing"; exit 127; }
 
 command -v python3 >/dev/null || { echo "SKIP: python3"; exit 127; }
 [ -x "$BUILD_DIR/bin/xrootd" ] || { echo "SKIP: xrootd binary"; exit 127; }
@@ -145,11 +152,11 @@ all.adminpath $dir/admin
 all.pidpath $dir/admin
 oss.localroot $dir/data
 xrd.port $port
-xrd.protocol XrdHttp:$port $LIB_DIR/libXrdHttp-6.so
+xrd.protocol XrdHttp:$port $XRDHTTP_LIB
 http.desthttps false
 tpc.allow local
 tpc.allow private
-http.exthandler xrdtpcr +notls $LIB_DIR/libXrdHttpTPCR-6.so
+http.exthandler xrdtpcr +notls $TPCR_LIB
 $persist_line
 tpcr.blocksize 1m
 EOF
@@ -177,7 +184,7 @@ EOF
     # (fixed sleeps fired before the transfer started on slow CI runners).
     local deadline=$(( $(date +%s) + 60 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        [ "$(wc -c < "$dir/data/crash.bin" 2>/dev/null || echo 0)" \
+        [ "$(cat "$dir/data/crash.bin" 2>/dev/null | wc -c || echo 0)" \
           -ge $((512*1024)) ] 2>/dev/null && break
         sleep 0.5
     done
