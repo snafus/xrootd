@@ -107,6 +107,26 @@ both the partial file and its journal are visible:
   next attempt; orchestrator retry backoffs longer than ~2 minutes (at
   defaults) never see it.
 
+### Mixed clusters and partial rollout
+
+Running TPCR on some gateways and stock TPC on others is **safe**: the wire
+surface is identical, so clients cannot tell nodes apart and every transfer
+completes correctly wherever it lands. What changes is that resume becomes
+best-effort — it happens only when the *retry* lands on a TPCR node:
+
+- Retry lands on a **stock** node: the file is simply rewritten from
+  scratch (stock behavior). The leftover journal is orphaned until a TPCR
+  node next touches that destination (stock nodes never clean journals).
+- A stock node rewrites a partial that a TPCR journal describes, and a
+  later retry lands on TPCR: the handler never trusts the partial's length
+  (only the journal watermark) and re-verifies the tail below the watermark
+  against the journaled CRCs before resuming — consistent bytes resume,
+  anything else is `RESUME_REJECTED` and the transfer runs fresh. The
+  worst case of mixing is lost resume opportunity, never corruption.
+
+Use mixed mode for canary/rolling rollout; for deterministic resume, run
+TPCR (with the same configuration) on every gateway serving a namespace.
+
 ### Multi-tenant warning (do not disable tail verification)
 
 `tpcr.verify.tailbytes 0` disables the resume-time re-read of the partial's
