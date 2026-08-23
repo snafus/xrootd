@@ -101,13 +101,8 @@ if(TARGET XrdServer)
 
   gtest_discover_tests(xrdhttptpcr-digest-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
 
-  # Ops tool (shipped per WP-13): dumps a TPCR journal for inspection.
-  add_executable(tpcr-journal-dump
-          tpcr-journal-dump.cc
-          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRJournal.cc
-          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc
-          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc)
-  target_link_libraries(tpcr-journal-dump XrdServer XrdUtils)
+  # (tpcr-journal-dump is built in src/XrdHttpTpcR/ -- shipped with the
+  # handler, not gated on ENABLE_TESTS; the harnesses use it from bin/.)
 
   # Integration: real xrootd + TPCR handler against the fault-injectable
   # mock source (T-I1, T-I2, early T-I3/T-I4).  Skips (127) when python3,

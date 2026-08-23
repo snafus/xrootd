@@ -51,3 +51,15 @@ if(NOT APPLE)
 endif()
 
 install(TARGETS ${XrdHttpTPCR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+# Ops tool (WP-13 "ship it"): read-only inspection of a TPCR sidecar
+# journal, using the same defensive parser as the server.  Deliberately
+# not gated on ENABLE_TESTS -- operators need it wherever the handler runs.
+add_executable(tpcr-journal-dump
+  tpcr-journal-dump.cc
+  XrdHttpTpcRJournal.cc
+  XrdHttpTpcRStream.cc
+  XrdHttpTpcRSlabPool.cc
+)
+target_link_libraries(tpcr-journal-dump XrdServer XrdUtils)
+install(TARGETS tpcr-journal-dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

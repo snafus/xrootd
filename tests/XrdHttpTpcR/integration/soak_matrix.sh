@@ -179,6 +179,13 @@ if grep -q "event=CLIENT_DISCONNECT" "$WORK"/soak/xrootd.log*; then
 else
     fail "T-S1/T-I11 CLIENT_DISCONNECT event missing"
 fi
+# FR-31: the checkpoint engine surfaces every taken checkpoint as a
+# structured event (T-S1's 5 s cadence guarantees several).
+if grep -q "event=CHECKPOINT" "$WORK"/soak/xrootd.log*; then
+    pass "FR-31 structured event CHECKPOINT logged"
+else
+    fail "FR-31 CHECKPOINT event missing"
+fi
 rm -f "$WORK/data/big.bin" "$WORK/ref.bin"
 echo >> "$RESULTS"
 

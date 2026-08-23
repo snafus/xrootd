@@ -412,6 +412,18 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         return true;
     };
 
+    // FR-31: every checkpoint the engine actually takes is surfaced as a
+    // structured event (the cadence decision itself lives in Checkpointer).
+    auto checkpoint_tick = [&]() {
+        if (!checkpointer) {return;}
+        if (checkpointer->MaybeCheckpoint(stream, stream.CommittedOffset(),
+                                          time(NULL))) {
+            std::stringstream ss;
+            ss << "W=" << stream.CommittedOffset();
+            logTransferEvent(LogMask::Info, rec, "CHECKPOINT", ss.str());
+        }
+    };
+
     // ------------------------------------------------------------------ //
     //             Degraded state: Tier-1 recovery (FR-14..FR-16)          //
     // ------------------------------------------------------------------ //
@@ -587,11 +599,7 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             const time_t pause_end = time(NULL) + probe_pause;
             while (time(NULL) < pause_end) {
                 if (!marker_tick()) {return DegradedResult::ClientGone;}
-                if (checkpointer) {
-                    checkpointer->MaybeCheckpoint(stream,
-                                                  stream.CommittedOffset(),
-                                                  time(NULL));
-                }
+                checkpoint_tick();
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
             probe_pause = std::min(probe_pause * 2, 15);
@@ -781,10 +789,7 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         // (FR-19; the SUB-1 data-sync-then-journal ordering lives inside).
         refresh_commit_clock();
         sched.AdvanceCommitted(stream.CommittedOffset());
-        if (checkpointer) {
-            checkpointer->MaybeCheckpoint(stream, stream.CommittedOffset(),
-                                          time(NULL));
-        }
+        checkpoint_tick();
         // Return excess slab reservations to the pool.
         while (slab_stash.size() > sched.InFlight()) {slab_stash.pop_back();}
 
@@ -849,8 +854,11 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         // is a distinct event, not a transfer failure: no verdict was
         // sent, so a shared-filesystem retry can resume from W.
         stream.Flush();
-        if (checkpointer) {
-            checkpointer->FinalCheckpoint(stream, stream.CommittedOffset());
+        if (checkpointer &&
+            checkpointer->FinalCheckpoint(stream, stream.CommittedOffset())) {
+            std::stringstream ss;
+            ss << "final W=" << stream.CommittedOffset();
+            logTransferEvent(LogMask::Info, rec, "CHECKPOINT", ss.str());
         }
         logTransferEvent(LogMask::Info, rec, "CLIENT_DISCONNECT",
             "Client connection lost; checkpointed and exiting without verdict");
@@ -884,6 +892,9 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
     if (aborted && checkpointer) {
         if (checkpointer->FinalCheckpoint(stream, stream.CommittedOffset())) {
             resumable_from = stream.CommittedOffset();
+            std::stringstream ss;
+            ss << "final W=" << resumable_from;
+            logTransferEvent(LogMask::Info, rec, "CHECKPOINT", ss.str());
         }
     }
 
