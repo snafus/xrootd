@@ -24,8 +24,11 @@ Stream::Finalize()
     m_open_for_write = false;
 
     // If there are outstanding buffers to reorder, finalization failed; the
-    // check has to happen before the buffers are released.
+    // check has to happen before the buffers are released.  Undelivered
+    // spans at close are a scheduler-bug signature, so dump them for the
+    // post-mortem before they are gone (stock behavior).
     bool all_buffers_returned = !AnyBufferedData();
+    if (!all_buffers_returned) {DumpBuffers();}
     m_buffers.clear();
 
     if (m_fh->close() == SFS_ERROR) {

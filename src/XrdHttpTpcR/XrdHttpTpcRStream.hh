@@ -24,10 +24,10 @@
  *    entries and the AvailableBuffers() count, which both stalled and
  *    hard-failed transfers when out-of-order arrival fragmented ranges
  *    across entries (BUG-7).  Entries are now created on demand and
- *    retired when empty; the scheduler instead governs admission with
- *    CommittedOffset() and ReorderSpan() (the byte distance covered by
- *    data buffered ahead of the committed offset).  Hard memory bounds
- *    arrive with the slab pool (WP-2) and the scheduler window (WP-4).
+ *    retired when empty; admission is governed by the scheduler, which
+ *    bounds its own range table to [committed, committed + window]
+ *    (NFR-1, WP-4).  Hard memory bounds arrive with the slab pool
+ *    (WP-2) and that scheduler window.
  *
  *  - WriteImpl() carries the in-order commit hook: every byte handed to
  *    the underlying file passes through it exactly once, at strictly
@@ -128,9 +128,9 @@ public:
     off_t CommittedOffset() const {return m_offset;}
 
     // The byte distance between the committed offset and the end of the
-    // furthest buffered data.  The scheduler bounds this by the configured
-    // reorder window when admitting new ranges (NFR-1); it replaces the
-    // stock buffer-occupancy admission signal.
+    // furthest buffered data.  Observability only (tests and the
+    // DumpBuffers post-mortem): the reorder window itself is enforced by
+    // the scheduler from its own range table, not from this figure.
     size_t ReorderSpan() const;
 
     // Install (or clear, by passing nullptr) the in-order commit hook.

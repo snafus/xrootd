@@ -140,10 +140,6 @@ public:
     // message, and returns false.  No-op (true) for non-ranged requests.
     bool ValidateRangeResponse(bool completion);
 
-    // True once this state has a pending ranged request (SetTransferParameters
-    // was called for the current issue).
-    bool RangeRequested() const {return m_range_request;}
-
     const std::map<std::string, std::string> & GetReprDigest() const { return m_repr_digests; }
 
     int GetErrorCode() const {return m_error_code;}
@@ -179,20 +175,6 @@ public:
     void RebindHeaders();
 
     CURL *GetHandle() const {return m_curl;}
-
-    // Returns true if at least one byte of the response has been received,
-    // but not the entire contents of the response.  For ranged requests the
-    // yardstick is the length we requested, never the length the response
-    // claimed (BUG-3).
-    bool BodyTransferInProgress() const {
-        return m_offset &&
-               (m_offset != (m_range_request ? m_expected_length
-                                             : m_content_length));
-    }
-
-    // Duplicate the current state; all settings are copied over, but those
-    // related to the transient state are reset as if from a constructor.
-    State *Duplicate();
 
     // Move the contents of a State object.  To be replaced by a move
     // constructor once C++11 is allowed in XRootD.

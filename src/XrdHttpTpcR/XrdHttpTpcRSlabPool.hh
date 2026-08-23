@@ -127,9 +127,7 @@ public:
     // the pool is saturated).  Never blocks.
     Slab Acquire(const std::shared_ptr<Client> &client);
 
-    size_t SlabSize() const {return m_slab_size;}
-
-    // Observability (tests, debug logging, future monitoring).
+    // Observability (tests and debug logging).
     uint64_t BytesAllocated() const;
     size_t FreeSlabs() const;
     size_t ActiveClients() const;

@@ -132,3 +132,36 @@ stash satisfies the next issue (reservations are not stacked), and (b) the reser
 is skipped entirely when the transfer has nothing in flight — delivery never needs the
 pool (Stream's window-bounded heap fallback), so the pool gates only *extra*
 parallelism.  Verified: 3 consecutive T-S2 runs at 8/8.  Touches: NFR-1, FR-13, SUB-3.
+
+**2026-08-23 / WP-12 scope audit — `tpcr.retry.budget` (02 §12) subsumed, not parsed.**
+No FR defines what it bounds: FR-13 names per-range `tpcr.retry.max`, FR-16 the
+wall-clock `tpcr.recovery.maxsecs`.  Implementing a third knob with invented semantics
+would be scope creep; today the directive fails startup as unknown (FR-30 fail-fast).
+Flagged in QUESTIONS.md Q-6 for the docs-vs-implementation divergence.  Touches:
+FR-13, FR-16, FR-30.
+
+**2026-08-23 / WP-12 scope audit — unknown CURLcodes classify as Retryable.**
+FR-12's table is exhaustive for the codes it names but silent on codes it does not
+(new libcurl versions add them).  Retryable is the conservative default under the
+priority order: a wrongly-permanent classification forfeits a recoverable transfer,
+while a wrongly-retryable one is bounded by `tpcr.retry.max` and the FR-16 recovery
+budget.  Touches: FR-12, FR-13, FR-16.
+
+**2026-08-23 / WP-12 scope audit — degraded-state exit resets the global stall clock.**
+Outage time ridden out in degraded state is charged to FR-16's recovery budget, not to
+the stock global stall timer (SUB-11 precedence): without the reset, a recovered
+transfer could be killed by the stall timer for an outage the recovery budget just
+authorized it to survive.  Wire-visible only as "transfers survive what FR-16 says
+they survive".  Touches: FR-16, SUB-11.
+
+**2026-08-23 / WP-12 scope audit — dead stock-port surface removed.**
+An audit of the implementation against 01/02/04 found no unjustified subsystems, but
+~90 lines of orphaned surface, mostly left behind when WP-4 deleted Multistream:
+`State::Duplicate`, `State::BodyTransferInProgress`, `State::RangeRequested` (test now
+uses the StateTestPeer seam), `SlabPool::SlabSize`, `Checkpointer::Record/MutableRecord`,
+`TransferDigests::EpochStart`, the `m_block_size`/`m_small_block_size` statics
+(replaced by `tpcr.blocksize`), and dead mock-source bookkeeping.  `Stream::DumpBuffers`
+was re-wired to the Finalize failure path (stock behavior) instead of deleted, which
+also re-justifies `ReorderSpan`/`GetCapacity` as its observability; the stale claim
+that ReorderSpan drives admission was corrected (the scheduler window does).  Touches:
+03 standing directive 5 ("delete rather than leave dead code").

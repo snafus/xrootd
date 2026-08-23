@@ -55,7 +55,6 @@ class SourceState:
         # value) as an RFC 9530 Repr-Digest on every response (FR-29 tests).
         self.repr_digest_mode = args.repr_digest
         self.headers_log = args.headers_log
-        self.request_count = 0
 
     @staticmethod
     def _parse_pair(value):
@@ -128,10 +127,6 @@ class Handler(BaseHTTPRequestHandler):
         self._log_headers()
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b""
-        with self.state.lock:
-            uploads = getattr(self.state, "uploads", {})
-            uploads[self.path] = body
-            self.state.uploads = uploads
         # Persist for the test script to compare.
         if self.state.headers_log:
             with open(self.state.headers_log + ".put" , "wb") as out:
@@ -144,8 +139,6 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_ctl()
             return
         self._log_headers()
-        with state.lock:
-            state.request_count += 1
 
         if state.refuse in ("refuse", "refuse-data"):
             self._plain_status(503, "source down (test-controlled)")

@@ -23,6 +23,26 @@ same token authorizes — safe but wasteful).  If create-token resume matters in
 production, the upstreamable fix is an OFS-level "create-or-open-existing" mode (no
 EXCL); flagging rather than deciding, per the operating rules.
 
+## Q-5 (WP-12 scope audit — review requested, not blocking)
+**FR-3 advertisement when resume is disabled.** FR-3 says OPTIONS responses MUST
+advertise `X-Transfer-Capabilities: resume/1`, unconditionally as written. The
+implementation advertises it only when `tpcr.resume` is on, because advertising
+resume against a config that will never write a journal misleads orchestrators
+into planning retries around a capability that is not there. Conditional
+advertisement looks like the spec's *intent* (FR-30 makes resume switchable),
+but it deviates from the letter of a MUST, so it is flagged here rather than
+silently decided. If the unconditional reading is the intended one, the fix is
+a one-line change in `TPCRHandler::ProcessOptionsReq`.
+
+## Q-6 (WP-12 scope audit — review requested, not blocking)
+**`tpcr.retry.budget` (02 §12) is not implemented.** No FR references it: FR-13
+names only per-range `tpcr.retry.max`, and the wall-clock ceiling on riding out
+faults is FR-16's `tpcr.recovery.maxsecs`. The directive was therefore judged
+subsumed and never parsed — today it would fail startup as an unknown directive
+(FR-30 fail-fast). If a separate cumulative-retry budget distinct from the
+recovery budget is wanted, it needs a definition of what it bounds that 02 does
+not give. See DECISIONS.md entry of 2026-08-23.
+
 ## Q-3 (WP-6, informational — no block on M2 for POSIX)
 **Backend matrix coverage limited to POSIX.** This testbed offers no EC, CephFS, or
 proxy/PSS deployment, so those legs of the WP-6 matrix could not run; per the plan they

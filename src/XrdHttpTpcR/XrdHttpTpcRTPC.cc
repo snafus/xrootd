@@ -64,8 +64,6 @@ XrdXrootdTpcMon* TPCRHandler::TPCLogRecord::tpcMonitor = 0;
 
 uint64_t TPCRHandler::m_monid{0};
 int TPCRHandler::m_marker_period = 5;
-size_t TPCRHandler::m_block_size = 16*1024*1024;
-size_t TPCRHandler::m_small_block_size = 1*1024*1024;
 XrdSysMutex TPCRHandler::m_monid_mutex;
 bool TPCRHandler::allowMissingCRL = false;
 

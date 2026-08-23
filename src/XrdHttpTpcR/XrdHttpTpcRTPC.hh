@@ -259,8 +259,6 @@ private:
     bool mismatchReprDigest(const std::map<std::string,std::string> & passiveSrvReprDigest, XrdHttpExtReq & req, TPCLogRecord &rec);
 
     static int m_marker_period;
-    static size_t m_block_size;
-    static size_t m_small_block_size;
     bool m_allow_local;
     bool m_allow_private;
     bool m_desthttps;

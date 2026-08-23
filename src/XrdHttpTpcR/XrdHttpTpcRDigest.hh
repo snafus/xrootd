@@ -85,10 +85,9 @@ public:
     // Lowercase 8-hex-digit rendering (the Repr-Digest / xattr format).
     std::string AdlerHex() const;
 
-    // Closes the current CRC32C epoch [EpochStart(), Covered()) -- called by
+    // Closes the current CRC32C epoch [epoch start, Covered()) -- called by
     // the checkpoint snapshot -- and starts the next one.
     JournalRecord::EpochDigest CloseEpoch();
-    off_t EpochStart() const {return m_epoch_start;}
 
     // adler32 of the concatenation A||B from adler(A), adler(B), len(B)
     // (the standard combine; exposed for T-U12 and future parallel use).

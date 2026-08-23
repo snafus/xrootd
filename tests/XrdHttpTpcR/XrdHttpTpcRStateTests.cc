@@ -43,6 +43,9 @@ struct StateTestPeer {
   static off_t StartOffset(const TPCR::State &state) {
     return state.m_start_offset;
   }
+  static bool RangeRequested(const TPCR::State &state) {
+    return state.m_range_request;
+  }
 };
 
 namespace {
@@ -132,7 +135,7 @@ TEST_F(XrdHttpTpcRStateTests, ResetAfterRequestClearsResponseFields) {
   EXPECT_EQ(state.GetContentLength(), 999) << "transfer-level, not per-request";
   EXPECT_TRUE(state.GetReprDigest().empty());
   EXPECT_EQ(state.BytesTransferred(), 0);
-  EXPECT_FALSE(state.RangeRequested());
+  EXPECT_FALSE(StateTestPeer::RangeRequested(state));
 }
 
 TEST_F(XrdHttpTpcRStateTests, HeaderParserRejectsMalformedInput) {

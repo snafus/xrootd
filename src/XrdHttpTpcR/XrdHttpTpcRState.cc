@@ -464,29 +464,6 @@ int State::Read(char *buffer, size_t size) {
     return retval;
 }
 
-State *State::Duplicate() {
-    CURL *curl = curl_easy_duphandle(m_curl);
-    if (!curl) {
-        throw std::runtime_error("Failed to duplicate existing curl handle.");
-    }
-
-    State *state = new State(0, *m_stream, curl, m_push, tpcForwardCreds);
-
-    if (m_headers) {
-        state->m_headers_copy.reserve(m_headers_copy.size());
-        for (std::vector<std::string>::const_iterator header_iter = m_headers_copy.begin();
-             header_iter != m_headers_copy.end();
-             header_iter++) {
-            state->m_headers = curl_slist_append(state->m_headers, header_iter->c_str());
-            state->m_headers_copy.push_back(*header_iter);
-        }
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, state->m_headers);
-    }
-
-    return state;
-}
-
 void State::SetTransferParameters(off_t offset, size_t size) {
     m_start_offset = offset;
     m_offset = 0;

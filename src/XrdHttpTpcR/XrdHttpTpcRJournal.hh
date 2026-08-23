@@ -198,9 +198,6 @@ public:
     // reported as FAILED, since durability of the full content is unproven.
     bool SuccessCleanup(Stream &stream, std::string &err);
 
-    const JournalRecord &Record() const {return m_record;}
-    JournalRecord &MutableRecord() {return m_record;}
-
     // Lease renewal interval = 2 x checkpoint.secs (FR-22, SUB-8).
     int64_t LeaseDuration() const {return 2 * (int64_t)m_checkpoint_secs;}
 
