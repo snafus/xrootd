@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "XrdHttpTpcRDigest.hh"
 #include "XrdHttpTpcRState.hh"
 #include "XrdHttpTpcRStream.hh"
 #include "XrdHttpTpcRTPC.hh"
@@ -1383,6 +1384,9 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
     const std::string dest_path = full_url.substr(0, full_url.find('?'));
     off_t resume_offset = 0;
     bool resuming = false;
+    // Streaming integrity digests (WP-10, FR-26): fresh here; a resume
+    // restores them from the journal below (SUB-4).
+    TPCR::TransferDigests digests;
     std::unique_ptr<TPCR::JournalStore> journal_store;
     TPCR::JournalRecord record;          // the record this session will own
     bool have_record = false;            // record already committed on disk
@@ -1471,6 +1475,14 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
                 return req.SendSimpleResp(409, NULL,
                     const_cast<char *>(retry_hdr.str().c_str()),
                     const_cast<char *>(body.str().c_str()), 0);
+            } else if (journal.committed > 0 &&
+                       !digests.Restore(journal.digest_state,
+                                        journal.committed, reason)) {
+                // SUB-4: without a digest state matching W, the resumed
+                // prefix could never be attested (adler32 over [0, W) is not
+                // recomputable without re-reading) -- reject rather than
+                // resume into an unverifiable transfer (FR-26).
+                reject("reason=digest-state (" + reason + ")");
             } else {
                 // Resume -- case (b).  XRD-6 strict sequencing: acquire (or
                 // steal) the lease via atomic journal rewrite BEFORE opening
@@ -1536,6 +1548,9 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
         resuming = false;
         have_record = false;
         resume_offset = 0;
+        // The digests may hold restored resume state; a fresh transfer
+        // starts hashing from byte 0 again.
+        digests = TPCR::TransferDigests();
         mode = overwrite_allowed ? (usingEC ? SFS_O_CREAT : SFS_O_TRUNC)
                                  : SFS_O_CREAT;
         open_result = OpenWaitStall(*fh, full_url, mode|SFS_O_WRONLY,
@@ -1562,6 +1577,12 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
     // The Stream's committed offset seeds at W (0 fresh); all offsets stay
     // absolute.  Entry capacity equals the scheduler's range size.
     Stream stream(std::move(fh), resume_offset, m_tpcr.block_size, m_log);
+    // FR-26: every committed byte flows through the digests, in order,
+    // exactly once -- the Stream's commit hook is that guarantee.
+    stream.SetCommitHook([&digests](off_t offset, const char *data,
+                                    size_t size) {
+        digests.Update(offset, data, size);
+    });
     State state(0, stream, curl, false, req.tpcForwardCreds);
     state.SetupHeaders(req);
     state.SetContentLength(sourceFileContentLength);
@@ -1596,16 +1617,27 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
             }
         }
         if (have_record) {
+            // SUB-4: the snapshot closes the open CRC32C epoch into the
+            // record and refreshes the serialized digest state under the
+            // very commit that persists W.
             checkpointer.reset(new TPCR::Checkpointer(
                 *journal_store, record, m_tpcr.checkpoint_bytes,
-                m_tpcr.checkpoint_secs, m_log));
+                m_tpcr.checkpoint_secs, m_log,
+                [&digests](TPCR::JournalRecord &snapshot) {
+                    auto epoch = digests.CloseEpoch();
+                    if (epoch.length > 0) {
+                        snapshot.epochs.push_back(epoch);
+                    }
+                    snapshot.digest_state = digests.Serialize();
+                }));
         }
     }
 
     // FR-7: every pull -- streams=1 included -- runs through the range
     // scheduler.  There is exactly one pull code path.
     return RunPullScheduler(req, state, stream, streams, resource, iface_ip,
-                            sourceValidators, checkpointer.get(), rec);
+                            sourceValidators, checkpointer.get(), &digests,
+                            rec);
 }
 
 /******************************************************************************/

@@ -21,12 +21,15 @@ the resume tests (WP-8) flip via /ctl.
 """
 
 import argparse
+import base64
 import json
 import os
 import socket
+import struct
 import sys
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -48,6 +51,9 @@ class SourceState:
         self.refuse = "ok"
         self.etag = '"tpcr-mock-etag-1"'
         self.last_modified = "Wed, 01 Jan 2025 00:00:00 GMT"
+        # --repr-digest good|bad: advertise the payload adler32 (or a wrong
+        # value) as an RFC 9530 Repr-Digest on every response (FR-29 tests).
+        self.repr_digest_mode = args.repr_digest
         self.headers_log = args.headers_log
         self.request_count = 0
 
@@ -95,6 +101,12 @@ class Handler(BaseHTTPRequestHandler):
     def _send_validators(self):
         self.send_header("ETag", self.state.etag)
         self.send_header("Last-Modified", self.state.last_modified)
+        if self.state.repr_digest_mode:
+            adler = zlib.adler32(self.payload) & 0xffffffff
+            if self.state.repr_digest_mode == "bad":
+                adler ^= 0xdeadbeef
+            value = base64.b64encode(struct.pack(">I", adler)).decode()
+            self.send_header("Repr-Digest", "adler=:%s:" % value)
 
     def do_HEAD(self):
         self._log_headers()
@@ -256,6 +268,7 @@ def main():
     parser.add_argument("--stall", default=None, metavar="SECS:N")
     parser.add_argument("--throttle", type=int, default=0, metavar="BYTES_PER_S")
     parser.add_argument("--headers-log", default=None)
+    parser.add_argument("--repr-digest", default=None, choices=["good", "bad"])
     args = parser.parse_args()
 
     with open(args.file, "rb") as ref:

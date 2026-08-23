@@ -173,12 +173,15 @@ private:
 // transfer continues, and the failure is logged (SUB-1).
 class Checkpointer {
 public:
-    // digest_serializer (WP-10) snapshots the running digest state
-    // checkpoint-atomically with W (SUB-4); empty function = no digests yet.
+    // digest_snapshot (WP-10) mutates the record under the same commit that
+    // persists W -- closing the open CRC32C epoch into record.epochs and
+    // refreshing record.digest_state -- so digest state and watermark are
+    // checkpoint-atomic (SUB-4).  Null = no digests (never in production).
+    using DigestSnapshot = std::function<void(JournalRecord &)>;
     Checkpointer(JournalStore &store, JournalRecord record,
                  uint64_t checkpoint_bytes, unsigned checkpoint_secs,
                  XrdSysError &log,
-                 std::function<std::string()> digest_serializer = nullptr);
+                 DigestSnapshot digest_snapshot = nullptr);
 
     // Called from the transfer loop after every commit advance.  Performs a
     // checkpoint when due (FR-19); returns true if one was taken.
@@ -210,7 +213,7 @@ private:
     const uint64_t m_checkpoint_bytes;
     const unsigned m_checkpoint_secs;
     XrdSysError &m_log;
-    std::function<std::string()> m_digest_serializer;
+    DigestSnapshot m_digest_snapshot;
     off_t m_last_committed;
     time_t m_last_time;
 };

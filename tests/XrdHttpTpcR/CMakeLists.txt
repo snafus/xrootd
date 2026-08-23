@@ -83,6 +83,24 @@ if(TARGET XrdServer)
 
   gtest_discover_tests(xrdhttptpcr-journal-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
 
+  # T-U12 digests: zlib serves as the independent reference implementation.
+  find_package(ZLIB REQUIRED)
+  add_executable(xrdhttptpcr-digest-unit-tests
+          XrdHttpTpcRDigestTests.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRDigest.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRJournal.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRStream.cc
+          ${PROJECT_SOURCE_DIR}/src/XrdHttpTpcR/XrdHttpTpcRSlabPool.cc)
+
+  target_link_libraries(xrdhttptpcr-digest-unit-tests
+          XrdServer
+          XrdUtils
+          ZLIB::ZLIB
+          GTest::gtest
+          GTest::gtest_main)
+
+  gtest_discover_tests(xrdhttptpcr-digest-unit-tests PROPERTIES DISCOVERY_TIMEOUT 10)
+
   # Ops tool (shipped per WP-13): dumps a TPCR journal for inspection.
   add_executable(tpcr-journal-dump
           tpcr-journal-dump.cc

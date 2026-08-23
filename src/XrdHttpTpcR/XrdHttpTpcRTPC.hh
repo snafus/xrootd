@@ -15,6 +15,7 @@
 #include "XrdHttpTpcRConfig.hh"
 #include "XrdHttpTpcRScheduler.hh"
 #include "XrdHttpTpcRJournal.hh"
+#include "XrdHttpTpcRDigest.hh"
 #include "XrdHttpTpcRSlabPool.hh"
 
 #include <curl/curl.h>
@@ -192,6 +193,7 @@ private:
                          const std::string &interface_ip,
                          const TPCR::SourceValidators &baseline,
                          TPCR::Checkpointer *checkpointer,
+                         TPCR::TransferDigests *digests,
                          TPCLogRecord &rec);
     int RunPullSchedulerImpl(XrdHttpExtReq &req, TPCR::State &state,
                              TPCR::Stream &stream, size_t streams,
@@ -199,6 +201,7 @@ private:
                              const std::string &interface_ip,
                              const TPCR::SourceValidators &baseline,
                              TPCR::Checkpointer *checkpointer,
+                             TPCR::TransferDigests *digests,
                              std::vector<TPCR::State*> &states,
                              std::vector<ManagedCurlHandle> &owned_handles,
                              TPCLogRecord &rec);

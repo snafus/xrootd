@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** M2 COMPLETE (tag tpcr-m2). Next: WP-10 — digests (adler32 + crc32c, journal state, SUB-4).
+**Current focus:** WP-11 — tail verification + checksum-store injection (FR-27/FR-28, XRD-2).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
@@ -14,7 +14,7 @@
 | WP-7 Journal + checkpointing | done | (this commit) | 85/85 unit; crash matrix 3/3 | Journal format+CRC, SFS store, Checkpointer with SUB-1 ordering; FR-17/23 on all exit paths; tpcr-journal-dump shipped. |
 | WP-8 Resume open path | done | (this commit) | 86/86 unit; resume matrix 10/10 | Full a–e decision tree; ladder; lease 409/steal; GC; SUB-2 table; FR-5 absolute markers; O_EXCL deviation in DECISIONS/Q-4. |
 | WP-9 Capability + client-visible | done | 2ebd24ee1 | 33/33 integration; trace_check m2 clean | FR-3 OPTIONS header; FR-6 in-line resumable-from; T-I8 strict grammar checker. |
-| WP-10 Digests | todo | | | |
+| WP-10 Digests | done | (this commit) | 92/92 unit; resume matrix 11/11 incl. digest-across-resume | Local seedable adler32 + XrdOucCRC crc32c; SUB-4 checkpoint-atomic; FR-29 gate live end-to-end. |
 | WP-11 Tail verify + cksum injection | todo | | | |
 | WP-12 Scale and soak | todo | | | |
 | WP-13 Docs and handback | todo | | | |

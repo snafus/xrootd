@@ -331,6 +331,26 @@ fi
 kill "$XRD_PID" 2>/dev/null
 stop_mock
 
+# ---------------------------------------------------------------------------
+# 11. Digest continuity across resume (T-U12 end-to-end; FR-26/FR-29/SUB-4):
+#     the source advertises its adler32; a crash+resume transfer must still
+#     produce the matching whole-file digest from the RESTORED digest state.
+# ---------------------------------------------------------------------------
+stop_mock
+start_mock "$REF" --throttle $((512*1024)) --repr-digest good
+crash_transfer "/r11.bin"
+sleep 11
+start_server
+copy "/r11.bin"
+if printf '%s' "$RESPONSE" | grep -q "success: Created" \
+   && cmp -s "$REF" "$WORK/data/r11.bin" \
+   && server_log | grep -q "event=RESUME_START"; then
+    pass "11: resumed transfer attested the correct whole-file adler32 (FR-29)"
+else
+    fail "11: $(printf '%s' "$RESPONSE" | tail -c 200)"
+fi
+kill "$XRD_PID" 2>/dev/null
+
 echo
 if [ "$FAILURES" -eq 0 ]; then echo "RESUME MATRIX (T-I6): ALL PASSED"; exit 0; fi
 echo "$FAILURES resume matrix check(s) FAILED"; exit 1

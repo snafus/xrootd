@@ -384,6 +384,29 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# FR-29: source Repr-Digest vs computed destination adler32
+# ---------------------------------------------------------------------------
+make_ref "$WORK/ref.bin" $((3 * BLOCK + 777))
+start_mock "$WORK/ref.bin" --repr-digest good
+copy_pull "/dest-digest-ok.bin" 4
+stop_mock
+if printf '%s' "$RESPONSE" | grep -q "success: Created" \
+   && cmp -s "$WORK/ref.bin" "$WORK/data/dest-digest-ok.bin"; then
+    pass "FR-29 matching source Repr-Digest accepted"
+else
+    fail "FR-29 good digest: $RESPONSE"
+fi
+
+start_mock "$WORK/ref.bin" --repr-digest bad
+copy_pull "/dest-digest-bad.bin" 4
+stop_mock
+if printf '%s' "$RESPONSE" | grep -q "does not match the source Repr-Digest"; then
+    pass "FR-29 mismatched source Repr-Digest fails before the success chunk"
+else
+    fail "FR-29 bad digest: expected mismatch failure, got: $RESPONSE"
+fi
+
+# ---------------------------------------------------------------------------
 # T-I8: wire grammar (CON-4) -- a strict gfal/davix-style parser must accept
 # fresh-success, throttled-with-markers, resumed-shape, and failed responses;
 # FR-3 OPTIONS capability; FR-6 resumable-from suffix on failures with a

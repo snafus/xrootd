@@ -21,6 +21,7 @@ set(XrdHttpTPCR XrdHttpTPCR-${PLUGIN_VERSION})
 add_library(${XrdHttpTPCR} MODULE
   XrdHttpTpcRConfig.cc       XrdHttpTpcRConfig.hh
   XrdHttpTpcRConfigure.cc
+  XrdHttpTpcRDigest.cc       XrdHttpTpcRDigest.hh
   XrdHttpTpcPMarkManager.cc  XrdHttpTpcPMarkManager.hh
   XrdHttpTpcRJournal.cc      XrdHttpTpcRJournal.hh
   XrdHttpTpcRScheduler.cc    XrdHttpTpcRScheduler.hh

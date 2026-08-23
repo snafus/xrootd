@@ -431,10 +431,10 @@ bool JournalStore::Remove(std::string &err)
 Checkpointer::Checkpointer(JournalStore &store, JournalRecord record,
                            uint64_t checkpoint_bytes, unsigned checkpoint_secs,
                            XrdSysError &log,
-                           std::function<std::string()> digest_serializer)
+                           DigestSnapshot digest_snapshot)
     : m_store(store), m_record(std::move(record)),
       m_checkpoint_bytes(checkpoint_bytes), m_checkpoint_secs(checkpoint_secs),
-      m_log(log), m_digest_serializer(std::move(digest_serializer)),
+      m_log(log), m_digest_snapshot(std::move(digest_snapshot)),
       m_last_committed(m_record.committed), m_last_time(time(NULL))
 {
 }
@@ -492,9 +492,10 @@ bool Checkpointer::Take(Stream &stream, off_t committed, time_t now,
     m_record.committed = committed;
     m_record.updated = int64_t(now);
     m_record.lease_expiry = int64_t(now) + LeaseDuration();
-    if (m_digest_serializer) {
-        // SUB-4: the digest state is checkpoint-atomic with W.
-        m_record.digest_state = m_digest_serializer();
+    if (m_digest_snapshot) {
+        // SUB-4: the digest state (and the closed epoch) is checkpoint-
+        // atomic with W -- same record, same atomic rename.
+        m_digest_snapshot(m_record);
     }
     std::string err;
     if (!m_store.Commit(m_record, err)) {

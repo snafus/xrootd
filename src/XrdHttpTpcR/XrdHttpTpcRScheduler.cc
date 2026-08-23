@@ -31,6 +31,7 @@
 #include "XrdHttpTpcRStream.hh"
 #include "XrdHttpTpcRScheduler.hh"
 #include "XrdHttpTpcRJournal.hh"
+#include "XrdHttpTpcRDigest.hh"
 
 #include "XrdSys/XrdSysError.hh"
 
@@ -126,6 +127,7 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
                                   const std::string &interface_ip,
                                   const SourceValidators &baseline,
                                   Checkpointer *checkpointer,
+                                  TransferDigests *digests,
                                   TPCLogRecord &rec)
 {
     std::vector<State*> states;
@@ -133,7 +135,7 @@ int TPCRHandler::RunPullScheduler(XrdHttpExtReq &req, State &state,
     try {
         int retval = RunPullSchedulerImpl(req, state, stream, streams,
                                           resource_url, interface_ip,
-                                          baseline, checkpointer,
+                                          baseline, checkpointer, digests,
                                           states, owned_handles, rec);
         for (auto *each : states) {delete each;}
         return retval;
@@ -158,6 +160,7 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                                       const std::string &interface_ip,
                                       const SourceValidators &baseline,
                                       Checkpointer *checkpointer,
+                                      TransferDigests *digests,
                                       std::vector<State*> &states,
                                       std::vector<ManagedCurlHandle> &owned_handles,
                                       TPCLogRecord &rec)
@@ -895,6 +898,44 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             << stream.CommittedOffset() << " of " << content_length;
         logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL", ss2.str());
         final_ss << generateClientErr(ss2, rec);
+    } else if (digests && digests->Poisoned()) {
+        // NFR-7: the in-order digest invariant broke; the checksum cannot
+        // be attested, so neither can the transfer.
+        std::stringstream ss2;
+        ss2 << "internal digest ordering violation; success cannot be attested";
+        logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL", ss2.str());
+        final_ss << generateClientErr(ss2, rec);
+    } else if (digests && digests->Covered() != content_length) {
+        std::stringstream ss2;
+        ss2 << "digest coverage " << digests->Covered()
+            << " does not match content length " << content_length
+            << "; internal inconsistency";
+        logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL", ss2.str());
+        final_ss << generateClientErr(ss2, rec);
+    } else if (digests && ([&]() {
+                   // FR-29: when the source claimed an adler digest, the
+                   // destination's computed value must match -- checked
+                   // BEFORE any success chunk.  Values arrive as lowercase
+                   // hex (parseReprDigest base64-decodes to hex).
+                   for (const char *key : {"adler", "adler32"}) {
+                       auto claim = baseline.repr_digests.find(key);
+                       if (claim == baseline.repr_digests.end()) {continue;}
+                       std::string claimed = claim->second;
+                       for (auto &ch : claimed) {ch = char(tolower(ch));}
+                       if (claimed != digests->AdlerHex()) {
+                           std::stringstream ss2;
+                           ss2 << "destination adler32 " << digests->AdlerHex()
+                               << " does not match the source Repr-Digest "
+                               << claimed;
+                           logTransferEvent(LogMask::Error, rec,
+                                            "DIGEST_MISMATCH", ss2.str());
+                           final_ss << generateClientErr(ss2, rec);
+                           return true;   // mismatch -> fail
+                       }
+                   }
+                   return false;
+               })()) {
+        // final_ss already carries the mismatch message.
     } else if (checkpointer && !([&]() {
                    // FR-23 success ordering: final data sync -> [checksum
                    // injection, WP-11] -> journal delete; only then close
