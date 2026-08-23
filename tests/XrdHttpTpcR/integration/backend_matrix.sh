@@ -173,7 +173,14 @@ EOF
         -H "Source: http://127.0.0.1:$mock_port/src.bin" \
         -H "X-Number-Of-Streams: 2" -H "Overwrite: T" > /dev/null 2>&1 &
     local copy_pid=$!
-    sleep 4                          # transfer is mid-flight
+    # Kill only after the partial demonstrably exists and is growing
+    # (fixed sleeps fired before the transfer started on slow CI runners).
+    local deadline=$(( $(date +%s) + 60 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        [ "$(wc -c < "$dir/data/crash.bin" 2>/dev/null || echo 0)" \
+          -ge $((512*1024)) ] 2>/dev/null && break
+        sleep 0.5
+    done
     kill -9 "$xrd_pid" 2>/dev/null   # gateway crash
     wait "$copy_pid" 2>/dev/null
     kill "$mock_pid" 2>/dev/null

@@ -110,9 +110,14 @@ if(TARGET XrdServer)
   add_test(NAME XrdHttpTpcR::integration
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/tpcr_test.sh
                    ${CMAKE_BINARY_DIR})
+  # RUN_SERIAL on every server-driving harness: they kill live servers on
+  # a timing budget and pick free ports with a bind-then-close probe --
+  # both race against concurrently running tests on contended CI runners
+  # (observed: a stolen port sent a COPY to another test's server).
   set_tests_properties(XrdHttpTpcR::integration PROPERTIES
                        SKIP_RETURN_CODE 127
                        TIMEOUT 600
+                       RUN_SERIAL TRUE
                        LABELS "integration")
 
   # WP-6 backend semantics matrix (M2 gate) and WP-7 crash matrix (T-I5).
@@ -120,16 +125,19 @@ if(TARGET XrdServer)
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/backend_matrix.sh
                    ${CMAKE_BINARY_DIR})
   set_tests_properties(XrdHttpTpcR::backend_matrix PROPERTIES
-                       SKIP_RETURN_CODE 127 TIMEOUT 300 LABELS "integration")
+                       SKIP_RETURN_CODE 127 TIMEOUT 300 RUN_SERIAL TRUE
+                       LABELS "integration")
   add_test(NAME XrdHttpTpcR::crash_matrix
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/crash_matrix.sh
                    ${CMAKE_BINARY_DIR})
   set_tests_properties(XrdHttpTpcR::crash_matrix PROPERTIES
-                       SKIP_RETURN_CODE 127 TIMEOUT 600 LABELS "integration")
+                       SKIP_RETURN_CODE 127 TIMEOUT 600 RUN_SERIAL TRUE
+                       LABELS "integration")
   # WP-8 resume decision matrix (T-I6, T-I13 leg).
   add_test(NAME XrdHttpTpcR::resume_matrix
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/resume_matrix.sh
                    ${CMAKE_BINARY_DIR})
   set_tests_properties(XrdHttpTpcR::resume_matrix PROPERTIES
-                       SKIP_RETURN_CODE 127 TIMEOUT 900 LABELS "integration")
+                       SKIP_RETURN_CODE 127 TIMEOUT 900 RUN_SERIAL TRUE
+                       LABELS "integration")
 endif()

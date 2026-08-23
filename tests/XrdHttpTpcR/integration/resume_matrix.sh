@@ -117,7 +117,13 @@ crash_transfer() {  # crash_transfer <dest>
         -H "Source: http://127.0.0.1:$MOCK_PORT/src.bin" \
         -H "X-Number-Of-Streams: 4" -H "Overwrite: T" > /dev/null 2>&1 &
     local copy_pid=$!
-    sleep 8
+    # Kill only once the first checkpoint is provably down (W > 0); a
+    # fixed sleep fired before the transfer started on slow CI runners.
+    local deadline=$(( $(date +%s) + 90 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        [ "$(journal_w "$WORK/data$dest.xrdtpcr")" -gt 0 ] 2>/dev/null && break
+        sleep 0.5
+    done
     kill -9 "$XRD_PID"
     wait "$copy_pid" 2>/dev/null
     W_CRASH=$(journal_w "$WORK/data$dest.xrdtpcr")

@@ -85,6 +85,29 @@ journal_w() {  # prints W from the dump tool, or -1 on invalid/absent
                                     END {if (!found) print -1}'
 }
 
+# Event-driven pacing (CI runners are slow and contended; fixed sleeps
+# fired before the transfer even started).  On timeout the caller just
+# proceeds -- the scenario's own assertions then report what is missing.
+wait_journal_w() {  # wait_journal_w <journal> <min_bytes> <timeout_s>
+    local deadline=$(( $(date +%s) + $3 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        local w; w=$(journal_w "$1")
+        [ "$w" -ge "$2" ] 2>/dev/null && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+wait_file_size() {  # wait_file_size <path> <min_bytes> <timeout_s>
+    local deadline=$(( $(date +%s) + $3 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        local sz; sz=$(wc -c < "$1" 2>/dev/null || echo 0)
+        [ "$sz" -ge "$2" ] 2>/dev/null && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # A. kill -9 mid-transfer: journal valid, W trustworthy
 # ---------------------------------------------------------------------------
@@ -93,7 +116,8 @@ curl -s -N -X COPY "http://127.0.0.1:$PORT/crashA.bin" \
     -H "Source: http://127.0.0.1:$MOCK_PORT/src.bin" \
     -H "X-Number-Of-Streams: 4" -H "Overwrite: T" > /dev/null 2>&1 &
 COPY_PID=$!
-sleep 8                    # several checkpoints in (2m cadence, ~4MB/s)
+# Kill only once several checkpoints are provably down (2m cadence).
+wait_journal_w "$WORK/data/crashA.bin.xrdtpcr" $((6*1024*1024)) 120
 kill -9 "$XRD_PID"
 wait "$COPY_PID" 2>/dev/null
 
@@ -103,7 +127,7 @@ if [ ! -f "$JOURNAL" ]; then
 else
     if "$DUMP" "$JOURNAL" > "$WORK/dumpA.txt" 2>&1; then
         W=$(journal_w "$JOURNAL")
-        DEST_SIZE=$(stat -c %s "$WORK/data/crashA.bin")
+        DEST_SIZE=$(wc -c < "$WORK/data/crashA.bin" | tr -d ' ')
         if [ "$W" -gt 0 ] 2>/dev/null && [ "$W" -le "$DEST_SIZE" ] \
            && cmp -s -n "$W" "$WORK/ref.bin" "$WORK/data/crashA.bin"; then
             pass "A: journal valid after kill -9; W=$W durable and byte-identical to source"
@@ -119,11 +143,12 @@ fi
 # B. admitted failure: FR-17 final checkpoint before the failure chunk
 # ---------------------------------------------------------------------------
 start_server
-RESP=$(timeout 120 curl -s -X COPY "http://127.0.0.1:$PORT/crashB.bin" \
+RESP=$(curl -m 120 -s -X COPY "http://127.0.0.1:$PORT/crashB.bin" \
     -H "Source: http://127.0.0.1:$MOCK_PORT/src.bin" \
     -H "X-Number-Of-Streams: 4" -H "Overwrite: T" \
     -H "TransferHeaderX-Kick: 1" & CPID=$!
-sleep 3
+# Cut the source only after the transfer has demonstrably started.
+wait_file_size "$WORK/data/crashB.bin" 1 60
 curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl?mode=refuse"
 wait $CPID)
 curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl?mode=ok"
