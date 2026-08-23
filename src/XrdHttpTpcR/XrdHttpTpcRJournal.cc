@@ -451,12 +451,12 @@ bool Checkpointer::MaybeCheckpoint(Stream &stream, off_t committed, time_t now)
     return Take(stream, committed, now, bytes_due ? "bytes" : "timed");
 }
 
-void Checkpointer::FinalCheckpoint(Stream &stream, off_t committed)
+bool Checkpointer::FinalCheckpoint(Stream &stream, off_t committed)
 {
     // FR-17: every admitted failure / exit path checkpoints first, so a
     // shared-filesystem retry can resume even though orchestrator cleanup
     // may render it moot (a free option -- 02 §11).
-    Take(stream, committed, time(NULL), "final");
+    return Take(stream, committed, time(NULL), "final");
 }
 
 bool Checkpointer::SuccessCleanup(Stream &stream, std::string &err)

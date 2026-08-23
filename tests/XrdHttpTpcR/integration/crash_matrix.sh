@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
 # T-I5 (WP-7 slice): the kill-point crash matrix around checkpointing.
+# Verifies FR-18 (sidecar journal written through the server's SFS, next to
+# the destination) and FR-19 (the aggressive checkpoint cadence configured
+# below yields several watermark advances within a short transfer -- W > 0
+# well before completion).
 #
 #   A. kill -9 the gateway mid-transfer: the journal survives, parses with
 #      the same defensive parser the server uses (via tpcr-journal-dump),

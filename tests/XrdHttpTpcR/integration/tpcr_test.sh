@@ -384,6 +384,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# T-I8: wire grammar (CON-4) -- a strict gfal/davix-style parser must accept
+# fresh-success, throttled-with-markers, resumed-shape, and failed responses;
+# FR-3 OPTIONS capability; FR-6 resumable-from suffix on failures with a
+# checkpointed journal.
+# ---------------------------------------------------------------------------
+printf '%s' "$RESPONSE" > "$WORK/grammar-last.txt"   # persistent-401 failure
+if python3 "$SRC_DIR/check_grammar.py" "$WORK/grammar-last.txt" failure; then
+    pass "T-I8 failed-transfer response parses under the stock grammar"
+else
+    fail "T-I8 failed-transfer grammar"
+fi
+if python3 "$SRC_DIR/check_grammar.py" "$WORK/resp-outage.txt" success; then
+    pass "T-I8 marker-rich recovered response parses under the stock grammar"
+else
+    fail "T-I8 recovered-response grammar"
+fi
+if grep -q "resumable-from: " "$WORK/resp-outage2.txt"; then
+    if python3 "$SRC_DIR/check_grammar.py" "$WORK/resp-outage2.txt" failure; then
+        pass "T-I8/FR-6 failure carries resumable-from and still parses"
+    else
+        fail "T-I8/FR-6 resumable-from broke the failure grammar"
+    fi
+else
+    fail "FR-6 resumable-from missing from checkpointed failure"
+fi
+OPTIONS_HEADERS=$(curl -s -i -X OPTIONS "http://127.0.0.1:$HTTP_PORT/any" | tr -d '\r')
+if printf '%s' "$OPTIONS_HEADERS" | grep -q "X-Transfer-Capabilities: resume/1"; then
+    pass "FR-3 OPTIONS advertises X-Transfer-Capabilities: resume/1"
+else
+    fail "FR-3 OPTIONS capability missing: $(printf '%s' "$OPTIONS_HEADERS" | head -8)"
+fi
+
+# ---------------------------------------------------------------------------
 # FR-31: the structured log events for everything the suite exercised must
 # be present in the server log (checked last, after all scenarios ran).
 # ---------------------------------------------------------------------------

@@ -185,8 +185,10 @@ public:
     bool MaybeCheckpoint(Stream &stream, off_t committed, time_t now);
 
     // FR-17: unconditional checkpoint on any admitted failure / exit path,
-    // taken BEFORE the failure chunk is sent.
-    void FinalCheckpoint(Stream &stream, off_t committed);
+    // taken BEFORE the failure chunk is sent.  Returns true when the journal
+    // now durably records `committed` -- the caller may then advertise
+    // `resumable-from` in the failure chunk (FR-6).
+    bool FinalCheckpoint(Stream &stream, off_t committed);
 
     // FR-23 success path: final data sync, then journal removal.  Returns
     // false (with err) if the final sync fails -- the transfer must then be

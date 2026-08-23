@@ -860,9 +860,13 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
     // FR-17: on any admitted failure the final checkpoint (data sync +
     // journal update) is taken BEFORE the failure chunk goes out, so a
     // shared-filesystem retry can resume even though orchestrator cleanup
-    // may render it moot.
+    // may render it moot.  When it lands, the failure chunk advertises the
+    // watermark (FR-6) -- informational only, clients may ignore it.
+    off_t resumable_from = -1;
     if (aborted && checkpointer) {
-        checkpointer->FinalCheckpoint(stream, stream.CommittedOffset());
+        if (checkpointer->FinalCheckpoint(stream, stream.CommittedOffset())) {
+            resumable_from = stream.CommittedOffset();
+        }
     }
 
     std::stringstream final_ss;
@@ -873,6 +877,11 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL", abort_msg);
         if (!flush_error.empty()) {ss2 << "; " << flush_error;}
         final_ss << generateClientErr(ss2, rec, abort_curl_code);
+        if (resumable_from >= 0) {
+            // FR-6: appended INSIDE the failure line so prefix-based stock
+            // parsers ("failure: ...") are untouched (CON-4).
+            final_ss << ", resumable-from: " << resumable_from;
+        }
     } else if (!flush_error.empty()) {
         std::stringstream ss2;
         ss2 << flush_error;

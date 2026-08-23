@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
 # T-I6 (WP-8): the resume decision matrix, end to end against a real server.
+# Every rejection path degrades to a correct fresh transfer -- the CON-3
+# safety property (resume never fails a transfer stock would carry).
+# Scenario 4 is BUG-12's disposition made live: the partial's length lies
+# (truncated below W) and only the journal watermark is trusted (FR-25).
 #
 #   1. Happy path: kill -9 mid-transfer, retry -> RESUME_START with W > 0,
 #      session 2 fetches nothing below W (NFR-4 spirit), content exact,

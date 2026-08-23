@@ -495,6 +495,15 @@ TPCRHandler::TPCRHandler(XrdSysError *log, const char *config, XrdOucEnv *myEnv)
  * Handle the OPTIONS verb as we have added a new one...
  */
 int TPCRHandler::ProcessOptionsReq(XrdHttpExtReq &req) {
+    // FR-3: advertise the resume capability so orchestrators that care can
+    // reason about it; nothing on the wire depends on them doing so.  The
+    // header is only offered when resume is actually enabled.
+    if (m_tpcr.resume) {
+        return req.SendSimpleResp(200, NULL, (char *)
+            "DAV: 1\r\nDAV: <http://apache.org/dav/propset/fs/1>\r\n"
+            "Allow: HEAD,GET,PUT,PROPFIND,DELETE,OPTIONS,COPY\r\n"
+            "X-Transfer-Capabilities: resume/1", NULL, 0);
+    }
     return req.SendSimpleResp(200, NULL, (char *) "DAV: 1\r\nDAV: <http://apache.org/dav/propset/fs/1>\r\nAllow: HEAD,GET,PUT,PROPFIND,DELETE,OPTIONS,COPY", NULL, 0);
 }
 
