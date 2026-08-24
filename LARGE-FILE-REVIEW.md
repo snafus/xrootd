@@ -1,5 +1,13 @@
 # Adversarial review: is TPCR bullet-proof for very large transfers?
 
+> **STATUS 2026-08-24: dispositions accepted (Q-7) and implemented as
+> WP-14.** C1 (sync poison), C2 (lease-first + acquire-before-verify with
+> read-back), C3 (probe-loop lease renewal), C4 (epoch pruning, serialize
+> guard, reconciled caps) plus H3/H4/H5/H6/H7 are fixed with tests; see
+> DECISIONS.md. H1's residual (atomic lockfile, NTP skew margin) remains a
+> deployment note in ADMIN.md. The findings below are kept as written for
+> the record.
+
 Four independent hostile-reading audits of `src/XrdHttpTpcR/` against the
 10 TB / multi-day / multi-resume design point (integer safety; journal &
 digest scale; long-run scheduler behavior; boundary and fault edges).

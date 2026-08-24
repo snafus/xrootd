@@ -43,18 +43,13 @@ subsumed and never parsed — today it would fail startup as an unknown directiv
 recovery budget is wanted, it needs a definition of what it bounds that 02 does
 not give. See DECISIONS.md entry of 2026-08-23.
 
-## Q-7 (post-handback adversarial review — decision requested)
-**Large-transfer review found four correctness-class defects (fix before any
-production pilot).** See `LARGE-FILE-REVIEW.md`: C1 sync-failure ride-through
-(fsyncgate → possible attested false success), C2 resume rejections destroy a
-live-leased journal before the lease check (two-writer window), C3 lease
-renewal starvation in the degraded probe loop (one-line fix), C4 unbounded
-epoch growth crossing the journal's own parse caps (weeks-long transfers lose
-resume; eventually stops lease renewal). All have small local dispositions and
-none is architectural. Per the operating rules these change FR-mandated
-behavior (FR-22/FR-23/SUB-1 interpretations), so they are flagged for approval
-rather than fixed unilaterally: approve the dispositions in the review's final
-section and the fixes can proceed as WP-14.
+## Q-7 — ANSWERED 2026-08-24 (user: "ok Accept proposals")
+**Large-transfer review dispositions accepted; implemented as WP-14.** C1-C4
+critical fixes plus H3-H7 ordinary fixes landed with unit and integration
+tests; see the two WP-14 entries in DECISIONS.md and the status note at the
+top of `LARGE-FILE-REVIEW.md`. H1's remaining hardening (an O_EXCL/link()
+lockfile for cryptographic-grade lease acquisition, and the ~120 s NTP skew
+margin) stays a documented deployment note rather than code.
 
 ## Q-3 (WP-6, informational — no block on M2 for POSIX)
 **Backend matrix coverage limited to POSIX.** This testbed offers no EC, CephFS, or

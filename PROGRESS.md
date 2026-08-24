@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** ALL WORK PACKAGES COMPLETE (tag tpcr-handback). Awaiting human review of QUESTIONS.md (Q-1..Q-6, esp. Q-4) and a push/upstream decision — branch and tags are local only.
+**Current focus:** WP-14 (accepted large-transfer review fixes) — implementation done, regression running. Remaining human items: Q-1..Q-6 (esp. Q-4); branch is pushed to the fork (github.com/snafus/xrootd, branch tpcr).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
@@ -18,3 +18,4 @@
 | WP-11 Tail verify + cksum injection | done | (this commit) | 92/92 unit; resume matrix 12/12; T-I10 3/3 | FR-28 epoch tail verify (tamper caught); FR-27 xattr via FAttr, XRD-2 ordering incl. mtime-binding negative test. |
 | WP-12 Scale and soak | done | (this commit) | soak_matrix.sh 6/6 (T-S1, T-I11, T-S2, T-P2 x2, T-U10); full regression: 82/82 unit + all 4 integration matrices; trace_check all clean | T-S2 found a real slab-reservation livelock under pool saturation — fixed (see DECISIONS). Results in test-results/wp12-results.md. Follow-up commit: spec scope audit, dead-code trim, Q-5/Q-6. |
 | WP-13 Docs and handback | done | (this commit) | docs reviewed vs FR-30/FR-31 (review added the CHECKPOINT event + shipped journal-dump, prior commit); full suite green | docs/XrdHttpTpcR/{ADMIN,RUNBOOK,CHANGES,UPSTREAM}.md. Backend matrix beyond POSIX + power-loss durability remain site-validation items (Q-3). |
+| WP-14 Review fixes (Q-7) | done | (this commit) | 85/85 unit (3 new Checkpointer tests); tpcr_test +If-Range scenario; resume matrix +7b/7c lease-gate scenarios; full regression green | C1 sync-poison, C2 lease-first + acquire-before-verify, C3 probe-loop lease renewal, C4 epoch pruning/caps; H3-H7. See DECISIONS 2026-08-24. |

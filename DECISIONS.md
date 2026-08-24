@@ -165,3 +165,42 @@ was re-wired to the Finalize failure path (stock behavior) instead of deleted, w
 also re-justifies `ReorderSpan`/`GetCapacity` as its observability; the stale claim
 that ReorderSpan drives admission was corrected (the scheduler window does).  Touches:
 03 standing directive 5 ("delete rather than leave dead code").
+
+**2026-08-24 / WP-14 — Q-7 accepted: the four critical review findings are fixed.**
+User approved the dispositions in LARGE-FILE-REVIEW.md (Q-7).  C1: a failed data
+sync now permanently poisons the Checkpointer -- no later sync can advance W or
+attest success (Linux consumes writeback errors at the first fsync, so a
+retry-then-succeed sync proves nothing); the transfer fails with a unique error
+and advertises the last PERSISTED watermark as resumable-from.  This strengthens
+SUB-1's "failed sync must not advance W" to "failed sync ends the session".
+C2: the resume decision tree now gates on the lease FIRST -- a live lease gets
+409 unconditionally (including X-Resume: F and GC), and a dead lease is
+ACQUIRED (with read-back confirmation against rename races) before the validator
+ladder, dest-size check, and tail verify run, so every destructive rejection
+executes while holding the exclusion.  C3: the degraded probe inner loop now
+runs checkpoint_tick, keeping the lease renewed (and W flowing) during long
+trickling probes.  C4: the Checkpointer prunes epochs wholly below
+W - verify.tailbytes at each commit (tail verification never reads them),
+Serialize refuses records over kMaxRecordBytes, and kMaxEpochs dropped to
+32768 so the two caps are mutually consistent (32768 x 20 B < 1 MiB).
+Touches: SUB-1, FR-22, FR-4, FR-24, FR-28, NFR-5, XRD-6.
+
+**2026-08-24 / WP-14 — accepted H-grade fixes.**
+H3: VerifyResumeTail now requires the verified epochs to tile the tail span
+contiguously up to exactly W (a forged epoch-free journal previously passed
+vacuously, hollowing out SUB-9's forged-watermark defense).  H4: multiple 401s
+in one harvest batch fold into the single pending degraded entry instead of
+consuming the FR-12 one-shot re-probe before it runs.  H5: a source HEAD
+without Content-Length is rejected at HEAD time with the real reason (it
+previously rode a uint64(-1) into oss.asize and failed at the completion gate
+as a misleading internal error).  H6: when the session baseline holds a strong
+ETag, every range GET carries If-Range -- an in-place source change now fails
+immediately as source-changed (errSourceChanged, permanent) instead of
+depending on a fault-triggered re-HEAD or an optional Repr-Digest; sources
+ignoring If-Range behave as before (additive header, CON-4).  H7: FR-23's
+destructive order is now sync -> close -> checksum-inject -> journal-remove ->
+verdict, so a close failure after a provable sync leaves a resumable journal;
+on FinalCheckpoint failure the failure chunk falls back to advertising the
+persisted watermark.  New FR-30 cross-directive invariant: tpcr.gc.age must
+exceed the lease term (2 x tpcr.checkpoint.secs).
+Touches: FR-4, FR-12, FR-21, FR-23, FR-28, FR-30, SUB-9, CON-4.

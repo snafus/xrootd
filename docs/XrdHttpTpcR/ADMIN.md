@@ -105,7 +105,24 @@ both the partial file and its journal are visible:
 - A dead session's journal holds a **lease** for 2x `tpcr.checkpoint.secs`.
   A retry inside that window gets `409 + Retry-After` and self-heals on the
   next attempt; orchestrator retry backoffs longer than ~2 minutes (at
-  defaults) never see it.
+  defaults) never see it. The lease is the writer exclusion, checked before
+  anything destructive (including `X-Resume: F`), and startup enforces
+  `tpcr.gc.age` > the lease term. **Keep gateway clocks NTP-disciplined**:
+  lease expiry compares absolute timestamps across gateways, so a node
+  whose clock runs more than the lease term (~120 s at defaults) ahead of
+  its peers could steal a live lease.
+- **Storage sync failures are deliberately fatal.** If a checkpoint's data
+  fsync fails even once, the transfer fails with a unique error
+  ("checkpoint data sync failed; durability ... unprovable") rather than
+  riding through — a later fsync returning success proves nothing on Linux
+  once a writeback error was consumed, and continuing could attest a file
+  with a hole in it. The failure chunk advertises the last provably
+  durable watermark; the orchestrator's retry resumes from there, so the
+  cost of a transient storage hiccup is one retry round-trip.
+- **If-Range guard**: when the source's HEAD offers a strong ETag, every
+  range request carries `If-Range`, so a source file replaced in place
+  mid-transfer fails immediately as source-changed instead of producing a
+  torn copy. Sources that ignore `If-Range` behave exactly as before.
 
 ### Interoperability with standard remote storage
 

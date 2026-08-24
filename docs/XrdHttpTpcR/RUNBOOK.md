@@ -76,6 +76,19 @@ watermark is behind by at most one checkpoint interval + reorder window. The
 next COPY for that destination resumes (watch for `RESUME_START` and, on the
 wire, perf markers that start at the resumed offset).
 
+**Transfer fails with "checkpoint data sync failed; durability ...
+unprovable".** The destination storage failed an fsync mid-transfer. This
+is deliberately fatal (a later "successful" sync proves nothing once the
+kernel consumed the writeback error); the failure chunk's
+`resumable-from:` carries the last provably durable watermark and a retry
+resumes from it. Recurring instances point at failing storage under the
+destination namespace — investigate the backend, not the transfer.
+
+**Transfer fails with "source entity changed during the transfer
+(If-Range guard...)".** The source file was replaced in place while the
+copy ran — the guard caught it before a torn mixture could be stored.
+Re-drive the transfer once the source has settled.
+
 **Assertion failure in logs.** Internal-invariant assertions fail the
 transfer in release builds and abort in debug builds (NFR-7). A transfer
 failed by an assertion is a bug report: capture the unique error string and
