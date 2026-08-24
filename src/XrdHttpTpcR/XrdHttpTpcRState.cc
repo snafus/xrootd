@@ -46,6 +46,8 @@ void State::Move(State &other)
     m_resp_range_start = other.m_resp_range_start;
     m_resp_range_end = other.m_resp_range_end;
     m_range_request = other.m_range_request;
+    m_if_range = other.m_if_range;
+    m_if_range_etag = std::move(other.m_if_range_etag);
     m_seen_content_range = other.m_seen_content_range;
     m_body_validated = other.m_body_validated;
     m_etag = other.m_etag;
@@ -172,6 +174,18 @@ void State::SetupHeaders(XrdHttpExtReq &req) {
         curl_easy_setopt(m_curl, CURLOPT_HTTPHEADER, list);
         m_headers = list;
     }
+}
+
+void State::SetIfRange(const std::string &etag) {
+    // Appended to the persistent custom-header list so RebindHeaders
+    // carries it across every curl_easy_reset (SUB-5).  Transfer-level
+    // state: deliberately NOT cleared by ResetAfterRequest.
+    const std::string header = "If-Range: " + etag;
+    m_headers = curl_slist_append(m_headers, header.c_str());
+    m_headers_copy.push_back(header);
+    m_if_range = true;
+    m_if_range_etag = etag;
+    curl_easy_setopt(m_curl, CURLOPT_HTTPHEADER, m_headers);
 }
 
 void State::SetupHeadersForHEAD(XrdHttpExtReq &req) {
@@ -526,6 +540,19 @@ bool State::ValidateRangeResponse(bool completion) {
     // continuing risks corrupting the destination.
     if (m_status_code != 206) {
         std::stringstream ss;
+        if (m_status_code == 200 && m_if_range && m_etag != m_if_range_etag) {
+            // WP-14/H6: with the If-Range guard armed, a 200 whose response
+            // ETag differs from the one we sent is the source SAYING the
+            // entity no longer matches -- the file changed in place with no
+            // transport fault to catch it.  (A 200 whose ETag still MATCHES
+            // is a range-dishonoring source, handled below: it ignored both
+            // Range and If-Range.)
+            ss << "source entity changed during the transfer "
+                  "(If-Range guard: 200 to a ranged request)";
+            m_error_buf = ss.str();
+            m_error_code = errSourceChanged;
+            return false;
+        }
         if (m_status_code == 200) {
             // The canonical failure: source ignored Range and is streaming
             // the whole file to every connection (BUG-2's silent corruption

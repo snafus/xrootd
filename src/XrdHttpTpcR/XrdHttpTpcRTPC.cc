@@ -1248,8 +1248,19 @@ bool TPCRHandler::VerifyResumeTail(const std::string &dest_path,
 
     std::vector<char> buffer(4 * 1024 * 1024);
     size_t epochs_checked = 0;
+    // WP-14/H3 coverage tracking: the verified epochs must tile the tail
+    // span contiguously up to exactly W.  Without this a forged record with
+    // an EMPTY (or gappy) epoch list would pass vacuously, hollowing out
+    // the SUB-9 forged-watermark defense this check exists to provide.
+    off_t covered_from = -1;   // start of the verified contiguous span
+    off_t covered_to = -1;     // end of the verified contiguous span
     for (const auto &epoch : journal.epochs) {
         const off_t epoch_end = off_t(epoch.offset) + off_t(epoch.length);
+        if (off_t(epoch.offset) < 0 || epoch_end < off_t(epoch.offset)) {
+            reason = "journal epoch offsets overflow";
+            file->close();
+            return false;
+        }
         if (epoch_end <= tail_start) {continue;}       // below the tail span
         if (epoch_end > watermark || epoch.length == 0) {
             // Defensive (SUB-9): an epoch past W can only come from a
@@ -1284,8 +1295,27 @@ bool TPCRHandler::VerifyResumeTail(const std::string &dest_path,
             return false;
         }
         epochs_checked++;
+        if (covered_from < 0) {
+            covered_from = off_t(epoch.offset);
+            covered_to = epoch_end;
+        } else if (off_t(epoch.offset) != covered_to) {
+            reason = "journal epochs do not tile the tail span contiguously";
+            file->close();
+            return false;
+        } else {
+            covered_to = epoch_end;
+        }
     }
     file->close();
+    // WP-14/H3: the verified span must reach W exactly and must begin at or
+    // below the tail start.  (Checkpoint-time pruning keeps the first
+    // retained epoch overlapping the tail, so legitimate journals always
+    // satisfy this.)
+    if (epochs_checked == 0 || covered_to != watermark ||
+        covered_from > tail_start) {
+        reason = "journal epochs do not cover the verification tail";
+        return false;
+    }
     if (m_log.getMsgMask() & LogMask::Debug) {
         std::stringstream ss;
         ss << "tail verification passed: " << epochs_checked
@@ -1484,6 +1514,20 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
         bool mismatchDigests = false;
         std::map<std::string,std::string> sourceFileReprDigest;
         GetRemoteFileInfoTPCPull(curl, req, sourceFileContentLength, sourceFileReprDigest, success, rec, &sourceValidators);
+        // WP-14/H5: a HEAD without a Content-Length cannot drive a ranged
+        // pull (FR-7/FR-10 schedule by size).  Fail HERE with the real
+        // reason -- otherwise uint64_t(-1) rode into oss.asize and the
+        // completion gate reported a misleading internal inconsistency.
+        if (success && int64_t(sourceFileContentLength) < 0) {
+            std::stringstream ss;
+            ss << "Source HEAD response did not include a Content-Length; "
+               << "pull-mode ranged transfer is impossible";
+            rec.status = 500;
+            logTransferEvent(LogMask::Error, rec, "HEAD_FAIL", ss.str());
+            req.SendSimpleResp(rec.status, NULL, NULL,
+                               generateClientErr(ss, rec).c_str(), 0);
+            success = false;
+        }
         if(success) {
             //In the case we cannot get the information from the source server (offline or other error)
             //we just don't add the file information to the opaque of the local file to open
@@ -1540,16 +1584,53 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
             journal_store->Remove(remove_err);   // best effort
         };
 
-        if (force_fresh) {
-            if (journal_present) {reject("reason=client-forced (X-Resume: F)");}
-        } else if (!journal_present) {
+        // WP-14/C2 ordering: the lease is the ONLY writer exclusion
+        // (XRD-6), so it is the FIRST gate after a journal parses -- before
+        // any branch that removes the journal or falls through to an
+        // O_TRUNC open.  A live lease means another session is writing this
+        // destination RIGHT NOW; it does not matter why this retry believes
+        // the journal is stale (changed validators, a stale NFS st_size,
+        // X-Resume: F, GC age): destroying its state would put two writers
+        // on one file, each able to attest success over an interleaved mix.
+        auto lease_conflict = [&](long retry_after) -> int {
+            std::stringstream retry_hdr;
+            retry_hdr << "Retry-After: " << retry_after;
+            std::stringstream body;
+            body << "Transfer already in progress by another gateway; "
+                 << "retry after " << retry_after << "s";
+            rec.status = 409;
+            logTransferEvent(LogMask::Info, rec, "LEASE_CONFLICT",
+                             body.str());
+            fh->close();
+            return req.SendSimpleResp(409, NULL,
+                const_cast<char *>(retry_hdr.str().c_str()),
+                const_cast<char *>(body.str().c_str()), 0);
+        };
+
+        if (!journal_present) {
             // Cases (a) and (d): no journal.  A journal-less partial is
             // indistinguishable from a stale foreign file (FR-25) and gets
-            // stock Overwrite treatment below.
+            // stock Overwrite treatment below.  (X-Resume: F with no
+            // journal likewise needs no action.)
         } else if (!journal_valid) {
+            // Rename atomicity (XRD-5) guarantees a live session's current
+            // journal always parses (old record or new record, never torn),
+            // so an unparseable sidecar was never a live session's state
+            // and carries no lease worth honoring.  (WP-14/C4's serialize
+            // guard keeps legitimate records parseable.)
             reject("reason=journal-invalid (" + load_err + ")");
+        } else if (journal.LeaseLive(now)) {
+            // FR-22: live foreign lease -- 409 + Retry-After; touch
+            // NOTHING, whatever else this request asked for.
+            return lease_conflict(
+                (long)(journal.lease_expiry - (int64_t)now) + 1);
+        } else if (force_fresh) {
+            // FR-4 -- honored only against a dead session's journal; a
+            // live writer is protected by the lease gate above.
+            reject("reason=client-forced (X-Resume: F)");
         } else if (journal.Age(now) > (int64_t)m_tpcr.gc_age_secs) {
-            // FR-24 lazy GC: past the orchestrator retry horizon.
+            // FR-24 lazy GC: past the orchestrator retry horizon.  Behind
+            // the lease gate, and Configure enforces gc.age > lease term.
             logTransferEvent(LogMask::Info, rec, "GC_DISCARD",
                 "journal older than tpcr.gc.age; discarding");
             std::string remove_err;
@@ -1565,56 +1646,15 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
                 // Case (e): journal without a partial -- common under POSC,
                 // which unlinks crashed creates (XRD-1).
                 reject("reason=no-partial (journal without destination; POSC?)");
-            } else if (!TPCR::SourceValidators::ResumeAccepts(
-                           journal.validators, sourceValidators,
-                           m_tpcr.validators_length_only
-                               ? TPCR::SourceValidators::Policy::LengthOnly
-                               : TPCR::SourceValidators::Policy::Strong,
-                           reason)) {
-                // FR-21 ladder; FR-20 case (c).
-                reject("reason=validator (" + reason + ")");
-            } else if (dest_stat.st_size < journal.committed) {
-                // FR-20/FR-25: the partial was truncated or replaced; W no
-                // longer describes it.
-                reject("reason=dest-truncated (size below watermark)");
-            } else if (journal.LeaseLive(now)) {
-                // FR-22: live foreign lease -- another gateway is writing.
-                // 409 + Retry-After; touch nothing.
-                const long retry_after =
-                    (long)(journal.lease_expiry - (int64_t)now) + 1;
-                std::stringstream retry_hdr;
-                retry_hdr << "Retry-After: " << retry_after;
-                std::stringstream body;
-                body << "Transfer already in progress by another gateway; "
-                     << "retry after " << retry_after << "s";
-                rec.status = 409;
-                logTransferEvent(LogMask::Info, rec, "LEASE_CONFLICT",
-                                 body.str());
-                fh->close();
-                return req.SendSimpleResp(409, NULL,
-                    const_cast<char *>(retry_hdr.str().c_str()),
-                    const_cast<char *>(body.str().c_str()), 0);
-            } else if (m_tpcr.verify_tailbytes > 0 && journal.committed > 0 &&
-                       !VerifyResumeTail(dest_path, journal,
-                                         &req.GetSecEntity(),
-                                         m_tpcr.verify_tailbytes, reason)) {
-                // FR-28: the tail of the partial no longer matches what the
-                // journal attested (torn write, external tampering, or a
-                // lying backend) -- resume would build on bad bytes.
-                reject("reason=tail-verify (" + reason + ")");
-            } else if (journal.committed > 0 &&
-                       !digests.Restore(journal.digest_state,
-                                        journal.committed, reason)) {
-                // SUB-4: without a digest state matching W, the resumed
-                // prefix could never be attested (adler32 over [0, W) is not
-                // recomputable without re-reading) -- reject rather than
-                // resume into an unverifiable transfer (FR-26).
-                reject("reason=digest-state (" + reason + ")");
             } else {
-                // Resume -- case (b).  XRD-6 strict sequencing: acquire (or
-                // steal) the lease via atomic journal rewrite BEFORE opening
-                // the data file; opening first would create case-(a) side
-                // effects on a path another session may own.
+                // WP-14/C2 lock-then-mutate: take over the dead lease NOW,
+                // before the (possibly minutes-long) tail verification and
+                // before any destructive rejection -- so every rejection
+                // below executes while HOLDING the exclusion, and the old
+                // check-then-steal race window (which tail verification had
+                // widened from milliseconds to minutes) collapses back to
+                // the rename itself.  XRD-6 sequencing is preserved: the
+                // lease commit still precedes the data open.
                 if (journal.lease_expiry != 0) {
                     logTransferEvent(LogMask::Info, rec, "LEASE_STEAL",
                         "expired lease taken over");
@@ -1626,9 +1666,52 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
                 journal.updated = (int64_t)now;
                 journal.streams = (uint32_t)streams;
                 std::string commit_err;
+                TPCR::JournalRecord readback;
                 if (!journal_store->Commit(journal, commit_err)) {
                     reject("reason=lease-write-failed (" + commit_err + ")");
+                } else if (!journal_store->Load(readback, commit_err) ||
+                           !readback.LeaseOwnedBy(journal.lease_owner)) {
+                    // Read-back confirmation: two gateways racing on the
+                    // same dead lease both rename; last writer wins.  The
+                    // loser sees a foreign owner here and backs off instead
+                    // of writing -- the survivor holds the exclusion.
+                    return lease_conflict(
+                        2 * (long)m_tpcr.checkpoint_secs + 1);
+                } else if (!TPCR::SourceValidators::ResumeAccepts(
+                               journal.validators, sourceValidators,
+                               m_tpcr.validators_length_only
+                                   ? TPCR::SourceValidators::Policy::LengthOnly
+                                   : TPCR::SourceValidators::Policy::Strong,
+                               reason)) {
+                    // FR-21 ladder; FR-20 case (c).  Held lease: removal is
+                    // safe.
+                    reject("reason=validator (" + reason + ")");
+                } else if (dest_stat.st_size < journal.committed) {
+                    // FR-20/FR-25: the partial was truncated or replaced; W
+                    // no longer describes it.
+                    reject("reason=dest-truncated (size below watermark)");
+                } else if (m_tpcr.verify_tailbytes > 0 &&
+                           journal.committed > 0 &&
+                           !VerifyResumeTail(dest_path, journal,
+                                             &req.GetSecEntity(),
+                                             m_tpcr.verify_tailbytes,
+                                             reason)) {
+                    // FR-28: the tail of the partial no longer matches what
+                    // the journal attested (torn write, external tampering,
+                    // or a lying backend) -- resume would build on bad
+                    // bytes.
+                    reject("reason=tail-verify (" + reason + ")");
+                } else if (journal.committed > 0 &&
+                           !digests.Restore(journal.digest_state,
+                                            journal.committed, reason)) {
+                    // SUB-4: without a digest state matching W, the resumed
+                    // prefix could never be attested (adler32 over [0, W)
+                    // is not recomputable without re-reading) -- reject
+                    // rather than resume into an unverifiable transfer
+                    // (FR-26).
+                    reject("reason=digest-state (" + reason + ")");
                 } else {
+                    // Resume -- case (b).  The lease is already ours.
                     resuming = true;
                     resume_offset = journal.committed;
                     record = journal;
@@ -1749,7 +1832,7 @@ int TPCRHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req)
             // very commit that persists W.
             checkpointer.reset(new TPCR::Checkpointer(
                 *journal_store, record, m_tpcr.checkpoint_bytes,
-                m_tpcr.checkpoint_secs, m_log,
+                m_tpcr.checkpoint_secs, m_tpcr.verify_tailbytes, m_log,
                 [&digests](TPCR::JournalRecord &snapshot) {
                     auto epoch = digests.CloseEpoch();
                     if (epoch.length > 0) {

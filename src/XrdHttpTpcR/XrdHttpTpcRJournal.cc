@@ -172,6 +172,12 @@ bool JournalRecord::Serialize(std::string &out, std::string &err) const
     }
     // Self-CRC (SUB-9) over everything so far.
     PutU32(out, XrdOucCRC::Calc32C(out.data(), out.size()));
+    // WP-14/C4: never emit a record the parser would refuse -- committing
+    // one would silently forfeit resume at the NEXT session's Load.
+    if (out.size() > kMaxRecordBytes) {
+        err = "serialized journal exceeds kMaxRecordBytes";
+        return false;
+    }
     return true;
 }
 
@@ -430,12 +436,15 @@ bool JournalStore::Remove(std::string &err)
 
 Checkpointer::Checkpointer(JournalStore &store, JournalRecord record,
                            uint64_t checkpoint_bytes, unsigned checkpoint_secs,
+                           uint64_t prune_tailbytes,
                            XrdSysError &log,
                            DigestSnapshot digest_snapshot)
     : m_store(store), m_record(std::move(record)),
       m_checkpoint_bytes(checkpoint_bytes), m_checkpoint_secs(checkpoint_secs),
+      m_prune_tailbytes(prune_tailbytes),
       m_log(log), m_digest_snapshot(std::move(digest_snapshot)),
-      m_last_committed(m_record.committed), m_last_time(time(NULL))
+      m_last_committed(m_record.committed), m_last_time(time(NULL)),
+      m_persisted_committed(m_record.committed)
 {
 }
 
@@ -459,15 +468,26 @@ bool Checkpointer::FinalCheckpoint(Stream &stream, off_t committed)
     return Take(stream, committed, time(NULL), "final");
 }
 
-bool Checkpointer::SuccessCleanup(Stream &stream, std::string &err)
+bool Checkpointer::FinalDataSync(Stream &stream, std::string &err)
 {
-    // FR-23: sync -> [checksum store injection, WP-11] -> journal delete ->
-    // (caller closes) -> success chunk.  An unprovable final sync means the
+    // FR-23 first half: sync -> (caller closes, injects checksum) ->
+    // RemoveJournal -> success chunk.  An unprovable final sync means the
     // transfer CANNOT be reported successful (priority 1: correctness).
+    if (m_sync_failed) {
+        err = "a checkpoint data sync previously failed; durability of the "
+              "content cannot be attested (WP-14/C1)";
+        return false;
+    }
     if (stream.Sync() != SFS_OK) {
+        m_sync_failed = true;
         err = "final data sync failed; success cannot be attested";
         return false;
     }
+    return true;
+}
+
+void Checkpointer::RemoveJournal()
+{
     std::string remove_err;
     if (!m_store.Remove(remove_err)) {
         // Not fatal: the orphan journal is caught by lazy GC (FR-24), and
@@ -475,18 +495,26 @@ bool Checkpointer::SuccessCleanup(Stream &stream, std::string &err)
         // file anyway.  Log loudly, continue.
         m_log.Emsg("Checkpoint", "journal cleanup failed:", remove_err.c_str());
     }
-    return true;
 }
 
 bool Checkpointer::Take(Stream &stream, off_t committed, time_t now,
                         const char *why)
 {
+    // WP-14/C1: a single failed data sync poisons the engine.  The first
+    // fsync after a writeback error consumes the error and the kernel drops
+    // the failed pages, so a LATER sync returning success proves nothing --
+    // advancing W on it would journal bytes the disk never kept.  The
+    // caller observes SyncFailed() and fails the transfer; the on-disk
+    // journal keeps the last provably durable watermark.
+    if (m_sync_failed) {return false;}
     // SUB-1: the data sync comes FIRST; if it fails the journal must not
     // advance (the old record stays valid: its W is still <= durable data).
     if (stream.Sync() != SFS_OK) {
+        m_sync_failed = true;
         m_log.Emsg("Checkpoint",
-                   "data sync failed; keeping previous journal watermark");
-        m_last_time = now;   // do not hammer a failing sync every loop pass
+                   "data sync failed; checkpoint engine poisoned -- the "
+                   "transfer must fail (resumable from the last durable "
+                   "watermark)");
         return false;
     }
     m_record.committed = committed;
@@ -497,12 +525,29 @@ bool Checkpointer::Take(Stream &stream, off_t committed, time_t now,
         // atomic with W -- same record, same atomic rename.
         m_digest_snapshot(m_record);
     }
+    // WP-14/C4: epochs wholly below W - prune_tailbytes are never read
+    // again (resume tail verification skips them), so drop them before
+    // they grow the record toward its parse caps.  With verify disabled
+    // (prune_tailbytes 0) everything below W prunes -- verification will
+    // not want any of it.
+    if (!m_record.epochs.empty()) {
+        const off_t floor =
+            committed > off_t(m_prune_tailbytes)
+                ? committed - off_t(m_prune_tailbytes) : 0;
+        auto keep = m_record.epochs.begin();
+        while (keep != m_record.epochs.end() &&
+               off_t(keep->offset + keep->length) <= floor) {
+            ++keep;
+        }
+        m_record.epochs.erase(m_record.epochs.begin(), keep);
+    }
     std::string err;
     if (!m_store.Commit(m_record, err)) {
         m_log.Emsg("Checkpoint", "journal commit failed:", err.c_str());
         m_last_time = now;
         return false;
     }
+    m_persisted_committed = committed;
     m_last_committed = committed;
     m_last_time = now;
     if (m_log.getMsgMask() & 0x01 /* Debug */) {

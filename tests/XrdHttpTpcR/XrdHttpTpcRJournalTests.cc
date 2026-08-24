@@ -212,3 +212,137 @@ TEST(XrdHttpTpcRJournalTests, SourceUrlNormalizationStripsQuery) {
   EXPECT_EQ("https://host/file", NormalizeSourceUrl("https://host/file"));
   EXPECT_EQ("", NormalizeSourceUrl("?onlyquery"));
 }
+
+// ---------------------------------------------------------------------------
+// WP-14: Checkpointer-level tests (sync poison, epoch pruning, cap
+// consistency).  These use the in-memory SFS so the full JournalStore
+// commit/load path runs, not a stub.
+// ---------------------------------------------------------------------------
+
+#include "XrdHttpTpcR/XrdHttpTpcRStream.hh"
+#include "XrdHttpTpcRMockSfs.hh"
+#include "XrdHttpTpcRMockSfsFile.hh"
+
+#include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysLogger.hh"
+
+#include <ctime>
+#include <memory>
+#include <vector>
+
+TEST(XrdHttpTpcRJournalTests, EpochCapsAreMutuallyConsistent) {
+  // WP-14/C4 regression: a record AT the epoch cap must both serialize and
+  // re-parse.  The original caps allowed Serialize/Commit to emit a record
+  // that the next session's Parse rejected as oversized -- silently
+  // forfeiting weeks of resume equity on a slow transfer.
+  JournalRecord record = SampleRecord();
+  record.epochs.clear();
+  uint64_t off = 0;
+  for (size_t i = 0; i < JournalRecord::kMaxEpochs; i++) {
+    record.epochs.push_back({off, 10, 0x1u});
+    off += 10;
+  }
+  record.committed = off_t(off);
+  record.validators.content_length = int64_t(off) + 100;
+  std::string raw, err;
+  ASSERT_TRUE(record.Serialize(raw, err)) << err;
+  EXPECT_LE(raw.size(), size_t(JournalRecord::kMaxRecordBytes));
+  JournalRecord parsed;
+  EXPECT_TRUE(JournalRecord::Parse(raw.data(), raw.size(), parsed, err))
+      << err;
+  // One past the cap: refused at WRITE time, never at the next load.
+  record.epochs.push_back({off, 10, 0x1u});
+  EXPECT_FALSE(record.Serialize(raw, err));
+}
+
+TEST(XrdHttpTpcRJournalTests, SyncFailurePoisonsTheCheckpointer) {
+  // WP-14/C1 (fsyncgate): after ONE failed data sync, no later "successful"
+  // sync may advance the journal or attest anything -- on Linux the first
+  // fsync after a writeback error consumes it and drops the lost pages, so
+  // the later success proves nothing.
+  XrdSysLogger logger(STDERR_FILENO, 0);
+  XrdSysError log(&logger, "JournalTest");
+  MemorySfs sfs;
+  TPCR::JournalStore store(&sfs, "/data/file.bin", ".xrdtpcr", nullptr);
+  JournalRecord record;
+  record.source_url = "https://src/file";
+  record.committed = 0;
+  record.validators.content_length = 1 << 20;
+  std::string err;
+  ASSERT_TRUE(store.Commit(record, err)) << err;
+
+  auto *data_file = new MemorySfsFile();
+  data_file->FailSyncs(1);   // one transient failure, then "success"
+  TPCR::Stream stream(std::unique_ptr<XrdSfsFile>(data_file), 0, 4096, log);
+  TPCR::Checkpointer ckpt(store, record, /*bytes*/ 1, /*secs*/ 1000000,
+                          /*prune tail*/ 1 << 20, log);
+
+  std::vector<char> buf(4096, 'a');
+  ASSERT_EQ(stream.Write(0, buf.data(), buf.size(), true),
+            ssize_t(buf.size()));
+
+  // First checkpoint: the sync fails -> poisoned, journal untouched.
+  EXPECT_FALSE(ckpt.MaybeCheckpoint(stream, 4096, time(NULL)));
+  EXPECT_TRUE(ckpt.SyncFailed());
+  EXPECT_EQ(ckpt.PersistedWatermark(), 0);
+
+  // The mock now syncs "successfully" -- the poison must hold anyway.
+  EXPECT_FALSE(ckpt.MaybeCheckpoint(stream, 4096, time(NULL) + 999999));
+  EXPECT_FALSE(ckpt.FinalCheckpoint(stream, 4096));
+  std::string sync_err;
+  EXPECT_FALSE(ckpt.FinalDataSync(stream, sync_err));
+  EXPECT_FALSE(sync_err.empty());
+  EXPECT_TRUE(ckpt.SyncFailed());
+
+  // The on-disk journal still records the last PROVABLY durable watermark.
+  JournalRecord reloaded;
+  ASSERT_TRUE(store.Load(reloaded, err)) << err;
+  EXPECT_EQ(reloaded.committed, 0);
+}
+
+TEST(XrdHttpTpcRJournalTests, CheckpointerPrunesEpochsBelowTheVerifyTail) {
+  // WP-14/C4: epochs wholly below W - verify.tailbytes are never read by
+  // resume-time tail verification; carrying them only grows the record
+  // toward its parse caps.  The Checkpointer must drop them per commit.
+  XrdSysLogger logger(STDERR_FILENO, 0);
+  XrdSysError log(&logger, "JournalTest");
+  MemorySfs sfs;
+  TPCR::JournalStore store(&sfs, "/data/big.bin", ".xrdtpcr", nullptr);
+  JournalRecord record;
+  record.source_url = "https://src/big";
+  record.committed = 0;
+  record.validators.content_length = 1 << 20;
+  std::string err;
+  ASSERT_TRUE(store.Commit(record, err)) << err;
+
+  TPCR::Stream stream(std::unique_ptr<XrdSfsFile>(new MemorySfsFile()), 0,
+                      4096, log);
+  off_t epoch_start = 0;
+  TPCR::Checkpointer ckpt(
+      store, record, /*bytes*/ 1, /*secs*/ 1000000, /*prune tail*/ 150, log,
+      [&epoch_start](JournalRecord &snapshot) {
+        // Emulate the digest snapshot: one epoch per checkpoint covering
+        // [previous W, new W).
+        snapshot.epochs.push_back(
+            {uint64_t(epoch_start),
+             uint64_t(snapshot.committed - epoch_start), 0xabcu});
+        epoch_start = snapshot.committed;
+      });
+
+  time_t now = time(NULL);
+  for (off_t w = 100; w <= 400; w += 100) {
+    ASSERT_TRUE(ckpt.MaybeCheckpoint(stream, w, now++));
+  }
+
+  // W=400, tail=150 -> floor 250: epochs [0,100) and [100,200) end at or
+  // below the floor and must be gone; [200,300) and [300,400) remain and
+  // tile the tail contiguously up to exactly W.
+  JournalRecord reloaded;
+  ASSERT_TRUE(store.Load(reloaded, err)) << err;
+  EXPECT_EQ(reloaded.committed, 400);
+  ASSERT_EQ(reloaded.epochs.size(), 2u);
+  EXPECT_EQ(reloaded.epochs[0].offset, 200u);
+  EXPECT_EQ(reloaded.epochs[0].length, 100u);
+  EXPECT_EQ(reloaded.epochs[1].offset, 300u);
+  EXPECT_EQ(reloaded.epochs[1].length, 100u);
+}

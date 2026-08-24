@@ -349,6 +349,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# WP-14/H6: source entity replaced IN PLACE with no transport fault.  The
+# If-Range guard (armed from the HEAD's strong ETag) makes the source answer
+# 200 instead of 206, which fails the transfer as source-changed -- before
+# this guard the changed bytes were only caught if some fault forced a
+# degraded re-HEAD (or the source offered a Repr-Digest).
+# ---------------------------------------------------------------------------
+make_ref "$WORK/ref.bin" $((20 * BLOCK))
+start_mock "$WORK/ref.bin" --throttle $((512 * 1024))
+copy_pull_bg "$WORK/resp-ifrange.txt" "/dest-ifrange.bin" 4
+sleep 3
+mock_ctl "etag=%22tpcr-mock-etag-CHANGED%22"   # no refusal: data keeps flowing
+wait "$COPY_PID"
+stop_mock
+if grep -q "If-Range guard" "$WORK/resp-ifrange.txt"; then
+    pass "WP-14/H6 in-place source change caught by the If-Range guard"
+else
+    fail "WP-14/H6 If-Range: $(tail -2 "$WORK/resp-ifrange.txt")"
+fi
+
+# ---------------------------------------------------------------------------
 # FR-12: 401 mid-session -- one re-probe recovers a flapping gateway...
 # ---------------------------------------------------------------------------
 make_ref "$WORK/ref.bin" $((4 * BLOCK + 999))
@@ -420,11 +440,24 @@ fi
 # ---------------------------------------------------------------------------
 EXPECTED_ADLER=$(python3 -c "import zlib; print('%08x' % (zlib.adler32(open('$WORK/ref.bin','rb').read()) & 0xffffffff))")
 ATTR_HEX=$(python3 - "$WORK/data/dest-digest-ok.bin" <<'EOF2'
-import os, sys
+import os, subprocess, sys
 path = sys.argv[1]
-for name in os.listxattr(path):
+
+def entries():
+    if hasattr(os, "listxattr"):          # Linux
+        for name in os.listxattr(path):
+            yield name, os.getxattr(path, name)
+    else:                                 # macOS: python os lacks xattr APIs
+        listing = subprocess.run(["xattr", path], capture_output=True,
+                                 text=True).stdout.split()
+        for name in listing:
+            dump = subprocess.run(["xattr", "-px", name, path],
+                                  capture_output=True, text=True).stdout
+            yield name, bytes.fromhex("".join(dump.split()))
+
+for name, value in entries():
     if "adler" in name.lower() or "cks" in name.lower():
-        print(os.getxattr(path, name).hex())
+        print(value.hex())
         break
 else:
     print("NOATTR")

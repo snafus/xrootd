@@ -42,6 +42,11 @@ FailureClass TPCR::ClassifyCurlFailure(int curl_code, int http_status,
         case State::errLengthMismatch:
             // The source demonstrably misimplements ranged GETs (FR-8).
             return FailureClass::Permanent;
+        case State::errSourceChanged:
+            // WP-14/H6: the If-Range guard proved the source entity
+            // changed mid-transfer -- a definite change is permanent
+            // (same disposition as the degraded re-HEAD's SOURCE_CHANGED).
+            return FailureClass::Permanent;
         case State::errWrite:
         case State::errFlush:
         case State::errClose:

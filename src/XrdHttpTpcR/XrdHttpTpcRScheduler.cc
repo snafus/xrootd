@@ -198,6 +198,16 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         extra->SetupHeaders(req);
     }
 
+    // WP-14/H6: arm the If-Range guard on every handle when the session
+    // baseline captured a STRONG ETag.  A source whose entity changes in
+    // place then answers 200 instead of 206 and the transfer fails as
+    // SOURCE_CHANGED instead of silently storing a torn old/new mixture;
+    // sources that ignore If-Range behave exactly as before.
+    if (!baseline.etag.empty() &&
+        baseline.etag.compare(0, 2, "W/") != 0) {
+        for (auto *s : states) {s->SetIfRange(baseline.etag);}
+    }
+
     std::vector<HandleSlot> slots(nhandles);
     for (size_t idx = 0; idx < nhandles; idx++) {
         slots[idx].state = states[idx];
@@ -414,14 +424,25 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
 
     // FR-31: every checkpoint the engine actually takes is surfaced as a
     // structured event (the cadence decision itself lives in Checkpointer).
-    auto checkpoint_tick = [&]() {
-        if (!checkpointer) {return;}
+    // WP-14/C1: once a data sync has failed, no later sync result can prove
+    // durability (Linux consumes the writeback error at the first fsync and
+    // drops the failed pages) -- the transfer MUST fail, and the failure
+    // chunk advertises the last watermark the journal actually persisted.
+    const char *const kSyncPoisonMsg =
+        "checkpoint data sync failed; durability of bytes past the last "
+        "persisted watermark is unprovable -- failing so a retry can resume "
+        "from provably durable data";
+    // Runs the checkpoint engine; returns false when the engine is poisoned
+    // and the caller must abort the transfer (WP-14/C1).
+    auto checkpoint_tick = [&]() -> bool {
+        if (!checkpointer) {return true;}
         if (checkpointer->MaybeCheckpoint(stream, stream.CommittedOffset(),
                                           time(NULL))) {
             std::stringstream ss;
             ss << "W=" << stream.CommittedOffset();
             logTransferEvent(LogMask::Info, rec, "CHECKPOINT", ss.str());
         }
+        return !checkpointer->SyncFailed();
     };
 
     // ------------------------------------------------------------------ //
@@ -508,6 +529,20 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                         curl_multi_remove_handle(multi.Get(),
                                                  slot.state->GetHandle());
                         return DegradedResult::ClientGone;
+                    }
+                    // WP-14/C3: this loop is unbounded (a trickling probe
+                    // keeps extending the recovery budget), so the lease
+                    // MUST keep renewing here too -- without this tick a
+                    // slow probe outlived the 2x-checkpoint.secs lease and
+                    // let a concurrent retry legitimately steal it while
+                    // this session was still writing (two-writer window).
+                    // The tick also keeps W checkpoints flowing during
+                    // long probes, and surfaces C1 poisoning promptly.
+                    if (!checkpoint_tick()) {
+                        curl_multi_remove_handle(multi.Get(),
+                                                 slot.state->GetHandle());
+                        degraded_reason = kSyncPoisonMsg;
+                        return DegradedResult::PermanentFailure;
                     }
                     refresh_commit_clock();
                     now = time(NULL);
@@ -599,7 +634,10 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             const time_t pause_end = time(NULL) + probe_pause;
             while (time(NULL) < pause_end) {
                 if (!marker_tick()) {return DegradedResult::ClientGone;}
-                checkpoint_tick();
+                if (!checkpoint_tick()) {
+                    degraded_reason = kSyncPoisonMsg;
+                    return DegradedResult::PermanentFailure;
+                }
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
             probe_pause = std::min(probe_pause * 2, 15);
@@ -714,9 +752,13 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                 if (failure == FailureClass::AuthRetry) {
                     // FR-12: 401/403 mid-session gets exactly one full
                     // re-probe (the source side may be a flapping gateway);
-                    // a second occurrence is permanent -- this session
-                    // cannot refresh its own token.
-                    if (auth_probe_used) {
+                    // a second occurrence AFTER that probe ran is permanent
+                    // -- this session cannot refresh its own token.
+                    // WP-14/H4: a token expiry hits every in-flight range at
+                    // once, so several 401s can land in ONE harvest batch --
+                    // those must all fold into the single pending degraded
+                    // entry, not consume the probe before it ever runs.
+                    if (auth_probe_used && !enter_degraded) {
                         failure = FailureClass::Permanent;
                     } else {
                         auth_probe_used = true;
@@ -789,7 +831,11 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
         // (FR-19; the SUB-1 data-sync-then-journal ordering lives inside).
         refresh_commit_clock();
         sched.AdvanceCommitted(stream.CommittedOffset());
-        checkpoint_tick();
+        if (!checkpoint_tick()) {
+            aborted = true;
+            abort_msg = kSyncPoisonMsg;
+            break;
+        }
         // Return excess slab reservations to the pool.
         while (slab_stash.size() > sched.InFlight()) {slab_stash.pop_back();}
 
@@ -802,8 +848,7 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                     aborted = true;
                     std::stringstream ss;
                     ss << "no commit progress within the recovery budget ("
-                       << m_tpcr.recovery_maxsecs
-                       << "s); source unavailable, admitting failure";
+                       << m_tpcr.recovery_maxsecs << "s); admitting failure";
                     abort_msg = ss.str();
                     break;
                 }
@@ -895,6 +940,14 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
             std::stringstream ss;
             ss << "final W=" << resumable_from;
             logTransferEvent(LogMask::Info, rec, "CHECKPOINT", ss.str());
+        } else if (checkpointer->PersistedWatermark() > 0) {
+            // WP-14: the final checkpoint could not run (poisoned engine, or
+            // journal commit failure), but the on-disk journal still records
+            // the last provably durable watermark -- advertise THAT.  This
+            // covers the C1 sync-poison path in particular: the suspect
+            // bytes are exactly [persisted W, committed), and a resume
+            // re-fetches exactly that span.
+            resumable_from = checkpointer->PersistedWatermark();
         }
     }
 
@@ -963,15 +1016,18 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
                })()) {
         // final_ss already carries the mismatch message.
     } else if (checkpointer && !([&]() {
-                   // FR-23 success ordering: final data sync -> [checksum
-                   // injection, WP-11] -> journal delete; only then close
-                   // and only then the success chunk.
-                   std::string cleanup_err;
-                   if (!checkpointer->SuccessCleanup(stream, cleanup_err)) {
+                   // FR-23 success ordering (WP-14/H7): final data sync ->
+                   // close -> [checksum injection] -> journal delete ->
+                   // success chunk.  The journal is removed LAST among the
+                   // destructive steps, so a close failure after a provable
+                   // sync leaves a resumable journal instead of forcing the
+                   // retry to re-pull the whole file from zero.
+                   std::string sync_err;
+                   if (!checkpointer->FinalDataSync(stream, sync_err)) {
                        std::stringstream ss2;
-                       ss2 << cleanup_err;
+                       ss2 << sync_err;
                        logTransferEvent(LogMask::Error, rec, "SCHEDULER_FAIL",
-                                        cleanup_err);
+                                        sync_err);
                        final_ss << generateClientErr(ss2, rec);
                        return false;
                    }
@@ -991,11 +1047,13 @@ int TPCRHandler::RunPullSchedulerImpl(XrdHttpExtReq &req, State &main_state,
     } else {
         // FR-27 via the XRD-2 route: the file is now CLOSED (Finalize just
         // ran); inject the adler32 into the checksum store bound to the
-        // settled mtime, then -- and only then -- attest success.
+        // settled mtime; drop the journal (its work is provably done); then
+        // -- and only then -- attest success.
         if (digests) {
             InjectChecksum(dest_path, digests->AdlerHex(),
                            &req.GetSecEntity(), rec);
         }
+        if (checkpointer) {checkpointer->RemoveJournal();}
         final_ss << "success: Created";
         success = true;
     }

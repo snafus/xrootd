@@ -170,6 +170,18 @@ bool TPCRHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
     }
     Config.Close();
 
+    // WP-14/C2 cross-directive invariant (FR-30 fail-fast): lazy GC must
+    // never be able to discard a journal whose owner is alive between
+    // lease renewals -- the GC branch sits behind the lease gate, but only
+    // this bound makes "lease dead AND older than gc.age" imply "owner
+    // truly gone" rather than "owner merely slow to renew".
+    if (m_tpcr.resume &&
+        m_tpcr.gc_age_secs <= 2ULL * m_tpcr.checkpoint_secs) {
+        m_log.Emsg("Config", "tpcr.gc.age must exceed the lease term "
+                   "(2 x tpcr.checkpoint.secs); refusing to start");
+        return false;
+    }
+
     // The slab pool is server-global and sized once from the parsed config
     // (NFR-1).  Every transfer's reorder buffers draw from this budget.
     m_slab_pool.reset(new SlabPool(m_tpcr.block_size, m_tpcr.mempool_max));

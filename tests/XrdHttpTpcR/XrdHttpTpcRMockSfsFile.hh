@@ -97,11 +97,15 @@ public:
   }
 
   int sync() override {
+    if (m_fail_syncs > 0) {
+      m_fail_syncs--;
+      return SFS_ERROR;
+    }
     return SFS_OK;
   }
 
   int sync(XrdSfsAio *) override {
-    return SFS_OK;
+    return sync();
   }
 
   int truncate(XrdSfsFileOffset size) override {
@@ -141,6 +145,12 @@ public:
     m_fail_writes = true;
   }
 
+  // Makes the next `count` sync() calls fail -- the WP-14/C1 fsyncgate
+  // scenario: one transient failure, then "success" that proves nothing.
+  void FailSyncs(int count) {
+    m_fail_syncs = count;
+  }
+
   // Caps the number of bytes a single write() call accepts (0 = no cap).
   void SetMaxWriteSize(size_t max_write) {
     m_max_write = max_write;
@@ -155,6 +165,7 @@ private:
   std::vector<char> m_data;
   std::vector<std::pair<XrdSfsFileOffset, XrdSfsXferSize>> m_writes;
   bool m_fail_writes = false;
+  int m_fail_syncs = 0;
   size_t m_max_write = 0;
 };
 

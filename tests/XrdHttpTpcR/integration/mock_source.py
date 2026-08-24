@@ -160,6 +160,13 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(stall_secs)
 
         range_header = self.headers.get("Range")
+        # RFC 9110 If-Range: when the validator no longer matches, a
+        # compliant server ignores Range and sends the full current entity
+        # with 200 -- the WP-14/H6 changed-source signal TPCR relies on.
+        if_range = self.headers.get("If-Range")
+        if if_range is not None and if_range != state.etag:
+            self._serve_full()
+            return
         if range_header and not state.ignore_range:
             self._serve_range(range_header)
         else:

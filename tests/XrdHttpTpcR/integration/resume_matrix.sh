@@ -187,6 +187,9 @@ kill "$XRD_PID" 2>/dev/null
 # 2. X-Resume: F forces a fresh transfer (FR-4)
 # ---------------------------------------------------------------------------
 crash_transfer "/r2.bin"
+sleep 11                        # WP-14/C2: the lease gate now precedes
+                                # every destructive branch -- wait out the
+                                # dead session's lease before the retry
 : > "$WORK/hdrs.jsonl"
 start_server
 copy "/r2.bin" -H "X-Resume: F" -H "Overwrite: T"
@@ -213,6 +216,9 @@ kill "$XRD_PID" 2>/dev/null
 # 3. Validator mismatch -> RESUME_REJECTED -> fresh (FR-20c, FR-21)
 # ---------------------------------------------------------------------------
 crash_transfer "/r3.bin"
+sleep 11                        # WP-14/C2: the lease gate now precedes
+                                # every destructive branch -- wait out the
+                                # dead session's lease before the retry
 curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl?etag=%22flipped%22&lastmod=Thu,+02+Jan+2025+00:00:00+GMT"
 start_server
 copy "/r3.bin" -H "Overwrite: T"
@@ -230,6 +236,9 @@ curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl?etag=%22tpcr-mock-etag-1%2
 # 4. Destination truncated below W -> RESUME_REJECTED (FR-20/FR-25)
 # ---------------------------------------------------------------------------
 crash_transfer "/r4.bin"
+sleep 11                        # WP-14/C2: the lease gate now precedes
+                                # every destructive branch -- wait out the
+                                # dead session's lease before the retry
 truncate -s 1000 "$WORK/data/r4.bin"
 start_server
 copy "/r4.bin" -H "Overwrite: T"
@@ -246,6 +255,9 @@ kill "$XRD_PID" 2>/dev/null
 # 5. Case (e): journal without partial (POSC-style) -> discard -> fresh
 # ---------------------------------------------------------------------------
 crash_transfer "/r5.bin"
+sleep 11                        # WP-14/C2: the lease gate now precedes
+                                # every destructive branch -- wait out the
+                                # dead session's lease before the retry
 rm -f "$WORK/data/r5.bin"       # what POSC recovery would have done (XRD-1)
 start_server
 copy "/r5.bin" -H "Overwrite: T"
@@ -262,6 +274,9 @@ kill "$XRD_PID" 2>/dev/null
 # 6. Lazy GC: journal past tpcr.gc.age -> GC_DISCARD -> fresh (FR-24)
 # ---------------------------------------------------------------------------
 crash_transfer "/r6.bin"
+sleep 11                        # WP-14/C2: the lease gate now precedes
+                                # every destructive branch -- wait out the
+                                # dead session's lease before the retry
 sleep 22                        # gc.age is 20s
 start_server
 copy "/r6.bin" -H "Overwrite: T"
@@ -292,6 +307,32 @@ if [ "$HTTP_CODE" = "409" ] && server_log | grep -q "event=LEASE_CONFLICT"; then
 else
     fail "7: expected 409, got $HTTP_CODE: $(cat "$WORK/r7-second.txt")"
 fi
+
+# WP-14/C2: the lease gate is UNCONDITIONAL -- destructive requests that
+# would previously have deleted the live journal and truncated the partial
+# under the running session must all get 409 while the lease is live.
+# 7b: mismatched validators (retry sees a "changed" source).
+curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl?etag=%22flip-c2%22"
+HTTP_CODE=$(curl -s -o "$WORK/r7-c2a.txt" -w '%{http_code}' -X COPY \
+    "http://127.0.0.1:$PORT/r7.bin" \
+    -H "Source: http://127.0.0.1:$MOCK_PORT/src.bin" \
+    -H "X-Number-Of-Streams: 2")
+if [ "$HTTP_CODE" = "409" ] && [ -f "$WORK/data/r7.bin.xrdtpcr" ]; then
+    pass "7b: live lease + mismatched validators -> 409, journal untouched (WP-14/C2)"
+else
+    fail "7b: expected 409 + intact journal, got $HTTP_CODE (journal: $(ls "$WORK/data/r7.bin.xrdtpcr" 2>/dev/null || echo GONE))"
+fi
+# 7c: X-Resume: F must not evict a live writer either (FR-4 yields to FR-22).
+HTTP_CODE=$(curl -s -o "$WORK/r7-c2b.txt" -w '%{http_code}' -X COPY \
+    "http://127.0.0.1:$PORT/r7.bin" \
+    -H "Source: http://127.0.0.1:$MOCK_PORT/src.bin" \
+    -H "X-Resume: F" -H "Overwrite: T" -H "X-Number-Of-Streams: 2")
+if [ "$HTTP_CODE" = "409" ] && [ -f "$WORK/data/r7.bin.xrdtpcr" ]; then
+    pass "7c: live lease + X-Resume: F -> 409, journal untouched (WP-14/C2)"
+else
+    fail "7c: expected 409 + intact journal, got $HTTP_CODE"
+fi
+curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl?etag=%22tpcr-mock-etag-1%22"
 wait "$COPY_PID" 2>/dev/null
 kill "$XRD_PID" 2>/dev/null
 

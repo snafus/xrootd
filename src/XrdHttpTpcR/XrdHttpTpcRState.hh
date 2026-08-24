@@ -38,6 +38,7 @@ public:
         errRangeNotHonored = 4,  // Non-206 success status to a ranged request.
         errRangeMismatch   = 5,  // Content-Range absent or not echoing the request.
         errLengthMismatch  = 6,  // Reported or delivered length != requested range length.
+        errSourceChanged   = 7,  // If-Range guard tripped: source entity changed (WP-14/H6).
         errTimeout = 10  // The transfer did not make any progress within the timeout.
     };
 
@@ -108,6 +109,15 @@ public:
     void SetTransferParameters(off_t offset, size_t size);
 
     void SetupHeaders(XrdHttpExtReq &req);
+
+    // WP-14/H6: arms the If-Range guard.  Appends `If-Range: <etag>` to the
+    // custom header list (rebound on every reset), so a source whose entity
+    // changed IN PLACE -- with no transport fault to trigger the degraded
+    // re-HEAD -- answers 200 instead of 206, which validation converts into
+    // a permanent source-changed failure instead of a torn old/new mixture.
+    // Call only with a STRONG ETag (never "W/..."); sources that ignore
+    // If-Range simply keep sending 206, i.e. today's behavior.
+    void SetIfRange(const std::string &etag);
 
     void SetupHeadersForHEAD(XrdHttpExtReq & req);
 
@@ -254,6 +264,8 @@ private:
     off_t m_resp_range_start = -1;  // parsed Content-Range first byte.
     off_t m_resp_range_end = -1;    // parsed Content-Range last byte (inclusive).
     bool m_range_request = false;   // a Range header was set for this request.
+    bool m_if_range = false;        // transfer-level: If-Range guard armed (WP-14/H6).
+    std::string m_if_range_etag;    // the strong ETag the guard was armed with.
     bool m_seen_content_range = false;  // response carried a Content-Range.
     bool m_body_validated = false;  // ValidateRangeResponse(false) already ran.
     std::string m_etag;             // ETag from the current response (SUB-7).

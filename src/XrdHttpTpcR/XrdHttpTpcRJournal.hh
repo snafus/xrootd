@@ -71,9 +71,13 @@ struct JournalRecord {
     static const size_t kMaxDigestName = 64;
     static const size_t kMaxDigestValue = 1024;
     static const size_t kMaxReprDigests = 16;
-    // ~2,500 epochs cover 10 TB at the default 4 GiB cadence (NFR-5);
-    // 65536 leaves generous headroom without admitting absurd records.
-    static const size_t kMaxEpochs = 65536;
+    // ~2,500 epochs cover 10 TB at the default 4 GiB cadence (NFR-5), and
+    // the Checkpointer prunes epochs below the verify-tail (WP-14/C4), so
+    // real records stay far below these.  The caps must satisfy
+    // kMaxEpochs * 20 (serialized epoch size) < kMaxRecordBytes, or a
+    // record could serialize/commit and then be rejected on the next load
+    // -- exactly the trap this pair once contained.
+    static const size_t kMaxEpochs = 32768;          // 32768*20 = 640 KiB
     static const size_t kMaxRecordBytes = 1 * 1024 * 1024;
 
     // --- Core resume state ---
@@ -156,7 +160,10 @@ public:
     bool Commit(const JournalRecord &record, std::string &err);
 
     // Removes the journal (and any stale temp).  Success-path order is
-    // sync -> [checksum inject, WP-11] -> Remove -> close (FR-23).
+    // sync -> close -> [checksum inject, WP-11] -> Remove -> verdict
+    // (FR-23; Remove deliberately LAST among the destructive steps, so a
+    // close failure after a provable sync still leaves a resumable journal
+    // instead of forcing a from-zero retry -- WP-14/H7).
     bool Remove(std::string &err);
 
 private:
@@ -169,17 +176,31 @@ private:
 // The checkpoint engine (FR-19): decides WHEN to checkpoint (every
 // checkpoint_bytes of commit advance or checkpoint_secs, whichever first)
 // and executes the SUB-1 ordering (data sync, then journal commit).  A
-// failed data sync means NO journal advance -- the old record stays, the
-// transfer continues, and the failure is logged (SUB-1).
+// failed data sync POISONS the engine permanently (WP-14/C1): on Linux the
+// first fsync after a writeback error consumes it and drops the dirty
+// pages, so a LATER sync on the same handle can return success without the
+// lost bytes ever reaching disk -- retry-and-continue would let W advance
+// over a hole and ultimately attest a false success.  Once poisoned, no
+// checkpoint, final checkpoint, or success sync will ever run again; the
+// caller must fail the transfer.  The last successfully persisted W stays
+// trustworthy (every byte below it was proven durable by a sync that
+// preceded its commit) and is the correct resumable-from.
 class Checkpointer {
 public:
     // digest_snapshot (WP-10) mutates the record under the same commit that
     // persists W -- closing the open CRC32C epoch into record.epochs and
     // refreshing record.digest_state -- so digest state and watermark are
     // checkpoint-atomic (SUB-4).  Null = no digests (never in production).
+    //
+    // prune_tailbytes (WP-14/C4): epochs wholly below W - prune_tailbytes
+    // are dropped at each checkpoint -- resume-time tail verification never
+    // reads them (it skips epochs ending at or below W - verify.tailbytes),
+    // so carrying them only grows the record toward its parse caps.  Pass
+    // the configured tpcr.verify.tailbytes.
     using DigestSnapshot = std::function<void(JournalRecord &)>;
     Checkpointer(JournalStore &store, JournalRecord record,
                  uint64_t checkpoint_bytes, unsigned checkpoint_secs,
+                 uint64_t prune_tailbytes,
                  XrdSysError &log,
                  DigestSnapshot digest_snapshot = nullptr);
 
@@ -193,10 +214,26 @@ public:
     // `resumable-from` in the failure chunk (FR-6).
     bool FinalCheckpoint(Stream &stream, off_t committed);
 
-    // FR-23 success path: final data sync, then journal removal.  Returns
-    // false (with err) if the final sync fails -- the transfer must then be
-    // reported as FAILED, since durability of the full content is unproven.
-    bool SuccessCleanup(Stream &stream, std::string &err);
+    // FR-23 success path, first half: the final data sync.  Returns false
+    // (with err) if it fails or the engine is poisoned -- the transfer must
+    // then be reported as FAILED, since durability of the full content is
+    // unproven.  Journal removal is separate (RemoveJournal) and happens
+    // only after the close succeeds (WP-14/H7).
+    bool FinalDataSync(Stream &stream, std::string &err);
+
+    // FR-23 success path, last half: best-effort journal removal after the
+    // data file is synced AND closed.  Failure is non-fatal (lazy GC or the
+    // next COPY collects the orphan) but is logged.
+    void RemoveJournal();
+
+    // WP-14/C1: true once any data sync has failed.  Permanently sticky;
+    // the caller must abort the transfer with a permanent error.
+    bool SyncFailed() const {return m_sync_failed;}
+
+    // The last watermark actually persisted to the on-disk journal -- the
+    // only value that may be advertised as resumable-from when the current
+    // in-memory committed offset can no longer be proven durable.
+    off_t PersistedWatermark() const {return m_persisted_committed;}
 
     // Lease renewal interval = 2 x checkpoint.secs (FR-22, SUB-8).
     int64_t LeaseDuration() const {return 2 * (int64_t)m_checkpoint_secs;}
@@ -209,10 +246,13 @@ private:
     JournalRecord m_record;
     const uint64_t m_checkpoint_bytes;
     const unsigned m_checkpoint_secs;
+    const uint64_t m_prune_tailbytes;
     XrdSysError &m_log;
     DigestSnapshot m_digest_snapshot;
     off_t m_last_committed;
     time_t m_last_time;
+    off_t m_persisted_committed;
+    bool m_sync_failed = false;
 };
 
 } // namespace TPCR
