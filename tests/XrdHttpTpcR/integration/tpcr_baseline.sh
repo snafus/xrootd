@@ -46,7 +46,7 @@ with open(path, "wb") as out:
     remaining = size
     while remaining:
         n = min(remaining, 1 << 20)
-        out.write(rng.randbytes(n))
+        out.write(rng.getrandbits(n * 8).to_bytes(n, "little"))
         remaining -= n
 EOF
 

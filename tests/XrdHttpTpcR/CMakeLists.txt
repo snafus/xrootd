@@ -116,7 +116,7 @@ if(TARGET XrdServer)
   # (observed: a stolen port sent a COPY to another test's server).
   set_tests_properties(XrdHttpTpcR::integration PROPERTIES
                        SKIP_RETURN_CODE 127
-                       TIMEOUT 600
+                       TIMEOUT 1200
                        RUN_SERIAL TRUE
                        LABELS "integration")
 
@@ -125,19 +125,19 @@ if(TARGET XrdServer)
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/backend_matrix.sh
                    ${CMAKE_BINARY_DIR})
   set_tests_properties(XrdHttpTpcR::backend_matrix PROPERTIES
-                       SKIP_RETURN_CODE 127 TIMEOUT 300 RUN_SERIAL TRUE
+                       SKIP_RETURN_CODE 127 TIMEOUT 900 RUN_SERIAL TRUE
                        LABELS "integration")
   add_test(NAME XrdHttpTpcR::crash_matrix
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/crash_matrix.sh
                    ${CMAKE_BINARY_DIR})
   set_tests_properties(XrdHttpTpcR::crash_matrix PROPERTIES
-                       SKIP_RETURN_CODE 127 TIMEOUT 600 RUN_SERIAL TRUE
+                       SKIP_RETURN_CODE 127 TIMEOUT 900 RUN_SERIAL TRUE
                        LABELS "integration")
   # WP-8 resume decision matrix (T-I6, T-I13 leg).
   add_test(NAME XrdHttpTpcR::resume_matrix
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/resume_matrix.sh
                    ${CMAKE_BINARY_DIR})
   set_tests_properties(XrdHttpTpcR::resume_matrix PROPERTIES
-                       SKIP_RETURN_CODE 127 TIMEOUT 900 RUN_SERIAL TRUE
+                       SKIP_RETURN_CODE 127 TIMEOUT 1800 RUN_SERIAL TRUE
                        LABELS "integration")
 endif()

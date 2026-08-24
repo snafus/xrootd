@@ -113,7 +113,7 @@ journal_w() {
                                     END {if (!found) print -1}'
 }
 
-make_ref() { python3 -c "import random; open('$1','wb').write(random.Random($2).randbytes($3))"; }
+make_ref() { python3 -c "import random; n=$3; rng=random.Random($2); open('$1','wb').write(rng.getrandbits(n*8).to_bytes(n,'little'))"; }
 
 # Crashes a throttled transfer mid-flight, leaving partial + journal.
 # Afterwards: the server is DOWN; W_CRASH holds the journal watermark.

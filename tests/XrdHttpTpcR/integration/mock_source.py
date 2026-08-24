@@ -30,7 +30,13 @@ import sys
 import threading
 import time
 import zlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socketserver
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """http.server.ThreadingHTTPServer needs Python 3.7; EL8 ships 3.6."""
+    daemon_threads = True
 from urllib.parse import urlparse, parse_qs
 
 

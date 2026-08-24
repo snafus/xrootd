@@ -141,7 +141,7 @@ with open(path, "wb") as out:
     remaining = size
     while remaining > 0:
         chunk = min(remaining, 1 << 20)
-        out.write(rng.randbytes(chunk))
+        out.write(rng.getrandbits(chunk * 8).to_bytes(chunk, "little"))
         remaining -= chunk
 EOF
 }

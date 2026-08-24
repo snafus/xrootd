@@ -81,11 +81,15 @@ start_server() {
     echo "server failed to start"; exit 1
 }
 
-python3 -c "import random; open('$WORK/ref.bin','wb').write(random.Random(11).randbytes(64*1024*1024))"
+python3 -c "import random; n=64*1024*1024; rng=random.Random(11); open('$WORK/ref.bin','wb').write(rng.getrandbits(n*8).to_bytes(n,'little'))"
 python3 "$SRC_DIR/mock_source.py" --port "$MOCK_PORT" --file "$WORK/ref.bin" \
     --throttle $((1024 * 1024)) > "$WORK/mock.log" 2>&1 &
 PIDS+=($!)
-sleep 1
+# Wait until the mock actually serves (slow CI runners: a fixed sleep let
+# the first COPY probe a half-started mock and fail the whole scenario).
+for _ in $(seq 1 100); do
+    curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl" && break; sleep 0.2
+done
 
 journal_w() {  # prints W from the dump tool, or -1 on invalid/absent
     "$DUMP" "$1" 2>/dev/null | awk '/committed watermark/ {print $NF; found=1}
@@ -136,7 +140,7 @@ else
         W=$(journal_w "$JOURNAL")
         DEST_SIZE=$(wc -c < "$WORK/data/crashA.bin" | tr -d ' ')
         if [ "$W" -gt 0 ] 2>/dev/null && [ "$W" -le "$DEST_SIZE" ] \
-           && cmp -s -n "$W" "$WORK/ref.bin" "$WORK/data/crashA.bin"; then
+           && cmp -s <(head -c "$W" "$WORK/ref.bin") <(head -c "$W" "$WORK/data/crashA.bin"); then
             pass "A: journal valid after kill -9; W=$W durable and byte-identical to source"
         else
             fail "A: watermark untrustworthy (W=$W, dest=$DEST_SIZE)"
@@ -163,7 +167,7 @@ JOURNAL="$WORK/data/crashB.bin.xrdtpcr"
 if printf '%s' "$RESP" | grep -q "failure:" && [ -f "$JOURNAL" ]; then
     W=$(journal_w "$JOURNAL")
     if [ "$W" -gt 0 ] 2>/dev/null \
-       && cmp -s -n "$W" "$WORK/ref.bin" "$WORK/data/crashB.bin"; then
+       && cmp -s <(head -c "$W" "$WORK/ref.bin") <(head -c "$W" "$WORK/data/crashB.bin"); then
         pass "B: FR-17 final checkpoint present after admitted failure (W=$W)"
     else
         fail "B: final checkpoint watermark bad (W=$W)"

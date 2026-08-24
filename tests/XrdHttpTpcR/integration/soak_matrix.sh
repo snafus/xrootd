@@ -43,7 +43,7 @@ fail() { echo "FAIL: $*"; FAILURES=$((FAILURES + 1)); }
 pass() { echo "PASS: $*"; }
 pick_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 
-make_big_ref() {  # make_big_ref <path> <seed> <bytes>  (chunked: randbytes caps at <256 MiB)
+make_big_ref() {  # make_big_ref <path> <seed> <bytes>  (chunked; getrandbits works on py3.6)
     python3 - "$1" "$2" "$3" <<'EOF2'
 import random, sys
 path, seed, size = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
@@ -52,7 +52,7 @@ with open(path, "wb") as out:
     remaining = size
     while remaining:
         n = min(remaining, 1 << 20)
-        out.write(rng.randbytes(n))
+        out.write(rng.getrandbits(n * 8).to_bytes(n, "little"))
         remaining -= n
 EOF2
 }

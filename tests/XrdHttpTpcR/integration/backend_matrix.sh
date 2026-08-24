@@ -169,13 +169,16 @@ EOF
     done
 
     # Slow source so the kill lands mid-transfer.
-    python3 -c "import random; open('$dir/ref.bin','wb').write(random.Random(3).randbytes(8*1024*1024))"
+    python3 -c "import random; n=8*1024*1024; rng=random.Random(3); open('$dir/ref.bin','wb').write(rng.getrandbits(n*8).to_bytes(n,'little'))"
     local mock_port; mock_port=$(pick_port)
     python3 "$SRC_DIR/mock_source.py" --port "$mock_port" --file "$dir/ref.bin" \
         --throttle $((512 * 1024)) > "$dir/mock.log" 2>&1 &
     local mock_pid=$!
     PIDS+=($mock_pid)
-    sleep 1
+    # Wait until the mock actually serves (slow CI runners).
+    for _ in $(seq 1 100); do
+        curl -s -o /dev/null "http://127.0.0.1:$mock_port/ctl" && break; sleep 0.2
+    done
     curl -s -N -X COPY "http://127.0.0.1:$port/crash.bin" \
         -H "Source: http://127.0.0.1:$mock_port/src.bin" \
         -H "X-Number-Of-Streams: 2" -H "Overwrite: T" > /dev/null 2>&1 &
