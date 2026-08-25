@@ -91,7 +91,10 @@ start_gw() {  # start_gw <cfg> <name>; sets GW_PID.  NOT run in a subshell:
         curl -s -o /dev/null "http://127.0.0.1:$port/" && return 0
         sleep 0.2
     done
-    echo "gateway $2 failed to start"; exit 1
+    echo "gateway $2 failed to start"
+    echo "--- xrootd log tail (diagnostic) ---"
+    tail -40 "$WORK"/$2/xrootd.log* 2>/dev/null
+    exit 1
 }
 log_b() { cat "$WORK"/gwb/xrootd.log* 2>/dev/null; }
 

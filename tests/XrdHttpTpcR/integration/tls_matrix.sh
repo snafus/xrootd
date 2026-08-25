@@ -97,7 +97,10 @@ start_server() {
             && return 0
         sleep 0.2
     done
-    echo "TLS server failed to start"; exit 1
+    echo "TLS server failed to start"
+    echo "--- xrootd log tail (diagnostic) ---"
+    tail -40 "$WORK"/tls/xrootd.log* 2>/dev/null
+    exit 1
 }
 server_log() { cat "$WORK"/tls/xrootd.log* 2>/dev/null; }
 

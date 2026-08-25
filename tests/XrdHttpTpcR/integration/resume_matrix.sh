@@ -91,7 +91,10 @@ start_server() {
     for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
         curl -s -o /dev/null "http://127.0.0.1:$PORT/" && return 0; sleep 0.2
     done
-    echo "server failed to start"; exit 1
+    echo "server failed to start"
+    echo "--- xrootd log tail (diagnostic) ---"
+    tail -40 "$WORK"/resume/xrootd.log* 2>/dev/null
+    exit 1
 }
 server_log() { cat "$WORK"/resume/xrootd.log* 2>/dev/null; }
 
