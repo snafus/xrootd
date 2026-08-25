@@ -66,10 +66,19 @@ Feature-complete (tag `tpcr-handback`, branched from v6.1.1). All planned
 tests pass: 82 unit test entries, ~34 integration scenarios, crash matrix
 3/3, resume matrix 12/12, soak/perf 7/7; requirement traceability clean.
 
+TLS is exercised end to end (HTTPS clients, an HTTPS source through the
+CA-verified curl path, resume over TLS), and the two-gateway story — 409
+writer exclusion across live server processes, then a cross-gateway
+resume of the dead gateway's watermark — runs as its own matrix.
+
 **Known limits, stated plainly:** resume is qualified on POSIX backends
 only — EC/CephFS/proxy deployments are *unsupported until tested* (a
 qualification harness ships in `tests/XrdHttpTpcR/integration/`); the
-10 TB overhead numbers are measured-then-extrapolated (testbed disk was
-small); crash durability is validated at the API-ordering level, not
-against real power loss; and a handful of deliberate spec deviations await
-reviewer sign-off in the working tree's `QUESTIONS.md`.
+two-gateway matrix runs both instances on one host's ext4, so real
+distributed-filesystem semantics (CephFS/NFS caching) remain a
+site-validation item; token/macaroon flows are stock code but untested
+here (the security libraries are absent on this testbed); the 10 TB
+overhead numbers are measured-then-extrapolated; crash durability is
+validated at the API-ordering level, not against real power loss; and a
+handful of deliberate spec deviations await reviewer sign-off in the
+working tree's `QUESTIONS.md`.

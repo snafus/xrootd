@@ -140,4 +140,18 @@ if(TARGET XrdServer)
   set_tests_properties(XrdHttpTpcR::resume_matrix PROPERTIES
                        SKIP_RETURN_CODE 127 TIMEOUT 1800 RUN_SERIAL TRUE
                        LABELS "integration")
+  # WP-15: TLS leg (HTTPS gateway, HTTPS source via http.cadir, resume over
+  # TLS) and the two-live-gateway shared-filesystem matrix.
+  add_test(NAME XrdHttpTpcR::tls_matrix
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/tls_matrix.sh
+                   ${CMAKE_BINARY_DIR})
+  set_tests_properties(XrdHttpTpcR::tls_matrix PROPERTIES
+                       SKIP_RETURN_CODE 127 TIMEOUT 900 RUN_SERIAL TRUE
+                       LABELS "integration")
+  add_test(NAME XrdHttpTpcR::multi_gateway
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/multi_gateway.sh
+                   ${CMAKE_BINARY_DIR})
+  set_tests_properties(XrdHttpTpcR::multi_gateway PROPERTIES
+                       SKIP_RETURN_CODE 127 TIMEOUT 900 RUN_SERIAL TRUE
+                       LABELS "integration")
 endif()

@@ -204,3 +204,17 @@ on FinalCheckpoint failure the failure chunk falls back to advertising the
 persisted watermark.  New FR-30 cross-directive invariant: tpcr.gc.age must
 exceed the lease term (2 x tpcr.checkpoint.secs).
 Touches: FR-4, FR-12, FR-21, FR-23, FR-28, FR-30, SUB-9, CON-4.
+
+**2026-08-25 / WP-15 — TLS and two-gateway integration matrices.**
+Closes the two locally-closable gaps from the release-readiness assessment.
+tls_matrix.sh: throwaway CA + IP-SAN cert per run; HTTPS client->gateway with
+the handler loaded WITHOUT +notls; an HTTPS *source* pulled through the
+CA-verified curl path (http.cadir hashed dir -- note xrootd refuses CA
+material with group-write permissions); resume over TLS after kill -9.
+multi_gateway.sh: two live xrootd instances sharing one data directory --
+cross-process 409 while the lease is live (WP-14/C2 across real processes),
+X-Resume: F blocked the same way, and a genuine cross-gateway resume of the
+dead instance's watermark.  Both registered in ctest (RUN_SERIAL, SKIP 127).
+Honest scope: single-host ext4 stands in for the shared filesystem, and
+token/macaroon flows remain untested (libraries absent here) -- both stay
+site-validation items (Q-3).  Touches: FR-22, XRD-6, CON-3, NFR-2.

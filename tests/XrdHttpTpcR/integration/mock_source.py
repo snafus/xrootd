@@ -275,6 +275,9 @@ def main():
     parser.add_argument("--throttle", type=int, default=0, metavar="BYTES_PER_S")
     parser.add_argument("--headers-log", default=None)
     parser.add_argument("--repr-digest", default=None, choices=["good", "bad"])
+    # Serve over TLS (both required): the source side of the WP-15 TLS leg.
+    parser.add_argument("--tls-cert", default=None)
+    parser.add_argument("--tls-key", default=None)
     args = parser.parse_args()
 
     with open(args.file, "rb") as ref:
@@ -282,6 +285,11 @@ def main():
     Handler.state = SourceState(args)
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    if args.tls_cert and args.tls_key:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
     print("mock_source: serving %d bytes on port %d" %
           (len(Handler.payload), args.port), flush=True)
     try:
