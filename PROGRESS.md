@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** WP-14 (accepted large-transfer review fixes) — implementation done, regression running. Remaining human items: Q-1..Q-6 (esp. Q-4); branch is pushed to the fork (github.com/snafus/xrootd, branch tpcr).
+**Current focus:** all machine-side work complete through WP-15 (TLS + two-gateway matrices); CI fully green as of WP-14. Remaining human items: Q-1..Q-6 review (esp. Q-4) and the site-validation pass (real shared FS, tokens, scale).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
