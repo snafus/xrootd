@@ -67,7 +67,7 @@ EOF2
 }
 
 XRD_PID=""
-start_server() {  # start_server <cfg>
+start_server_once() {  # start_server_once <cfg>
     LD_LIBRARY_PATH="$LIB_DIR" "$BUILD_DIR/bin/xrootd" -c "$1" \
         -l "$WORK/xrootd.log" -n soak > /dev/null 2>&1 &
     XRD_PID=$!
@@ -75,7 +75,19 @@ start_server() {  # start_server <cfg>
     for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
         curl -s -o /dev/null "http://127.0.0.1:$PORT/" && return 0; sleep 0.2
     done
-    echo "server failed to start"; exit 1
+    return 1
+}
+# EL8 can intermittently kill a server at plugin load (Q-8); retry with
+# loud evidence, freeing the port between attempts.
+start_server() {  # start_server <cfg>
+    local attempt
+    for attempt in 1 2 3; do
+        start_server_once "$1" && return 0
+        kill -9 "$XRD_PID" 2>/dev/null
+        echo "SERVER START FAILED (attempt $attempt) -- diagnostics:"
+        tail -30 "$WORK"/soak/xrootd.log* 2>/dev/null
+    done
+    echo "server failed to start after 3 attempts"; exit 1
 }
 
 write_cfg() {  # write_cfg <path> <extra...>

@@ -169,13 +169,23 @@ http.exthandler xrdtpcr +notls $TPCR_LIB
 $persist_line
 tpcr.blocksize 1m
 EOF
-    LD_LIBRARY_PATH="$LIB_DIR" "$BUILD_DIR/bin/xrootd" -c "$dir/xrootd.cfg" \
-        -l "$dir/xrootd.log" -n srv > /dev/null 2>&1 &
-    local xrd_pid=$!
-    PIDS+=($xrd_pid)
-    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
-        curl -s -o /dev/null "http://127.0.0.1:$port/" && break; sleep 0.2
+    # EL8 can intermittently kill a server at plugin load (Q-8); retry.
+    local xrd_pid="" booted=0 attempt
+    for attempt in 1 2 3; do
+        LD_LIBRARY_PATH="$LIB_DIR" "$BUILD_DIR/bin/xrootd" -c "$dir/xrootd.cfg" \
+            -l "$dir/xrootd.log" -n srv > /dev/null 2>&1 &
+        xrd_pid=$!
+        PIDS+=($xrd_pid)
+        for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
+            curl -s -o /dev/null "http://127.0.0.1:$port/" && { booted=1; break; }
+            sleep 0.2
+        done
+        [ "$booted" = 1 ] && break
+        kill -9 "$xrd_pid" 2>/dev/null
+        echo "SERVER START FAILED ($tag, attempt $attempt) -- diagnostics:"
+        tail -30 "$dir"/srv/xrootd.log* 2>/dev/null
     done
+    [ "$booted" = 1 ] || { fail "($tag) server failed to start after 3 attempts"; return; }
 
     # Slow source so the kill lands mid-transfer.
     python3 -c "import random; n=8*1024*1024; rng=random.Random(3); open('$dir/ref.bin','wb').write(rng.getrandbits(n*8).to_bytes(n,'little'))"

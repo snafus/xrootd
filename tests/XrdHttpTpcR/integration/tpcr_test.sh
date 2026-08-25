@@ -95,16 +95,24 @@ tpcr.recovery.maxsecs 25
 xrootd.chksum adler32
 EOF
 
-LD_LIBRARY_PATH="$LIB_DIR" "$XROOTD_BIN" -c "$WORK/xrootd.cfg" \
-    -l "$WORK/xrootd.log" -n tpcr &
-XROOTD_PID=$!
-
-# Wait for the server to accept connections.
-for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
-    curl -s -o /dev/null "http://127.0.0.1:$HTTP_PORT/" && break
-    kill -0 "$XROOTD_PID" 2>/dev/null || { echo "xrootd died at startup"; cat "$WORK"/xrootd.log 2>/dev/null | tail -40; exit 1; }
-    sleep 0.2
+# EL8 can intermittently kill a server at plugin load (Q-8); retry with
+# loud evidence.
+BOOTED=0
+for attempt in 1 2 3; do
+    LD_LIBRARY_PATH="$LIB_DIR" "$XROOTD_BIN" -c "$WORK/xrootd.cfg" \
+        -l "$WORK/xrootd.log" -n tpcr &
+    XROOTD_PID=$!
+    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
+        curl -s -o /dev/null "http://127.0.0.1:$HTTP_PORT/" && { BOOTED=1; break; }
+        kill -0 "$XROOTD_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    [ "$BOOTED" = 1 ] && break
+    kill -9 "$XROOTD_PID" 2>/dev/null
+    echo "SERVER START FAILED (attempt $attempt) -- diagnostics:"
+    tail -40 "$WORK"/tpcr/xrootd.log* 2>/dev/null
 done
+[ "$BOOTED" = 1 ] || { echo "xrootd failed to start after 3 attempts"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Helpers

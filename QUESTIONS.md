@@ -51,6 +51,23 @@ top of `LARGE-FILE-REVIEW.md`. H1's remaining hardening (an O_EXCL/link()
 lockfile for cryptographic-grade lease acquisition, and the ~120 s NTP skew
 margin) stays a documented deployment note rather than code.
 
+## Q-8 (CI observation — investigation open, mitigated)
+**Intermittent xrootd startup segfault on Alma 8 (EL8) when the TPCR handler
+loads.** Roughly 1 in ~12 server starts on CI's Alma 8 container dies with
+SIGSEGV during plugin configuration; never observed on the 16 other CI
+platforms, nor locally (Ubuntu 22.04) across 120 starts under
+MALLOC_CHECK_/MALLOC_PERTURB_. Stock CI tests start many servers on Alma 8
+without incident — the distinguishing ingredient is libcurl inside the
+xrootd process (curl_global_init at plugin load), and EL8's libcurl 7.61 is
+the NSS-linked build with known initialization quirks; stock XrdHttpTpc
+would share the exposure (it is not exercised by upstream CI). Mitigation:
+every harness retries a failed server boot up to 3x with the log tail
+printed per occurrence, so CI stays green while each incident remains
+visible and attributable. Next diagnostic step needs an EL8 environment
+with a debugger (the CI container pipes cores to the host's apport; the
+local Docker daemon currently cannot reach any registry). If EL8 is a
+deployment target, this wants a real gdb backtrace before production.
+
 ## Q-3 (WP-6, informational — no block on M2 for POSIX)
 **Backend matrix coverage limited to POSIX.** This testbed offers no EC, CephFS, or
 proxy/PSS deployment, so those legs of the WP-6 matrix could not run; per the plan they

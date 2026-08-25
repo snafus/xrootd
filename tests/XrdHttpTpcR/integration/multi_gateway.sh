@@ -77,7 +77,7 @@ EOF
 write_cfg "$WORK/a.cfg" "$PORT_A" "$WORK/adminA"
 write_cfg "$WORK/b.cfg" "$PORT_B" "$WORK/adminB"
 
-start_gw() {  # start_gw <cfg> <name>; sets GW_PID.  NOT run in a subshell:
+start_gw_once() {  # start_gw <cfg> <name>; sets GW_PID.  NOT run in a subshell:
     # a startup failure must abort the whole harness, and `exit` inside
     # $(...) only kills the substitution (learned the hard way on EL8).
     # NB: with -n <name>, the log lands at $WORK/<name>/xrootd.log.
@@ -91,11 +91,22 @@ start_gw() {  # start_gw <cfg> <name>; sets GW_PID.  NOT run in a subshell:
         curl -s -o /dev/null "http://127.0.0.1:$port/" && return 0
         sleep 0.2
     done
-    echo "gateway $2 failed to start"
-    echo "--- xrootd log tail (diagnostic) ---"
-    tail -40 "$WORK"/$2/xrootd.log* 2>/dev/null
-    exit 1
+    return 1
 }
+# EL8 can intermittently kill a server at plugin load (Q-8); retry with
+# loud evidence, freeing the port between attempts.
+start_gw() {
+    local attempt
+    for attempt in 1 2 3; do
+        start_gw_once "$1" "$2" && return 0
+        kill -9 "$GW_PID" 2>/dev/null
+        echo "GATEWAY $2 START FAILED (attempt $attempt) -- diagnostics:"
+        echo "--- xrootd log tail ---"
+        tail -30 "$WORK"/$2/xrootd.log* 2>/dev/null
+    done
+    echo "gateway $2 failed to start after 3 attempts"; exit 1
+}
+
 log_b() { cat "$WORK"/gwb/xrootd.log* 2>/dev/null; }
 
 journal_w() {

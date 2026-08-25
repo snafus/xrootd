@@ -87,7 +87,7 @@ EOF
 # NOTE: no +notls -- on a TLS-enabled server the handler loads the normal way.
 
 XRD_PID=""
-start_server() {
+start_server_once() {
     LD_LIBRARY_PATH="$LIB_DIR" "$BUILD_DIR/bin/xrootd" -c "$WORK/tls.cfg" \
         -l "$WORK/xrootd.log" -n tls > /dev/null 2>&1 &
     XRD_PID=$!
@@ -97,11 +97,24 @@ start_server() {
             && return 0
         sleep 0.2
     done
-    echo "TLS server failed to start"
-    echo "--- xrootd log tail (diagnostic) ---"
-    tail -40 "$WORK"/tls/xrootd.log* 2>/dev/null
-    exit 1
+    return 1
 }
+# One server start can intermittently die on EL8 (suspected libcurl-NSS
+# init interaction at plugin load; under investigation as Q-8).  Retry a
+# failed boot up to 3 times, logging each occurrence loudly so CI logs
+# keep the evidence.
+start_server() {
+    local attempt
+    for attempt in 1 2 3; do
+        start_server_once && return 0
+        kill -9 "$XRD_PID" 2>/dev/null   # a hung boot must free the port
+        echo "SERVER START FAILED (attempt $attempt) -- diagnostics:"
+        echo "--- xrootd log tail ---"
+        tail -30 "$WORK"/tls/xrootd.log* 2>/dev/null
+    done
+    echo "server failed to start after 3 attempts"; exit 1
+}
+
 server_log() { cat "$WORK"/tls/xrootd.log* 2>/dev/null; }
 
 journal_w() {
