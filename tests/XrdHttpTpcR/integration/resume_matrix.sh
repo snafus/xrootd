@@ -79,7 +79,7 @@ start_server() {
         -l "$WORK/xrootd.log" -n resume > /dev/null 2>&1 &
     XRD_PID=$!
     PIDS+=($XRD_PID)
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
         curl -s -o /dev/null "http://127.0.0.1:$PORT/" && return 0; sleep 0.2
     done
     echo "server failed to start"; exit 1
@@ -93,7 +93,7 @@ start_mock() {  # start_mock <file> [args...]
         > "$WORK/mock.log" 2>&1 &
     MOCK_PID=$!
     PIDS+=($MOCK_PID)
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
         curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl" && return 0
         sleep 0.1
     done

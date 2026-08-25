@@ -83,7 +83,7 @@ start_server() {
         -l "$WORK/xrootd.log" -n tls > /dev/null 2>&1 &
     XRD_PID=$!
     PIDS+=($XRD_PID)
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
         curl -s --cacert "$WORK/ca.pem" -o /dev/null "https://127.0.0.1:$PORT/" \
             && return 0
         sleep 0.2

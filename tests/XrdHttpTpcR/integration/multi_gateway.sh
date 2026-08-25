@@ -68,19 +68,21 @@ EOF
 write_cfg "$WORK/a.cfg" "$PORT_A" "$WORK/adminA"
 write_cfg "$WORK/b.cfg" "$PORT_B" "$WORK/adminB"
 
-start_gw() {  # start_gw <cfg> <name>; echoes the pid
+start_gw() {  # start_gw <cfg> <name>; sets GW_PID.  NOT run in a subshell:
+    # a startup failure must abort the whole harness, and `exit` inside
+    # $(...) only kills the substitution (learned the hard way on EL8).
     # NB: with -n <name>, the log lands at $WORK/<name>/xrootd.log.
     LD_LIBRARY_PATH="$LIB_DIR" "$BUILD_DIR/bin/xrootd" -c "$1" \
         -l "$WORK/xrootd.log" -n "$2" > /dev/null 2>&1 &
-    local pid=$!
-    PIDS+=($pid)
+    GW_PID=$!
+    PIDS+=($GW_PID)
     local port
     port=$(grep "^xrd.port" "$1" | awk '{print $2}')
-    for _ in $(seq 1 50); do
-        curl -s -o /dev/null "http://127.0.0.1:$port/" && { echo "$pid"; return 0; }
+    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
+        curl -s -o /dev/null "http://127.0.0.1:$port/" && return 0
         sleep 0.2
     done
-    echo "gateway $2 failed to start" >&2; exit 1
+    echo "gateway $2 failed to start"; exit 1
 }
 log_b() { cat "$WORK"/gwb/xrootd.log* 2>/dev/null; }
 
@@ -97,8 +99,8 @@ for _ in $(seq 1 100); do
     curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl" && break; sleep 0.2
 done
 
-PID_A=$(start_gw "$WORK/a.cfg" gwa)
-PID_B=$(start_gw "$WORK/b.cfg" gwb)
+start_gw "$WORK/a.cfg" gwa; PID_A=$GW_PID
+start_gw "$WORK/b.cfg" gwb; PID_B=$GW_PID
 
 # ---------------------------------------------------------------------------
 # 1 + 2: A writes; B must refuse to interfere while A's lease is live

@@ -91,7 +91,7 @@ LD_LIBRARY_PATH="$LIB_DIR" "$XROOTD_BIN" -c "$WORK/xrootd.cfg" \
 XROOTD_PID=$!
 
 # Wait for the server to accept connections.
-for _ in $(seq 1 50); do
+for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
     curl -s -o /dev/null "http://127.0.0.1:$HTTP_PORT/" && break
     kill -0 "$XROOTD_PID" 2>/dev/null || { echo "xrootd died at startup"; cat "$WORK"/xrootd.log 2>/dev/null | tail -40; exit 1; }
     sleep 0.2
@@ -108,7 +108,7 @@ start_mock() {
     python3 "$SRC_DIR/mock_source.py" --port "$MOCK_PORT" --file "$ref" "$@" \
         > "$WORK/mock.log" 2>&1 &
     MOCK_PID=$!
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
         curl -s -o /dev/null "http://127.0.0.1:$MOCK_PORT/ctl" && return 0
         sleep 0.1
     done

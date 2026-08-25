@@ -164,7 +164,7 @@ EOF
         -l "$dir/xrootd.log" -n srv > /dev/null 2>&1 &
     local xrd_pid=$!
     PIDS+=($xrd_pid)
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 150); do   # slow CI containers need up to ~30s
         curl -s -o /dev/null "http://127.0.0.1:$port/" && break; sleep 0.2
     done
 
