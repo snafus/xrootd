@@ -44,7 +44,16 @@ trap cleanup EXIT
 FAILURES=0
 fail() { echo "FAIL: $*"; FAILURES=$((FAILURES + 1)); }
 pass() { echo "PASS: $*"; }
-pick_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
+pick_port() { python3 -c '
+import random, socket
+for _ in range(200):
+    p = random.randint(20000, 31999)   # below the ephemeral range: server
+    s = socket.socket()                # restarts cannot collide with
+    try:                               # kernel-assigned source ports
+        s.bind(("127.0.0.1", p)); s.close(); print(p); break
+    except OSError:
+        s.close()
+'; }
 
 PORT=$(pick_port)
 MOCK_PORT=$(pick_port)
