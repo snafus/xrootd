@@ -104,6 +104,13 @@ if(TARGET XrdServer)
   # (tpcr-journal-dump is built in src/XrdHttpTpcR/ -- shipped with the
   # handler, not gated on ENABLE_TESTS; the harnesses use it from bin/.)
 
+  # Server-driving harnesses: honor the framework's root/server gate the
+  # same way tests/CMakeLists.txt does for upstream's server tests --
+  # xrootd refuses to run as root, and rpmbuild's %check runs as root.
+  if(NOT ENABLE_SERVER_TESTS)
+    return()
+  endif()
+
   # Integration: real xrootd + TPCR handler against the fault-injectable
   # mock source (T-I1, T-I2, early T-I3/T-I4).  Skips (127) when python3,
   # curl, or the built artifacts are unavailable.

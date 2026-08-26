@@ -78,13 +78,17 @@ tpcr.blocksize 1m
 tpcr.window.bytes 4m
 tpcr.checkpoint.bytes 2m
 tpcr.checkpoint.secs 5
-tpcr.gc.age 20s
+tpcr.gc.age 10m
 EOF
+# Scenario 6 needs a SHORT gc.age to observe lazy GC; everyone else needs a
+# LONG one so a slow CI run (boot retries, container latency) cannot lose
+# its journal to GC before the scenario even begins (seen on Alma 8).
+sed 's/tpcr.gc.age 10m/tpcr.gc.age 20s/' "$WORK/xrootd.cfg" > "$WORK/gc.cfg"
 # Lease duration = 2 x checkpoint.secs = 10s.
 
 XRD_PID=""
-start_server_once() {
-    LD_LIBRARY_PATH="$LIB_DIR" "$BUILD_DIR/bin/xrootd" -c "$WORK/xrootd.cfg" \
+start_server_once() {  # start_server_once [cfg]
+    LD_LIBRARY_PATH="$LIB_DIR" "$BUILD_DIR/bin/xrootd" -c "${1:-$WORK/xrootd.cfg}" \
         -l "$WORK/xrootd.log" -n resume > /dev/null 2>&1 &
     XRD_PID=$!
     PIDS+=($XRD_PID)
@@ -97,10 +101,10 @@ start_server_once() {
 # init interaction at plugin load; under investigation as Q-8).  Retry a
 # failed boot up to 3 times, logging each occurrence loudly so CI logs
 # keep the evidence.
-start_server() {
+start_server() {  # start_server [cfg]
     local attempt
     for attempt in 1 2 3; do
-        start_server_once && return 0
+        start_server_once "${1:-}" && return 0
         kill -9 "$XRD_PID" 2>/dev/null   # a hung boot must free the port
         echo "SERVER START FAILED (attempt $attempt) -- diagnostics:"
         echo "--- xrootd log tail ---"
@@ -302,8 +306,8 @@ crash_transfer "/r6.bin"
 sleep 11                        # WP-14/C2: the lease gate now precedes
                                 # every destructive branch -- wait out the
                                 # dead session's lease before the retry
-sleep 22                        # gc.age is 20s
-start_server
+sleep 22                        # gc.cfg sets gc.age 20s
+start_server "$WORK/gc.cfg"
 copy "/r6.bin" -H "Overwrite: T"
 if printf '%s' "$RESPONSE" | grep -q "success: Created" \
    && cmp -s "$REF" "$WORK/data/r6.bin" \
