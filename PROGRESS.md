@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** Q-review complete (Q-1/2/4/5/6 answered, Q-7 done, Q-8 investigated and attributed to the CI runner environment; Q-3 remains the site-validation item). Rocky/Alma 8 RPM set built, install-smoked, and exported to rpms-el8/ (13 MB incl. SRPM).
+**Current focus:** Q-review complete (Q-1/2/4/5/6 answered, Q-7 done, Q-8 investigated and attributed to the CI runner environment; Q-3 remains the site-validation item). Packaging fully automated: every tpcr push now builds install-validated RPMs (alma8/9/10, fc43) and debs (ubuntu 24.04/26.04, debian 12/13) as GitHub run artifacts; a local el8 set also sits in rpms-el8/.
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
