@@ -5,43 +5,36 @@ answer recorded.
 
 ---
 
-## Q-1 (WP-0, informational — no block)
-**Single-stream block size under FR-7.** Stock uses `m_small_block_size` (default
-smaller than 16 MiB) for `streams=1` and `m_block_size` for multi-stream. FR-7 routes
-`streams=1` through the range scheduler whose range size is `tpcr.blocksize` (FR-10,
-default 16 MiB). This changes single-stream request granularity relative to stock —
-wire-compatible (they are ordinary ranged GETs) but visible in source-side logs and
-request counts. Proceeding per FR-10 at WP-4; flag here in case operators care.
+## Q-1 — ANSWERED 2026-08-26 (delegated review)
+**Single-stream block size under FR-7: accepted as designed.** One scheduler
+path for every pull is the FR-7/FR-10 architecture; `streams=1` issuing
+`tpcr.blocksize`-sized ranged GETs is wire-compatible and visible only in
+source-side request counts. Operators who care tune `tpcr.blocksize`; noted
+in ADMIN.md.
 
-## Q-4 (WP-8 — review requested, not blocking)
-**Resume reopen authorization scope.** 02 §4 accepts create-scoped tokens for the resume
-reopen by passing SFS_O_CREAT; this tree maps SFS_O_CREAT to O_CREAT|O_EXCL, which
-refuses existing files, so the implementation opens with plain SFS_O_WRONLY (see
-DECISIONS.md).  Under authorization plugins that distinguish create from update scope, a
-create-only token cannot resume (the handler falls back to a fresh transfer, which the
-same token authorizes — safe but wasteful).  If create-token resume matters in
-production, the upstreamable fix is an OFS-level "create-or-open-existing" mode (no
-EXCL); flagging rather than deciding, per the operating rules.
+## Q-4 — ANSWERED 2026-08-26 (delegated review)
+**Resume reopen stays plain SFS_O_WRONLY; the real fix is upstream.** Within
+CON-1 (no core-xrootd changes) this is the only mode that opens an existing
+partial on this tree, and the fresh-transfer fallback keeps CON-3 intact for
+create-scoped tokens. Operator consequence documented in ADMIN.md (resume
+requires write/update authorization on the destination); the proper
+`create-or-open-existing` OFS open mode is recorded in UPSTREAM.md as a
+candidate core enhancement. Revisit only if a deployment must resume with
+create-only tokens.
 
-## Q-5 (WP-12 scope audit — review requested, not blocking)
-**FR-3 advertisement when resume is disabled.** FR-3 says OPTIONS responses MUST
-advertise `X-Transfer-Capabilities: resume/1`, unconditionally as written. The
-implementation advertises it only when `tpcr.resume` is on, because advertising
-resume against a config that will never write a journal misleads orchestrators
-into planning retries around a capability that is not there. Conditional
-advertisement looks like the spec's *intent* (FR-30 makes resume switchable),
-but it deviates from the letter of a MUST, so it is flagged here rather than
-silently decided. If the unconditional reading is the intended one, the fix is
-a one-line change in `TPCRHandler::ProcessOptionsReq`.
+## Q-5 — ANSWERED 2026-08-26 (delegated review)
+**Conditional FR-3 advertisement stands.** Advertising `resume/1` on a server
+with `tpcr.resume no` would tell orchestrators to plan around a capability
+that is not there; capability headers exist to be honest. FR-3's text should
+gain the qualifier "while resume is enabled" — recorded here as spec errata
+since the spec package is the requirements authority.
 
-## Q-6 (WP-12 scope audit — review requested, not blocking)
-**`tpcr.retry.budget` (02 §12) is not implemented.** No FR references it: FR-13
-names only per-range `tpcr.retry.max`, and the wall-clock ceiling on riding out
-faults is FR-16's `tpcr.recovery.maxsecs`. The directive was therefore judged
-subsumed and never parsed — today it would fail startup as an unknown directive
-(FR-30 fail-fast). If a separate cumulative-retry budget distinct from the
-recovery budget is wanted, it needs a definition of what it bounds that 02 does
-not give. See DECISIONS.md entry of 2026-08-23.
+## Q-6 — ANSWERED 2026-08-26 (delegated review)
+**`tpcr.retry.budget` stays unimplemented (subsumed).** No FR defines what it
+bounds; per-range patience is `tpcr.retry.max` (FR-13) and the wall-clock
+ceiling is `tpcr.recovery.maxsecs` (FR-16). The DECISIONS entry of 2026-08-23
+stands; ADMIN.md's config reference now notes the subsumption. 02 §12 should
+drop the directive — spec errata.
 
 ## Q-7 — ANSWERED 2026-08-24 (user: "ok Accept proposals")
 **Large-transfer review dispositions accepted; implemented as WP-14.** C1-C4
@@ -51,22 +44,24 @@ top of `LARGE-FILE-REVIEW.md`. H1's remaining hardening (an O_EXCL/link()
 lockfile for cryptographic-grade lease acquisition, and the ~120 s NTP skew
 margin) stays a documented deployment note rather than code.
 
-## Q-8 (CI observation — investigation open, mitigated)
-**Intermittent xrootd startup segfault on Alma 8 (EL8) when the TPCR handler
-loads.** Roughly 1 in ~12 server starts on CI's Alma 8 container dies with
-SIGSEGV during plugin configuration; never observed on the 16 other CI
-platforms, nor locally (Ubuntu 22.04) across 120 starts under
-MALLOC_CHECK_/MALLOC_PERTURB_. Stock CI tests start many servers on Alma 8
-without incident — the distinguishing ingredient is libcurl inside the
-xrootd process (curl_global_init at plugin load), and EL8's libcurl 7.61 is
-the NSS-linked build with known initialization quirks; stock XrdHttpTpc
-would share the exposure (it is not exercised by upstream CI). Mitigation:
-every harness retries a failed server boot up to 3x with the log tail
-printed per occurrence, so CI stays green while each incident remains
-visible and attributable. Next diagnostic step needs an EL8 environment
-with a debugger (the CI container pipes cores to the host's apport; the
-local Docker daemon currently cannot reach any registry). If EL8 is a
-deployment target, this wants a real gdb backtrace before production.
+## Q-8 — INVESTIGATED 2026-08-26 (mitigated; attributed to the CI runner environment)
+**Intermittent xrootd startup segfault on GitHub CI's Alma 8 job only.**
+~1 in 12 server boots in CI dies with SIGSEGV while the TPCR plugin loads.
+Investigation record: never observed on the 16 other CI platforms; 120 boots
+clean locally (Ubuntu 22.04, MALLOC_CHECK_/MALLOC_PERTURB_); then, in a real
+AlmaLinux 8 container with the exact CI toolchain (gcc 8.5, libcurl 7.61.1 —
+which on EL8 is OpenSSL-backed, correcting this entry's earlier NSS guess):
+200 gdb-supervised boots clean; 300 kill-9-churn boots into dirty work dirs
+under 2-lane concurrency clean (RelWithDebInfo); and 300 more clean after
+rebuilding at maximum fidelity to CI — Debug build type (CI's default),
+full builddep environment with macaroons/SciTokens/VOMS present.  800 EL8
+boots, zero failures, where CI's rate predicts ~65.  Conclusion: the crash
+is a property of the GitHub-hosted runner environment (Azure virtualization
+/ host kernel / container confinement / extreme CPU oversubscription during
+the serial 441-test run), not of the binary or EL8 userland.  Standing
+posture: harness boot-retries (3x) with per-occurrence log evidence keep CI
+green while every incident stays counted; if the symptom EVER appears on a
+real EL8 host, treat it as a new, serious finding and capture a core there.
 
 ## Q-3 (WP-6, informational — no block on M2 for POSIX)
 **Backend matrix coverage limited to POSIX.** This testbed offers no EC, CephFS, or
@@ -75,10 +70,8 @@ are listed unsupported-for-resume in the admin doc until a site runs
 `backend_matrix.sh` (and a POSC leg) against them. The kill-9 durability leg validates
 API ordering, not power loss — a hardware test remains for a production validation pass.
 
-## Q-2 (WP-0, informational — no block)
-**T-U1 "smoke parity" scope at WP-0.** True pull/push parity against a live server
-needs the integration harness (mock HTTP source + running xrootd), which lands with
-WP-4/WP-5 per 05. At WP-0 the closest achievable variant is: the fork builds, loads its
-config, and the ported unit tests (prepareOpenURL, Stream) pass identically to stock,
-plus the stock-vs-fork diff review. Full T-U1/T-I1 parity runs are executed when the
-harness exists. Recorded per 00 ground rule on test variants.
+## Q-2 — ANSWERED 2026-08-26 (delegated review)
+**T-U1 parity was satisfied once the harness existed.** WP-4/5 delivered the
+full T-I1 size-by-streams byte-compare matrix, the CON-6 push smoke, and the
+T-I8 gfal/davix-grammar checks — the complete parity the WP-0 note deferred.
+

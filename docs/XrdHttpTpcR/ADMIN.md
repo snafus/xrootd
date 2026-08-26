@@ -70,7 +70,7 @@ fast, FR-30). Sizes accept `k`/`m`/`g` (powers of 1024); durations accept
 
 | Directive | Default | Valid range | Meaning |
 |---|---|---|---|
-| `tpcr.blocksize` | `16m` | `[1m, 1g]` | Range/block size for pull transfers and the slab size of the global buffer pool. |
+| `tpcr.blocksize` | `16m` | `[1m, 1g]` | Range/block size for pull transfers and the slab size of the global buffer pool. Applies to `streams=1` too (one scheduler path for every pull), so single-stream transfers issue more, smaller source requests than stock did — visible only in source-side logs. |
 | `tpcr.mempool.max` | `4g` | any size | Server-global byte budget of the slab pool. Transfers beyond the budget fall back to window-bounded private buffers, so this bounds *pooled* memory, not correctness. |
 | `tpcr.streams.max` | `16` | `[1, 1024]` | Cap on the client's `X-Number-Of-Streams`. Higher requests are clamped (logged as `STREAMS_CLAMPED`), never rejected. |
 | `tpcr.window.bytes` | `256m` | `[1m, 64g]` | Reorder/admission window: ranges are only scheduled within `[committed, committed + window]`, bounding per-transfer buffering and re-fetch after a crash. |
@@ -83,7 +83,7 @@ fast, FR-30). Sizes accept `k`/`m`/`g` (powers of 1024); durations accept
 | `tpcr.validators.require` | `strong` | `strong` \| `length-only` | Resume validator policy. `strong` refuses to resume when the source offers neither a digest, strong ETag, nor Last-Modified. `length-only` is for known-immutable sources only. |
 | `tpcr.gc.age` | `24h` | `>= 10s` | Lazy GC: a journal older than this is discarded by the next COPY that encounters it. Tune to your orchestrator's retry horizon. |
 | `tpcr.verify.tailbytes` | `1g` | any size | On resume, re-read and CRC-verify this many bytes below the watermark against the journal's epoch digests. `0` disables — see the multi-tenant warning. |
-| `tpcr.recovery.maxsecs` | `120` | `[5s, 24h]` | Degraded-state budget: seconds of zero commit progress the handler may ride through a total source outage before admitting failure. Keep **below** your orchestrator's marker-stall timeout. |
+| `tpcr.recovery.maxsecs` | `120` | `[5s, 24h]` | Degraded-state budget: seconds of zero commit progress the handler may ride through a total source outage before admitting failure. Keep **below** your orchestrator's marker-stall timeout. (Subsumes the architecture draft's `tpcr.retry.budget`, which does not exist.) |
 
 ## Cross-session resume: deployment prerequisites
 
@@ -102,6 +102,12 @@ both the partial file and its journal are visible:
   when a session dies, which deletes exactly the file resume needs. TPCR logs
   a startup warning when POSC is active; resume will always take the
   fresh-transfer path there. Choose one: POSC or resume.
+- **Token scopes:** the resume reopen authorizes as a plain write/update on
+  the destination (this tree's OFS maps create-mode opens to `O_EXCL`,
+  which would refuse the partial). A client whose token carries *only*
+  create scope cannot resume — the transfer safely falls back to a fresh
+  copy, which that token does authorize. Issue write/update-scoped tokens
+  where resume matters.
 - A dead session's journal holds a **lease** for 2x `tpcr.checkpoint.secs`.
   A retry inside that window gets `409 + Retry-After` and self-heals on the
   next attempt; orchestrator retry backoffs longer than ~2 minutes (at

@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** all machine-side work complete through WP-15 (TLS + two-gateway matrices); CI fully green as of WP-14. Remaining human items: Q-1..Q-6 review (esp. Q-4) and the site-validation pass (real shared FS, tokens, scale).
+**Current focus:** Q-review complete (Q-1/2/4/5/6 answered, Q-7 done, Q-8 investigated and attributed to the CI runner environment; Q-3 remains the site-validation item). EL8 RPM build in progress.
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|

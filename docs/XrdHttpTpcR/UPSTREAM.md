@@ -56,6 +56,17 @@ re-probe, or key the decision on the fresh response only. Found while
 implementing degraded-state recovery; fixed in TPCR's
 `ProbeSourceValidators`.
 
+## 6. Core enhancement candidate: a create-or-open-existing SFS open mode
+
+Not a bug — a gap TPCR works around. `XrdOfs` maps `SFS_O_CREAT` to
+`O_CREAT|O_EXCL` unconditionally (`XrdOfs.cc`), so no SFS open mode means
+"create if missing, open if present, never truncate" — exactly what a
+resume-style reopen wants, and what FR-20's "no O_EXCL semantics" asked
+for. TPCR resumes with plain `SFS_O_WRONLY` instead, which shifts the
+required authorization from create-scope to write/update-scope (see
+ADMIN.md). An upstream `SFS_O_MAYCREATE` (or an `SFS_O_CREAT` variant
+without EXCL) would let resumable writers accept create-scoped tokens.
+
 ## Not proposed upstream
 
 BUG-7 (occupancy-based admission deadlock), BUG-8 (dead
