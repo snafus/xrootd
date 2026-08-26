@@ -1,3 +1,6 @@
+# NB: the --with git version path derives Version from `git describe`; the
+# repository must carry the annotated v6.1.1 tag or the computed major
+# version (and thus the -N plugin suffix in %files) will be wrong.
 %bcond_with    asan
 %bcond_with    ceph
 %bcond_with    clang
