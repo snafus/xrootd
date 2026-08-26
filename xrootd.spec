@@ -443,7 +443,15 @@ install -m 644 -p config/%{name}.pp \
 %ldconfig_scriptlets server-libs
 
 %pre server
+%if 0%{?sysusers_create_compat:1}
 %sysusers_create_compat %(tar -z -x -f %{SOURCE0} --no-anchored xrootd-sysusers.conf -O > /tmp/xrootd-sysusers.conf && echo /tmp/xrootd-sysusers.conf)
+%else
+# EL8 lacks the sysusers rpm macros; create the runtime user directly.
+getent group xrootd >/dev/null || groupadd -r xrootd
+getent passwd xrootd >/dev/null || \
+    useradd -r -g xrootd -s /sbin/nologin \
+        -d %{_localstatedir}/spool/xrootd -c "XRootD runtime user" xrootd
+%endif
 
 %post server
 
