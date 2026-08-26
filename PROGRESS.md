@@ -1,6 +1,6 @@
 # TPCR Progress
 
-**Current focus:** Q-review complete (Q-1/2/4/5/6 answered, Q-7 done, Q-8 investigated and attributed to the CI runner environment; Q-3 remains the site-validation item). EL8 RPM build in progress.
+**Current focus:** Q-review complete (Q-1/2/4/5/6 answered, Q-7 done, Q-8 investigated and attributed to the CI runner environment; Q-3 remains the site-validation item). Rocky/Alma 8 RPM set built, install-smoked, and exported to rpms-el8/ (13 MB incl. SRPM).
 
 | WP | Status | Commit(s) | Tests passing | Notes |
 |----|--------|-----------|---------------|-------|
