@@ -29,7 +29,7 @@ public:
         errWrite   = 1,  // Failure while writing the received data to the local file.
         errFlush   = 2,  // Failure while flushing the local file.
         errClose   = 3,  // Failure while closing the local file.
-        errRange   = 4,  // The source did not answer with the range that was requested.
+        errRange   = 4,  // The source did not answer with the range that was requested, or not with all of it.
         errTimeout = 10  // The transfer did not make any progress within the timeout.
     };
 
@@ -98,6 +98,12 @@ public:
     ~State();
 
     void SetTransferParameters(off_t offset, size_t size);
+
+    // To be called when a request has completed without a transport error:
+    // checks that the body filled the range that was requested, and records
+    // the error otherwise.  libcurl cannot tell when the body carries no
+    // length of its own (chunked encoding).
+    bool CheckRangeComplete();
 
     void SetupHeaders(XrdHttpExtReq &req);
 

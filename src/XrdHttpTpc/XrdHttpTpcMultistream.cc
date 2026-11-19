@@ -63,7 +63,7 @@ public:
 
     CURLM *Get() const {return m_handle;}
 
-    void FinishCurlXfer(CURL *curl) {
+    void FinishCurlXfer(CURL *curl, CURLcode result) {
         CURLMcode mres = curl_multi_remove_handle(m_handle, curl);
         if (mres) {
             std::stringstream ss;
@@ -76,6 +76,10 @@ public:
              state_iter++) {
             if (curl == (*state_iter)->GetHandle()) {
                 m_bytes_transferred += (*state_iter)->BytesTransferred();
+                if (result == CURLE_OK) {
+                    // Complete as far as libcurl can tell; count the bytes.
+                    (*state_iter)->CheckRangeComplete();
+                }
                 int error_code = (*state_iter)->GetErrorCode();
                 if (error_code && !m_error_code) {
                     m_error_code = error_code;
@@ -380,13 +384,18 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
             if (msg && (msg->msg == CURLMSG_DONE)) {
                 CURL *easy_handle = msg->easy_handle;
                 res = msg->data.result;
-                mch.FinishCurlXfer(easy_handle);
+                mch.FinishCurlXfer(easy_handle, res);
                 // If any requests fail, cut off the entire transfer.
-                if (res != CURLE_OK) {
+                if (res != CURLE_OK || mch.GetErrorCode() == State::errRange) {
                     break;
                 }
             }
         } while (msg);
+        if (mch.GetErrorCode() == State::errRange) {
+            logTransferEvent(LogMask::Debug, rec, "MULTISTREAM_RANGE_FAILURE",
+                "Breaking loop: " + mch.GetErrorMessage());
+            break;
+        }
         if (res != static_cast<CURLcode>(-1) && res != CURLE_OK) {
             std::stringstream ss;
             ss << "Breaking loop due to failed curl transfer: " << curl_easy_strerror(res);
@@ -442,7 +451,7 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
         msg = curl_multi_info_read(multi_handle, &msgq);
         if (msg && (msg->msg == CURLMSG_DONE)) {
             CURL *easy_handle = msg->easy_handle;
-            mch.FinishCurlXfer(easy_handle);
+            mch.FinishCurlXfer(easy_handle, msg->data.result);
             if (res == CURLE_OK || res == static_cast<CURLcode>(-1))
                 res = msg->data.result;  // Transfer result will be examined below.
         }

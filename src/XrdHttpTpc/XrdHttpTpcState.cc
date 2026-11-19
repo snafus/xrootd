@@ -341,7 +341,30 @@ size_t State::PushRespCB(void *buffer, size_t size, size_t nitems, void *userdat
   return size*nitems;
 }
 
+bool State::CheckRangeComplete() {
+    if (m_push || m_range_length < 0 || m_error_code || m_offset == m_range_length
+        || m_status_code < 200 || m_status_code >= 300) {
+        return true;
+    }
+    std::stringstream ss;
+    ss << "The source sent " << m_offset << " bytes for the range bytes " << m_start_offset
+       << "-" << (m_start_offset + m_range_length - 1) << ", which is " << m_range_length
+       << " bytes long";
+    m_error_buf = ss.str();
+    m_error_code = errRange;
+    return false;
+}
+
 ssize_t State::Write(char *buffer, size_t size) {
+    if (m_range_length >= 0 && m_offset + static_cast<off_t>(size) > m_range_length) {
+        // Never write past the end of the range: these bytes belong to another request.
+        std::stringstream ss;
+        ss << "The source sent more than " << m_range_length << " bytes for the range bytes "
+           << m_start_offset << "-" << (m_start_offset + m_range_length - 1);
+        m_error_buf = ss.str();
+        m_error_code = errRange;
+        return -1;
+    }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
     if (retval == SFS_ERROR) {
         m_error_buf = m_stream->GetErrorMessage();
