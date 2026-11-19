@@ -45,6 +45,12 @@ teardown() {
 	assert_equal "$(cat xrootd_dst/file_dst_overwrite)" 'source content'
 }
 
+@test "pull copy with several streams transfers an empty file" {
+	: > xrootd_src/file_empty
+	run -0 xrdcp --streams 4 -T only http://${XROOTD_SRC}//file_empty http://${XROOTD_DST}//file_dst
+	[[ -f xrootd_dst/file_dst && ! -s xrootd_dst/file_dst ]]
+}
+
 @test "push copy writes the source content to the destination" {
 	run -0 xrdcp -T push only http://${XROOTD_SRC}//file_src http://${XROOTD_DST}//file_dst
 	assert_equal "$(cat xrootd_dst/file_dst)" 'source content'

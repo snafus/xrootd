@@ -1284,6 +1284,13 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
             return 0;
         }
     }
+    if (streams > 1 && sourceFileContentLength == 0) {
+        // An empty file has no range to hand out to the streams: the
+        // multistream code would run no request at all and report an internal
+        // error. Pull it with the single request instead.
+        streams = 1;
+        rec.streams = streams;
+    }
     int open_result = OpenWaitStall(*fh, full_url, mode|SFS_O_WRONLY,
                                     0644 | SFS_O_MKPTH,
                                     req.GetSecEntity(), authz);
