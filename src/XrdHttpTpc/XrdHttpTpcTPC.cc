@@ -1264,6 +1264,8 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
         return req.SendSimpleResp(rec.status, NULL, NULL, generateClientErr(ss, rec).c_str(), 0);
     }
     uint64_t sourceFileContentLength = 0;
+    // False if the source answered the HEAD request without a Content-Length
+    bool sourceFileContentLengthKnown = false;
     {
         //Get the content-length of the source file and pass it to the OSS layer
         //during the open
@@ -1274,7 +1276,10 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
         if(success) {
             //In the case we cannot get the information from the source server (offline or other error)
             //we just don't add the file information to the opaque of the local file to open
-            full_url += "&oss.asize=" + std::to_string(sourceFileContentLength);
+            sourceFileContentLengthKnown = static_cast<int64_t>(sourceFileContentLength) >= 0;
+            if (sourceFileContentLengthKnown) {
+                full_url += "&oss.asize=" + std::to_string(sourceFileContentLength);
+            }
             mismatchDigests = mismatchReprDigest(sourceFileReprDigest,req,rec);
         }
         if(!success || mismatchDigests) {
@@ -1284,10 +1289,11 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
             return 0;
         }
     }
-    if (streams > 1 && sourceFileContentLength == 0) {
+    if (streams > 1 && (sourceFileContentLength == 0 || !sourceFileContentLengthKnown)) {
         // An empty file has no range to hand out to the streams: the
         // multistream code would run no request at all and report an internal
-        // error. Pull it with the single request instead.
+        // error. A file of unknown size cannot be cut into ranges either.
+        // Pull both with the single request instead.
         streams = 1;
         rec.streams = streams;
     }
