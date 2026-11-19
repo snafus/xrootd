@@ -484,9 +484,10 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
         logTransferEvent(LogMask::Error, rec, "MULTISTREAM_FAIL", ss2.str());
         ss2 << flushErrorSuffix;
         ss << generateClientErr(ss2, rec);
-    } else if (mch.GetErrorCode() == State::errTimeout) {
-        // The stall detector fired; its message already describes precisely
-        // what happened, report it as-is.
+    } else if (mch.GetErrorCode() == State::errTimeout || mch.GetErrorCode() == State::errRange) {
+        // The stall detector fired, or the source answered a range request
+        // with something else than that range; the message already describes
+        // precisely what happened, report it as-is.
         std::stringstream ss2;
         ss2 << mch.GetErrorMessage();
         logTransferEvent(LogMask::Error, rec, "MULTISTREAM_FAIL", ss2.str());
