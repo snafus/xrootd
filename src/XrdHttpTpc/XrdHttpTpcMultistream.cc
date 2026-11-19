@@ -292,7 +292,13 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
     handles.push_back(new State());
     handles[0]->Move(state);
     for (size_t idx = 1; idx < concurrency; idx++) {
-        handles.push_back(handles[0]->Duplicate());
+        // The response to the client is not started yet: report a failure as a
+        // setup error, which is answered with a complete response.
+        try {
+            handles.push_back(handles[0]->Duplicate());
+        } catch (std::runtime_error &e) {
+            throw CurlHandlerSetupError(e.what());
+        }
         curl_handles.emplace_back(handles.back()->GetHandle());
     }
 
