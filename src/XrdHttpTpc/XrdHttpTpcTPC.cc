@@ -758,12 +758,20 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vecto
     ss << "Stripe Bytes Transferred: " << bytes_transferred << crlf;
     ss << "Total Stripe Count: 1" << crlf;
     // Build a list of TCP connections associated with this transfer; used by
-    // the TPC client for monitoring purposes.
+    // the TPC client for monitoring purposes.  There are many more request
+    // handles than connections, and a handle keeps reporting the connection it
+    // used last, even once another handle uses it or it is closed.  Only the
+    // handles with a request under way are asked: one of them holds each
+    // connection in use, and the ones still waiting for a connection report
+    // nothing.
     bool first = true;
     std::stringstream ss2;
     for (std::vector<State*>::const_iterator iter = state.begin();
         iter != state.end(); iter++)
     {
+        if (!(*iter)->RangeInProgress()) {
+            continue;
+        }
         std::string desc = (*iter)->GetConnectionDescription();
         if (!desc.empty()) {
             ss2 << (first ? "" : ",") << desc;

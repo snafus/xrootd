@@ -99,6 +99,9 @@ public:
 
     void SetTransferParameters(off_t offset, size_t size);
 
+    // Whether a range request is under way on this handle.
+    bool RangeInProgress() const {return m_range_length >= 0;}
+
     // To be called when a request has completed without a transport error:
     // checks that the body filled the range that was requested, and records
     // the error otherwise.  libcurl cannot tell when the body carries no
