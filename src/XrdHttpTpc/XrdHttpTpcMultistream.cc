@@ -680,16 +680,26 @@ void StreamThread(State *state, ThreadedPull *pull)
         while (pull->NextBlock(offset, size)) {
             state->SetTransferParameters(offset, size);
             CURLcode result = curl_easy_perform(state->GetHandle());
+            bool flushed = true;
             if (result == CURLE_OK) {
                 // Write the last, short part of the block, then count the bytes.
-                state->FlushWriteBuffer();
+                flushed = state->FlushWriteBuffer();
                 state->CheckRangeComplete();
             }
             int error = state->GetErrorCode();
             int status = state->GetStatusCode();
-            if (result == CURLE_ABORTED_BY_CALLBACK && !error && pull->stop.load()) {
+            if (!error && pull->stop.load()
+                && (result == CURLE_ABORTED_BY_CALLBACK || result == CURLE_WRITE_ERROR || !flushed)) {
                 // Stopped because of a failure elsewhere, which is already
-                // recorded: this is not a cause.
+                // recorded: this is not a cause.  The stop is seen by the
+                // progress callback, or before a write to the file, which
+                // then is not made and ends the transfer with a write error.
+                break;
+            }
+            if (!flushed && !error) {
+                // Not reachable as the code stands; a block whose end was not
+                // written must never count as done.
+                pull->Fail(errStreamInternal, 0, CURLE_OK, "The end of a block was not written to the file");
                 break;
             }
             // A block is only done after an answer of the 2xx class.  libcurl
@@ -725,6 +735,8 @@ struct StreamJoiner {
         }
         for (State *handle : handles) {
             handle->SetCounters(nullptr, nullptr);
+            handle->SetStopFlag(nullptr);
+            curl_easy_setopt(handle->GetHandle(), CURLOPT_XFERINFOFUNCTION, NULL);
             curl_easy_setopt(handle->GetHandle(), CURLOPT_NOPROGRESS, 1L);
             curl_easy_setopt(handle->GetHandle(), CURLOPT_XFERINFODATA, NULL);
         }
@@ -782,6 +794,7 @@ int TPCHandler::RunBlocksWithThreads(XrdHttpExtReq &req, State &state,
 
     for (State *handle : handles) {
         handle->SetCounters(&pull.received, &pull.written);
+        handle->SetStopFlag(&pull.stop);
         curl_easy_setopt(handle->GetHandle(), CURLOPT_XFERINFOFUNCTION, StopCallback);
         curl_easy_setopt(handle->GetHandle(), CURLOPT_XFERINFODATA, &pull);
         curl_easy_setopt(handle->GetHandle(), CURLOPT_NOPROGRESS, 0L);

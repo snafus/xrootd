@@ -419,6 +419,12 @@ ssize_t State::Write(char *buffer, size_t size) {
 
 bool State::FlushWriteBuffer() {
     if (m_wbuf.empty()) {return true;}
+    if (m_stop && m_stop->load(std::memory_order_relaxed)) {
+        // The pull is being stopped because of a failure that is already
+        // recorded; this is not a cause, and nothing more is written.
+        m_wbuf.clear();
+        return false;
+    }
     std::string error;
     ssize_t retval = m_stream->WriteAt(m_wbuf_offset, m_wbuf.data(), m_wbuf.size(), error);
     bool ok = retval == static_cast<ssize_t>(m_wbuf.size());

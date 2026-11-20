@@ -151,6 +151,11 @@ public:
         m_written = written;
     }
 
+    // EXPERIMENT: a flag, shared by the streams of a pull, that tells them to
+    // stop.  Looked at before each write to the file, so that a stream that
+    // is stopping does not queue for the storage first.
+    void SetStopFlag(const std::atomic<bool> *stop) {m_stop = stop;}
+
     CURL *GetHandle() const {return m_curl;}
 
     int AvailableBuffers() const;
@@ -231,6 +236,7 @@ private:
     off_t m_wbuf_offset{0};  // EXPERIMENT: offset in the file of the first byte of m_wbuf.
     std::atomic<off_t> *m_received{nullptr};  // EXPERIMENT: see SetCounters().
     std::atomic<off_t> *m_written{nullptr};  // EXPERIMENT: see SetCounters().
+    const std::atomic<bool> *m_stop{nullptr};  // EXPERIMENT: see SetStopFlag().
     int m_status_code;  // status code from HTTP response.
     int m_error_code; // error code from underlying stream operations.
     off_t m_content_length;  // value of Content-Length header, if we received one.
