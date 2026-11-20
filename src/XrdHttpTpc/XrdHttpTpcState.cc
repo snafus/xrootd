@@ -422,6 +422,7 @@ bool State::FlushWriteBuffer() {
     std::string error;
     ssize_t retval = m_stream->WriteAt(m_wbuf_offset, m_wbuf.data(), m_wbuf.size(), error);
     bool ok = retval == static_cast<ssize_t>(m_wbuf.size());
+    if (ok && m_written) {m_written->fetch_add(retval, std::memory_order_relaxed);}
     m_wbuf.clear();
     if (!ok) {
         m_error_buf = error.empty() ? "Short write to the file" : error;

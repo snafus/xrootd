@@ -143,9 +143,13 @@ public:
     // the file, at the offset it belongs to.  Returns false on a write error.
     bool FlushWriteBuffer();
 
-    // EXPERIMENT: a counter, shared by the streams of a pull, of the bytes
-    // received from the source.  Read by another thread while this one counts.
-    void SetReceivedCounter(std::atomic<off_t> *counter) {m_received = counter;}
+    // EXPERIMENT: counters, shared by the streams of a pull, of the bytes
+    // received from the source and of the bytes written to the file.  Read by
+    // another thread while this one counts.
+    void SetCounters(std::atomic<off_t> *received, std::atomic<off_t> *written) {
+        m_received = received;
+        m_written = written;
+    }
 
     CURL *GetHandle() const {return m_curl;}
 
@@ -225,7 +229,8 @@ private:
     off_t m_start_offset;  // offset where we started in the file.
     std::vector<char> m_wbuf;  // EXPERIMENT: data collected for the next write.
     off_t m_wbuf_offset{0};  // EXPERIMENT: offset in the file of the first byte of m_wbuf.
-    std::atomic<off_t> *m_received{nullptr};  // EXPERIMENT: see SetReceivedCounter().
+    std::atomic<off_t> *m_received{nullptr};  // EXPERIMENT: see SetCounters().
+    std::atomic<off_t> *m_written{nullptr};  // EXPERIMENT: see SetCounters().
     int m_status_code;  // status code from HTTP response.
     int m_error_code; // error code from underlying stream operations.
     off_t m_content_length;  // value of Content-Length header, if we received one.

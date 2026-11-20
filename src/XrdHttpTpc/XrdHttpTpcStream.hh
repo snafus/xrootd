@@ -92,7 +92,9 @@ public:
     // text of an error to its caller and does not keep it.  With the write
     // lock the streams write one at a time: the file object keeps the text of
     // an error in one place, and when the storage fills up every stream fails
-    // at the same moment.
+    // at the same moment.  Without the lock (a switch for measurement only)
+    // that text can be mixed up between two failing writes, and the file
+    // object is written to concurrently, which it is not fully safe for.
     void SetDirectWriteSize(size_t size) {m_direct_write_size = size;}
     size_t DirectWriteSize() const {return m_direct_write_size;}
     void SetWriteLock(bool lock) {m_lock_writes = lock;}

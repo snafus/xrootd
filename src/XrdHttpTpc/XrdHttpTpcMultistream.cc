@@ -616,15 +616,17 @@ struct ThreadedPull {
         return true;
     }
 
-    // Records the first failure and tells every stream to stop.
-    void Fail(int error, int status, CURLcode result, const std::string &message) {
+    // Records the first failure and tells every stream to stop.  It is called
+    // from catch blocks too and must not throw: the text is the one thing in
+    // it that can, and a failure without its text is still a failure.
+    void Fail(int error, int status, CURLcode result, const std::string &message) noexcept {
         std::lock_guard<std::mutex> lock(mtx);
         if (!failed) {
             failed = true;
             error_code = error;
             status_code = status;
             curl_result = result;
-            error_message = message;
+            try {error_message = message;} catch (...) {}
         }
         stop.store(true);
     }
@@ -658,6 +660,7 @@ struct ThreadedPull {
     std::condition_variable ended;   // a stream thread has ended
     std::atomic<bool> stop{false};   // every stream is to stop
     std::atomic<off_t> received{0};  // bytes received from the source by all the streams
+    std::atomic<off_t> written{0};   // bytes written to the file by all the streams
 };
 
 // The progress callback of libcurl: the only way to end a transfer from
@@ -689,17 +692,21 @@ void StreamThread(State *state, ThreadedPull *pull)
                 // recorded: this is not a cause.
                 break;
             }
-            if (error || status >= 400 || result != CURLE_OK) {
-                pull->Fail(error, status >= 400 ? status : 0, result, state->GetErrorMessage());
+            // A block is only done after an answer of the 2xx class.  libcurl
+            // also returns CURLE_OK for a final answer such as 304, or a
+            // redirection without a Location, which carries no part of the file.
+            const bool wrong_status = (result == CURLE_OK) && (status < 200 || status >= 300);
+            if (error || status >= 400 || wrong_status || result != CURLE_OK) {
+                pull->Fail(error, (status >= 400 || wrong_status) ? status : 0, result, state->GetErrorMessage());
                 break;
             }
             pull->BlockDone();
             state->ResetAfterRequest();
         }
-    } catch (std::exception &e) {
-        pull->Fail(errStreamInternal, 0, CURLE_OK, std::string("Internal error in a stream: ") + e.what());
     } catch (...) {
-        pull->Fail(errStreamInternal, 0, CURLE_OK, "Internal error in a stream");
+        // No text is built here: building one may throw again, and an
+        // exception that leaves a thread ends the server.
+        pull->Fail(errStreamInternal, 0, CURLE_OK, std::string());
     }
     pull->StreamEnded();
 }
@@ -717,7 +724,7 @@ struct StreamJoiner {
             if (thread.joinable()) {thread.join();}
         }
         for (State *handle : handles) {
-            handle->SetReceivedCounter(nullptr);
+            handle->SetCounters(nullptr, nullptr);
             curl_easy_setopt(handle->GetHandle(), CURLOPT_NOPROGRESS, 1L);
             curl_easy_setopt(handle->GetHandle(), CURLOPT_XFERINFODATA, NULL);
         }
@@ -774,7 +781,7 @@ int TPCHandler::RunBlocksWithThreads(XrdHttpExtReq &req, State &state,
     StreamJoiner joiner{pull, threads, handles};
 
     for (State *handle : handles) {
-        handle->SetReceivedCounter(&pull.received);
+        handle->SetCounters(&pull.received, &pull.written);
         curl_easy_setopt(handle->GetHandle(), CURLOPT_XFERINFOFUNCTION, StopCallback);
         curl_easy_setopt(handle->GetHandle(), CURLOPT_XFERINFODATA, &pull);
         curl_easy_setopt(handle->GetHandle(), CURLOPT_NOPROGRESS, 0L);
@@ -804,10 +811,15 @@ int TPCHandler::RunBlocksWithThreads(XrdHttpExtReq &req, State &state,
     }
 
     // The thread of the request: markers to the client and the stall detector.
+    // Progress is bytes received plus bytes written: when every byte has
+    // arrived and a slow storage is still taking the last writes, the pull is
+    // not stalled.
     time_t last_marker = 0;
     off_t last_advance_bytes = 0;
     time_t last_advance_time = time(NULL);
     const time_t transfer_start = last_advance_time;
+    time_t stop_time = 0;
+    bool stop_reported = false;
     bool client_gone = false;
     while (true) {
         {
@@ -823,9 +835,23 @@ int TPCHandler::RunBlocksWithThreads(XrdHttpExtReq &req, State &state,
         }
         const time_t now = time(NULL);
         const off_t received = pull.received.load();
-        if (received > last_advance_bytes) {
-            last_advance_bytes = received;
+        const off_t progress = received + pull.written.load();
+        if (progress > last_advance_bytes) {
+            last_advance_bytes = progress;
             last_advance_time = now;
+        }
+        if (pull.stop.load()) {
+            // A failure is recorded and the streams are stopping.  A stream
+            // inside a write to the storage cannot be interrupted, and this
+            // thread must wait for it.  No marker is sent meanwhile: a client
+            // that watches for markers must not take the pull for alive.
+            if (!stop_time) {stop_time = now;}
+            if (!stop_reported && now > stop_time + m_timeout) {
+                logTransferEvent(LogMask::Error, rec, "MULTISTREAM_EXPERIMENT",
+                    "The streams have not stopped; a write to the storage may be hanging");
+                stop_reported = true;
+            }
+            continue;
         }
         if (now >= last_marker + m_marker_period) {
             if (SendPerfMarker(req, rec, handles, received)) {
@@ -861,7 +887,7 @@ int TPCHandler::RunBlocksWithThreads(XrdHttpExtReq &req, State &state,
 
     std::stringstream ss;
     bool success = false;
-    if (pull.failed && pull.status_code >= 400) {
+    if (pull.failed && pull.status_code != 0) {
         std::string err = pull.error_message;
         std::stringstream ss2;
         ss2 << "Remote side failed with status code " << pull.status_code;
@@ -874,7 +900,7 @@ int TPCHandler::RunBlocksWithThreads(XrdHttpExtReq &req, State &state,
     } else if (pull.failed && (pull.error_code == State::errTimeout || pull.error_code == State::errRange
                                || pull.error_code == errStreamInternal)) {
         std::stringstream ss2;
-        ss2 << pull.error_message;
+        ss2 << (pull.error_message.empty() ? "Internal error in a stream" : pull.error_message);
         logTransferEvent(LogMask::Error, rec, "MULTISTREAM_FAIL", ss2.str());
         ss << generateClientErr(ss2, rec);
     } else if (pull.failed && pull.error_code) {

@@ -217,8 +217,9 @@ ssize_t Stream::WriteAt(off_t offset, const char *buf, size_t size, std::string 
     if (m_lock_writes) {lock.lock();}
     ssize_t retval = m_fh->write(offset, buf, size);
     if (retval == SFS_ERROR) {
-        // The text is in the one error object of the file: read it under the
-        // lock even when the writes themselves are not serialised.
+        // The text is in the one error object of the file.  Without the write
+        // lock another failing write may be changing it at this moment; the
+        // lock taken here only keeps two readers apart.
         if (!lock.owns_lock()) {lock.lock();}
         std::stringstream ss;
         const char *msg = m_fh->error.getErrText();
