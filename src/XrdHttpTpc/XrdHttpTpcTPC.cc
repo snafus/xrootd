@@ -1251,6 +1251,11 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
     if (query_header != req.headers.end()) {
         redirect_resource = query_header->second;
     }
+    if (Experiment::CurlBufferSize()) {
+        // EXPERIMENT: larger pieces from libcurl; the handles of a multistream
+        // pull are copies of this one and inherit the setting.
+        curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, Experiment::CurlBufferSize());
+    }
     XrdSfsFileOpenMode mode = SFS_O_CREAT;
     auto overwrite_header = XrdOucTUtils::caseInsensitiveFind(req.headers,"overwrite");
     if ((overwrite_header == req.headers.end()) || (overwrite_header->second == "T")) {

@@ -15,6 +15,10 @@
  *                          auto: one block per stream (file size / streams).
  *   XRD_TPC_EXP_WRITE_MIB  size of each write to the file in the block-write
  *                          model (default 16).
+ *   XRD_TPC_EXP_CURL_BUFFER_KIB
+ *                          size of the buffer libcurl receives into, and so the
+ *                          largest piece it hands over at a time, in KiB.  Unset
+ *                          or 0: the default of libcurl (16).  Any pull.
  */
 
 #include <cstdlib>
@@ -31,6 +35,13 @@ inline size_t WriteSize() {
     const char *val = getenv("XRD_TPC_EXP_WRITE_MIB");
     long long mib = (val && *val) ? atoll(val) : 16;
     return static_cast<size_t>((mib > 0 ? mib : 16) * MiB);
+}
+
+// Size of the receive buffer of libcurl in bytes; 0 to leave its default.
+inline long CurlBufferSize() {
+    const char *val = getenv("XRD_TPC_EXP_CURL_BUFFER_KIB");
+    long kib = (val && *val) ? atol(val) : 0;
+    return kib > 0 ? kib * 1024 : 0;
 }
 
 // Whether the block-write model is selected.
