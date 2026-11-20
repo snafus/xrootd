@@ -1,7 +1,9 @@
 #ifndef XRD_HTTP_TPC_TPC_HH
 #define XRD_HTTP_TPC_TPC_HH
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <sys/time.h>
@@ -92,9 +94,9 @@ private:
         timeval     begT;
         off_t bytes_transferred;
         int status;
-        int tpc_status;
+        std::atomic<int> tpc_status;  // EXPERIMENT: also set by the socket callbacks, from the thread of a stream
         unsigned int streams;
-        bool isIPv6;
+        std::atomic<bool> isIPv6;  // EXPERIMENT: as tpc_status
         bool allow_local;
         bool allow_private;
         XrdHttpExtReq & mReq;
@@ -103,6 +105,9 @@ private:
         // with the description of its peer used in a performance marker.
         // Kept by the socket callbacks, which run in the thread of the request.
         std::map<int, std::string> connections;
+        // EXPERIMENT: protects connections, which the socket callbacks change
+        // from the thread of each stream.
+        std::mutex mtx;
         XrdSysError * m_log;
         TpcType mTpcType;
     };
@@ -151,6 +156,11 @@ private:
     // Experimental multi-stream version of RunCurlWithUpdates
     int RunCurlWithStreams(XrdHttpExtReq &req, TPC::State &state,
                            size_t streams, TPCLogRecord &rec);
+    // EXPERIMENT: the block-write model with one thread for each stream.
+    int RunBlocksWithThreads(XrdHttpExtReq &req, TPC::State &state,
+                          size_t streams, std::vector<TPC::State*> &handles,
+                          std::vector<ManagedCurlHandle> &curl_handles,
+                          TPCLogRecord &rec);
     int RunCurlWithStreamsImpl(XrdHttpExtReq &req, TPC::State &state,
                            size_t streams, std::vector<TPC::State*> &streams_handles,
                            std::vector<ManagedCurlHandle> &curl_handles,

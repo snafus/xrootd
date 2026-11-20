@@ -168,6 +168,8 @@ int TPCHandler::opensocket_callback(void *clientp,
 
   // Remember the connection for the performance markers.  The HTTP-TPC
   // specification wants tcp:1.2.3.4:1094 and tcp:[2001:db8::1]:1094.
+  // This is a callback of libcurl, which is C: nothing may be thrown through it.
+  try {
   char ip[INET6_ADDRSTRLEN];
   std::stringstream desc;
   if (aInfo->addr.sa_family == AF_INET) {
@@ -179,7 +181,13 @@ int TPCHandler::opensocket_callback(void *clientp,
     if (inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)))
       desc << "tcp:[" << ip << "]:" << ntohs(sin6->sin6_port);
   }
-  rec->connections[fd] = desc.str();
+  {
+    std::lock_guard<std::mutex> lock(rec->mtx);
+    rec->connections[fd] = desc.str();
+  }
+  } catch (...) {
+    // Without its entry the connection is only missing from the markers.
+  }
 
   return fd;
 }
@@ -191,7 +199,10 @@ int TPCHandler::closesocket_callback(void *clientp, curl_socket_t fd) {
   // Otherwise, we would lose the socket usage information if the socket is closed before
   // the PMark handle is closed.
   rec->pmarkManager.endPmark(fd);
-  rec->connections.erase(fd);
+  {
+    std::lock_guard<std::mutex> lock(rec->mtx);
+    rec->connections.erase(fd);
+  }
 
   return close(fd);
 }
@@ -785,6 +796,7 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vecto
     // transfer, as recorded by the socket callbacks.
     bool first = true;
     std::stringstream ss2;
+    std::unique_lock<std::mutex> connections_lock(rec.mtx);
     for (std::map<int, std::string>::const_iterator iter = rec.connections.begin();
         iter != rec.connections.end(); iter++)
     {
@@ -793,6 +805,7 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vecto
             first = false;
         }
     }
+    connections_lock.unlock();
     if (!first)
         ss << "RemoteConnections: " << ss2.str() << crlf;
     ss << "End" << crlf;
@@ -1348,6 +1361,7 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
     if (streams > 1 && Experiment::BlockWrites()) {
         // EXPERIMENT: the streams write at their own offsets.
         stream.SetDirectWriteSize(Experiment::WriteSize());
+        stream.SetWriteLock(Experiment::WriteLock());
     }
     State state(0, stream, curl, false, req.tpcForwardCreds);
     state.SetupHeaders(req);

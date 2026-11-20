@@ -10,6 +10,7 @@
 #include "XrdSfs/XrdSfsInterface.hh"
 
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -86,9 +87,16 @@ public:
     // EXPERIMENT: block-write model.  Once a write size is set, the states do
     // not use Write() and its reorder buffers; each collects its own data and
     // writes it at its own offset with WriteAt().
+    //
+    // WriteAt() may be called from the thread of each stream.  It gives the
+    // text of an error to its caller and does not keep it.  With the write
+    // lock the streams write one at a time: the file object keeps the text of
+    // an error in one place, and when the storage fills up every stream fails
+    // at the same moment.
     void SetDirectWriteSize(size_t size) {m_direct_write_size = size;}
     size_t DirectWriteSize() const {return m_direct_write_size;}
-    ssize_t WriteAt(off_t offset, const char *buffer, size_t size);
+    void SetWriteLock(bool lock) {m_lock_writes = lock;}
+    ssize_t WriteAt(off_t offset, const char *buffer, size_t size, std::string &error);
 
 private:
 
@@ -201,6 +209,8 @@ private:
 
     bool m_open_for_write;
     size_t m_direct_write_size{0};
+    bool m_lock_writes{true};
+    std::mutex m_write_mutex;
     size_t m_avail_count;
     std::unique_ptr<XrdSfsFile> m_fh;
     off_t m_offset;

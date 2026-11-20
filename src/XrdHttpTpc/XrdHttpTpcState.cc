@@ -200,11 +200,18 @@ void State::ResetAfterRequest() {
     m_wbuf.clear();
 }
 
+// HeaderCB and WriteCB are callbacks of libcurl, which is C: nothing may be
+// thrown through them.  Returning a number other than the one libcurl handed
+// over makes it end the transfer with an error.
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)
 {
-    State *obj = static_cast<State*>(userdata);
-    std::string header(buffer, size*nitems);
-    return obj->Header(header);
+    try {
+        State *obj = static_cast<State*>(userdata);
+        std::string header(buffer, size*nitems);
+        return obj->Header(header);
+    } catch (...) {
+        return 0;
+    }
 }
 
 int State::Header(const std::string &header) {
@@ -303,20 +310,25 @@ bool State::CheckRangeResponse() {
 }
 
 size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) {
-    State *obj = static_cast<State*>(userdata);
-    if (obj->GetStatusCode() < 0) {
-        return 0;
-     }  // malformed request - got body before headers.
-    if (obj->GetStatusCode() >= 400) {
-        obj->m_error_buf += std::string(static_cast<char*>(buffer),
-                                        std::min(static_cast<size_t>(1024), size*nitems));
-        // Record error messages until we hit a KB; at that point, fail out.
-        if (obj->m_error_buf.size() >= 1024)
+    try {
+        State *obj = static_cast<State*>(userdata);
+        if (obj->GetStatusCode() < 0) {
             return 0;
-        else
-            return size*nitems;
-    }  // Status indicates failure.
-    return obj->Write(static_cast<char*>(buffer), size*nitems);
+         }  // malformed request - got body before headers.
+        if (obj->GetStatusCode() >= 400) {
+            obj->m_error_buf += std::string(static_cast<char*>(buffer),
+                                            std::min(static_cast<size_t>(1024), size*nitems));
+            // Record error messages until we hit a KB; at that point, fail out.
+            if (obj->m_error_buf.size() >= 1024)
+                return 0;
+            else
+                return size*nitems;
+        }  // Status indicates failure.
+        return obj->Write(static_cast<char*>(buffer), size*nitems);
+    } catch (...) {
+        // Not size*nitems: libcurl ends the transfer with a write error.
+        return 0;
+    }
 }
 
 /**
@@ -371,19 +383,28 @@ ssize_t State::Write(char *buffer, size_t size) {
     const size_t write_size = m_stream->DirectWriteSize();
     if (write_size) {
         size_t done = 0;
-        while (done < size) {
-            if (m_wbuf.empty()) {
-                m_wbuf.reserve(write_size);
-                m_wbuf_offset = m_start_offset + m_offset + done;
+        // This runs inside a callback of libcurl, which is C: nothing may be
+        // thrown through it.
+        try {
+            while (done < size) {
+                if (m_wbuf.empty()) {
+                    m_wbuf.reserve(write_size);
+                    m_wbuf_offset = m_start_offset + m_offset + done;
+                }
+                size_t count = std::min(size - done, write_size - m_wbuf.size());
+                m_wbuf.insert(m_wbuf.end(), buffer + done, buffer + done + count);
+                done += count;
+                if (m_wbuf.size() == write_size && !FlushWriteBuffer()) {
+                    return -1;
+                }
             }
-            size_t count = std::min(size - done, write_size - m_wbuf.size());
-            m_wbuf.insert(m_wbuf.end(), buffer + done, buffer + done + count);
-            done += count;
-            if (m_wbuf.size() == write_size && !FlushWriteBuffer()) {
-                return -1;
-            }
+        } catch (std::exception &e) {
+            m_error_buf = std::string("Failed to buffer the data received: ") + e.what();
+            m_error_code = errWrite;
+            return -1;
         }
         m_offset += size;
+        if (m_received) {m_received->fetch_add(size, std::memory_order_relaxed);}
         return size;
     }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
@@ -398,12 +419,12 @@ ssize_t State::Write(char *buffer, size_t size) {
 
 bool State::FlushWriteBuffer() {
     if (m_wbuf.empty()) {return true;}
-    ssize_t retval = m_stream->WriteAt(m_wbuf_offset, m_wbuf.data(), m_wbuf.size());
+    std::string error;
+    ssize_t retval = m_stream->WriteAt(m_wbuf_offset, m_wbuf.data(), m_wbuf.size(), error);
     bool ok = retval == static_cast<ssize_t>(m_wbuf.size());
     m_wbuf.clear();
     if (!ok) {
-        m_error_buf = m_stream->GetErrorMessage();
-        if (m_error_buf.empty()) {m_error_buf = "Short write to the file";}
+        m_error_buf = error.empty() ? "Short write to the file" : error;
         m_error_code = errWrite;
     }
     return ok;

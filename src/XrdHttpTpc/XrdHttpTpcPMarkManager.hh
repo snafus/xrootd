@@ -29,6 +29,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <queue>
 
 namespace TPC {
@@ -124,6 +125,9 @@ private:
   */
   void addFd(int fd, const struct sockaddr * sockP);
 
+  // EXPERIMENT: the sockets are registered and released from the socket
+  // callbacks of libcurl, which run in the thread of each stream.
+  std::mutex mMutex;
   // The queue of socket information from which we will create the packet marking handles
   std::queue<SocketInfo> mSocketInfos;
   // The map of socket FD and packet marking handles

@@ -204,20 +204,27 @@ ssize_t Stream::WriteImpl(off_t offset, const char *buf, size_t size)
 }
 
 
-ssize_t Stream::WriteAt(off_t offset, const char *buf, size_t size)
+ssize_t Stream::WriteAt(off_t offset, const char *buf, size_t size, std::string &error)
 {
+    // m_open_for_write only changes in Finalize(), after the streams have ended.
     if (!m_open_for_write) {
-        if (!m_error_buf.size()) {m_error_buf = "Logic error: writing to a buffer not opened for write";}
+        error = "Logic error: writing to a buffer not opened for write";
         return SFS_ERROR;
     }
     if (size == 0) {return 0;}
+
+    std::unique_lock<std::mutex> lock(m_write_mutex, std::defer_lock);
+    if (m_lock_writes) {lock.lock();}
     ssize_t retval = m_fh->write(offset, buf, size);
     if (retval == SFS_ERROR) {
+        // The text is in the one error object of the file: read it under the
+        // lock even when the writes themselves are not serialised.
+        if (!lock.owns_lock()) {lock.lock();}
         std::stringstream ss;
         const char *msg = m_fh->error.getErrText();
         if (!msg || (*msg == '\0')) {msg = "(no error message provided)";}
         ss << msg << " (code=" << m_fh->error.getErrInfo() << ")";
-        m_error_buf = ss.str();
+        error = ss.str();
     }
     return retval;
 }

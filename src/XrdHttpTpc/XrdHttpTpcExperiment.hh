@@ -15,6 +15,11 @@
  *                          auto: one block per stream (file size / streams).
  *   XRD_TPC_EXP_WRITE_MIB  size of each write to the file in the block-write
  *                          model (default 16).
+ *   XRD_TPC_EXP_THREADS    1: in the block-write model, each stream is a thread
+ *                          with its own libcurl handle.  Unset or 0: one
+ *                          thread drives all the streams, as before.
+ *   XRD_TPC_EXP_WRITE_LOCK with threads: 1 (default) lets one stream at a time
+ *                          write to the file; 0 lets them write concurrently.
  *   XRD_TPC_EXP_CURL_BUFFER_KIB
  *                          size of the buffer libcurl receives into, and so the
  *                          largest piece it hands over at a time, in KiB.  Unset
@@ -42,6 +47,18 @@ inline long CurlBufferSize() {
     const char *val = getenv("XRD_TPC_EXP_CURL_BUFFER_KIB");
     long kib = (val && *val) ? atol(val) : 0;
     return kib > 0 ? kib * 1024 : 0;
+}
+
+// Whether each stream of the block-write model is a thread.
+inline bool Threads() {
+    const char *val = getenv("XRD_TPC_EXP_THREADS");
+    return val && atoi(val) > 0;
+}
+
+// Whether the threads write to the file one at a time.
+inline bool WriteLock() {
+    const char *val = getenv("XRD_TPC_EXP_WRITE_LOCK");
+    return !(val && *val) || atoi(val) != 0;
 }
 
 // Whether the block-write model is selected.
