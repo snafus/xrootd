@@ -1,5 +1,6 @@
 #ifndef XRD_HTTP_TPC_TPC_HH
 #define XRD_HTTP_TPC_TPC_HH
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -98,6 +99,10 @@ private:
         bool allow_private;
         XrdHttpExtReq & mReq;
         XrdHttpTpc::PMarkManager pmarkManager;
+        // The sockets libcurl has open for this transfer, by descriptor, each
+        // with the description of its peer used in a performance marker.
+        // Kept by the socket callbacks, which run in the thread of the request.
+        std::map<int, std::string> connections;
         XrdSysError * m_log;
         TpcType mTpcType;
     };

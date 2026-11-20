@@ -17,6 +17,9 @@
 
 #include <curl/curl.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <dlfcn.h>
 #include <fcntl.h>
 
@@ -163,6 +166,21 @@ int TPCHandler::opensocket_callback(void *clientp,
     return CURL_SOCKET_BAD;
   }
 
+  // Remember the connection for the performance markers.  The HTTP-TPC
+  // specification wants tcp:1.2.3.4:1094 and tcp:[2001:db8::1]:1094.
+  char ip[INET6_ADDRSTRLEN];
+  std::stringstream desc;
+  if (aInfo->addr.sa_family == AF_INET) {
+    const struct sockaddr_in *sin = reinterpret_cast<const struct sockaddr_in *>(&(aInfo->addr));
+    if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
+      desc << "tcp:" << ip << ":" << ntohs(sin->sin_port);
+  } else if (aInfo->addr.sa_family == AF_INET6) {
+    const struct sockaddr_in6 *sin6 = reinterpret_cast<const struct sockaddr_in6 *>(&(aInfo->addr));
+    if (inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)))
+      desc << "tcp:[" << ip << "]:" << ntohs(sin6->sin6_port);
+  }
+  rec->connections[fd] = desc.str();
+
   return fd;
 }
 
@@ -173,6 +191,7 @@ int TPCHandler::closesocket_callback(void *clientp, curl_socket_t fd) {
   // Otherwise, we would lose the socket usage information if the socket is closed before
   // the PMark handle is closed.
   rec->pmarkManager.endPmark(fd);
+  rec->connections.erase(fd);
 
   return close(fd);
 }
@@ -736,7 +755,7 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, TPC::State
 /*            T P C H a n d l e r : : S e n d P e r f M a r k e r             */
 /******************************************************************************/
   
-int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vector<State*> &state,
+int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vector<State*> & /*state*/,
     off_t bytes_transferred)
 {
     // The 'performance marker' format is largely derived from how GridFTP works
@@ -759,23 +778,18 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vecto
     ss << "Stripe Bytes Transferred: " << bytes_transferred << crlf;
     ss << "Total Stripe Count: 1" << crlf;
     // Build a list of TCP connections associated with this transfer; used by
-    // the TPC client for monitoring purposes.  There are many more request
-    // handles than connections, and a handle keeps reporting the connection it
-    // used last, even once another handle uses it or it is closed.  Only the
-    // handles with a request under way are asked: one of them holds each
-    // connection in use, and the ones still waiting for a connection report
-    // nothing.
+    // the TPC client for monitoring purposes.  The request handles cannot be
+    // asked: there are many more of them than connections, and a handle keeps
+    // reporting the connection of its previous request until libcurl starts
+    // its next one.  The list is the sockets libcurl has open for the
+    // transfer, as recorded by the socket callbacks.
     bool first = true;
     std::stringstream ss2;
-    for (std::vector<State*>::const_iterator iter = state.begin();
-        iter != state.end(); iter++)
+    for (std::map<int, std::string>::const_iterator iter = rec.connections.begin();
+        iter != rec.connections.end(); iter++)
     {
-        if (!(*iter)->RangeInProgress()) {
-            continue;
-        }
-        std::string desc = (*iter)->GetConnectionDescription();
-        if (!desc.empty()) {
-            ss2 << (first ? "" : ",") << desc;
+        if (!iter->second.empty()) {
+            ss2 << (first ? "" : ",") << iter->second;
             first = false;
         }
     }
