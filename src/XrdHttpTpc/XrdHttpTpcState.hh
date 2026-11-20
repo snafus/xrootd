@@ -141,6 +141,10 @@ public:
 
     void ResetAfterRequest();
 
+    // EXPERIMENT: block-write model.  Writes what this state has collected to
+    // the file, at the offset it belongs to.  Returns false on a write error.
+    bool FlushWriteBuffer();
+
     CURL *GetHandle() const {return m_curl;}
 
     int AvailableBuffers() const;
@@ -217,6 +221,8 @@ private:
     bool m_recv_all_headers;  // true if we have seen the end of headers.
     off_t m_offset;  // number of bytes we have received.
     off_t m_start_offset;  // offset where we started in the file.
+    std::vector<char> m_wbuf;  // EXPERIMENT: data collected for the next write.
+    off_t m_wbuf_offset{0};  // EXPERIMENT: offset in the file of the first byte of m_wbuf.
     int m_status_code;  // status code from HTTP response.
     int m_error_code; // error code from underlying stream operations.
     off_t m_content_length;  // value of Content-Length header, if we received one.

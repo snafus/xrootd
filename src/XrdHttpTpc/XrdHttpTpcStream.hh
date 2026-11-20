@@ -83,6 +83,13 @@ public:
 
     std::string GetErrorMessage() const {return m_error_buf;}
 
+    // EXPERIMENT: block-write model.  Once a write size is set, the states do
+    // not use Write() and its reorder buffers; each collects its own data and
+    // writes it at its own offset with WriteAt().
+    void SetDirectWriteSize(size_t size) {m_direct_write_size = size;}
+    size_t DirectWriteSize() const {return m_direct_write_size;}
+    ssize_t WriteAt(off_t offset, const char *buffer, size_t size);
+
 private:
 
     class Entry {
@@ -193,6 +200,7 @@ private:
     Entry *FirstAvailableBuffer();
 
     bool m_open_for_write;
+    size_t m_direct_write_size{0};
     size_t m_avail_count;
     std::unique_ptr<XrdSfsFile> m_fh;
     off_t m_offset;

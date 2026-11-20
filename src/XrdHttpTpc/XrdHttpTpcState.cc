@@ -197,6 +197,7 @@ void State::ResetAfterRequest() {
     m_recv_all_headers = false;
     m_recv_status_line = false;
     m_repr_digests.clear();
+    m_wbuf.clear();
 }
 
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)
@@ -365,6 +366,26 @@ ssize_t State::Write(char *buffer, size_t size) {
         m_error_code = errRange;
         return -1;
     }
+    // EXPERIMENT: block-write model.  Collect the data and write it at its own
+    // offset each time a write of the chosen size is complete.
+    const size_t write_size = m_stream->DirectWriteSize();
+    if (write_size) {
+        size_t done = 0;
+        while (done < size) {
+            if (m_wbuf.empty()) {
+                m_wbuf.reserve(write_size);
+                m_wbuf_offset = m_start_offset + m_offset + done;
+            }
+            size_t count = std::min(size - done, write_size - m_wbuf.size());
+            m_wbuf.insert(m_wbuf.end(), buffer + done, buffer + done + count);
+            done += count;
+            if (m_wbuf.size() == write_size && !FlushWriteBuffer()) {
+                return -1;
+            }
+        }
+        m_offset += size;
+        return size;
+    }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
     if (retval == SFS_ERROR) {
         m_error_buf = m_stream->GetErrorMessage();
@@ -373,6 +394,19 @@ ssize_t State::Write(char *buffer, size_t size) {
     }
     m_offset += retval;
     return retval;
+}
+
+bool State::FlushWriteBuffer() {
+    if (m_wbuf.empty()) {return true;}
+    ssize_t retval = m_stream->WriteAt(m_wbuf_offset, m_wbuf.data(), m_wbuf.size());
+    bool ok = retval == static_cast<ssize_t>(m_wbuf.size());
+    m_wbuf.clear();
+    if (!ok) {
+        m_error_buf = m_stream->GetErrorMessage();
+        if (m_error_buf.empty()) {m_error_buf = "Short write to the file";}
+        m_error_code = errWrite;
+    }
+    return ok;
 }
 
 void State::RecordFinalizeError(int error_code, const std::string &error_msg) {

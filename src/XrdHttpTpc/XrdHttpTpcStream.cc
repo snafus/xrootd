@@ -204,6 +204,25 @@ ssize_t Stream::WriteImpl(off_t offset, const char *buf, size_t size)
 }
 
 
+ssize_t Stream::WriteAt(off_t offset, const char *buf, size_t size)
+{
+    if (!m_open_for_write) {
+        if (!m_error_buf.size()) {m_error_buf = "Logic error: writing to a buffer not opened for write";}
+        return SFS_ERROR;
+    }
+    if (size == 0) {return 0;}
+    ssize_t retval = m_fh->write(offset, buf, size);
+    if (retval == SFS_ERROR) {
+        std::stringstream ss;
+        const char *msg = m_fh->error.getErrText();
+        if (!msg || (*msg == '\0')) {msg = "(no error message provided)";}
+        ss << msg << " (code=" << m_fh->error.getErrInfo() << ")";
+        m_error_buf = ss.str();
+    }
+    return retval;
+}
+
+
 void
 Stream::DumpBuffers() const
 {

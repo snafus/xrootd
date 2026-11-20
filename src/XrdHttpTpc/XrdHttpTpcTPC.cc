@@ -28,6 +28,7 @@
 
 #include "XrdHttpTpcState.hh"
 #include "XrdHttpTpcStream.hh"
+#include "XrdHttpTpcExperiment.hh"
 #include "XrdHttpTpcTPC.hh"
 #include <fstream>
 
@@ -1325,6 +1326,10 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
         return resp_result;
     }
     Stream stream(std::move(fh), streams * m_pipelining_multiplier, streams > 1 ? m_block_size : m_small_block_size, m_log);
+    if (streams > 1 && Experiment::BlockWrites()) {
+        // EXPERIMENT: the streams write at their own offsets.
+        stream.SetDirectWriteSize(Experiment::WriteSize());
+    }
     State state(0, stream, curl, false, req.tpcForwardCreds);
     state.SetupHeaders(req);
     state.SetContentLength(sourceFileContentLength);

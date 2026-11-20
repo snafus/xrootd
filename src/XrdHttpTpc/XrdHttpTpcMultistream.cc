@@ -4,6 +4,7 @@
 
 #include "XrdHttpTpcTPC.hh"
 #include "XrdHttpTpcState.hh"
+#include "XrdHttpTpcExperiment.hh"
 
 #include "XrdSys/XrdSysError.hh"
 
@@ -77,6 +78,8 @@ public:
             if (curl == (*state_iter)->GetHandle()) {
                 m_bytes_transferred += (*state_iter)->BytesTransferred();
                 if (result == CURLE_OK) {
+                    // EXPERIMENT: write the last, short part of the block.
+                    (*state_iter)->FlushWriteBuffer();
                     // Complete as far as libcurl can tell; count the bytes.
                     (*state_iter)->CheckRangeComplete();
                 }
@@ -287,6 +290,16 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
     off_t current_offset = 0;
 
     size_t concurrency = streams * m_pipelining_multiplier;
+    size_t block_size = m_block_size;
+    if (Experiment::BlockWrites()) {
+        // EXPERIMENT: one request per stream at a time, each for a large block.
+        concurrency = streams;
+        block_size = Experiment::BlockSize(content_size, streams);
+        std::stringstream ss;
+        ss << "EXPERIMENT block writes: block=" << block_size << " write="
+           << Experiment::WriteSize() << " streams=" << streams;
+        logTransferEvent(LogMask::Info, rec, "MULTISTREAM_EXPERIMENT", ss.str());
+    }
 
     handles.reserve(concurrency);
     handles.push_back(new State());
@@ -325,7 +338,7 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
 
     // Start assigning transfers
     int running_handles = 0;
-    current_offset = mch.StartTransfers(current_offset, content_size, m_block_size, running_handles);
+    current_offset = mch.StartTransfers(current_offset, content_size, block_size, running_handles);
 
     // Transfer loop: use curl to actually run the transfer, but periodically
     // interrupt things to send back performance updates to the client.
@@ -415,7 +428,7 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
             // Otherwise, continue running until there are no handles left.
             if (current_offset != content_size) {
                 current_offset = mch.StartTransfers(current_offset, content_size,
-                                                    m_block_size, running_handles);
+                                                    block_size, running_handles);
                 if (!running_handles) {
                     std::stringstream ss;
                     ss << "No handles are able to run.  Streams=" << streams << ", concurrency="
