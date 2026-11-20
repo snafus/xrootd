@@ -812,8 +812,12 @@ int TPCHandler::RunBlocksWithThreads(XrdHttpExtReq &req, State &state,
     while (true) {
         {
             std::unique_lock<std::mutex> lock(pull.mtx);
-            if (pull.ended.wait_for(lock, std::chrono::seconds(1),
-                                    [&pull]{return pull.running == 0;})) {
+            // wait_until() on the system clock, not wait_for(): the latter ends in
+            // pthread_cond_clockwait(), which the thread sanitizer of GCC 11
+            // does not know, so that it reports this lock as held twice.  A
+            // step of the clock only makes one wait shorter or longer.
+            if (pull.ended.wait_until(lock, std::chrono::system_clock::now() + std::chrono::seconds(1),
+                                      [&pull]{return pull.running == 0;})) {
                 break;
             }
         }
