@@ -1,7 +1,10 @@
-add_executable(xrdhttptpc-unit-tests XrdHttpTpcTests.cc)
+add_executable(xrdhttptpc-unit-tests
+  XrdHttpTpcTests.cc
+  XrdHttpTpcPullOptionsTests.cc)
 
 add_library(XrdHttpTpcUtils
   ${PROJECT_SOURCE_DIR}/src/XrdHttpTpc/XrdHttpTpcUtils.cc
+  ${PROJECT_SOURCE_DIR}/src/XrdHttpTpc/XrdHttpTpcPullOptions.cc
 )
 
 target_link_libraries(XrdHttpTpcUtils
