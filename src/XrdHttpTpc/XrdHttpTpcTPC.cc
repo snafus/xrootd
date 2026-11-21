@@ -30,6 +30,7 @@
 #include <thread>
 
 #include "XrdHttpTpcBlockPull.hh"
+#include "XrdHttpTpcPullMon.hh"
 #include "XrdHttpTpcState.hh"
 #include "XrdHttpTpcStream.hh"
 #include "XrdHttpTpcTPC.hh"
@@ -519,6 +520,9 @@ TPCHandler::TPCHandler(XrdSysError *log, const char *config, XrdOucEnv *myEnv) :
     if (!Configure(config, myEnv)) {
         throw std::runtime_error("Failed to configure the HTTP third-party-copy handler.");
     }
+
+    // The counters of the multistream pull, in the summary statistics.
+    PullMon::Register(myEnv, m_log);
 
 // Extract out the TPC monitoring object (we share it with xrootd).
 //
@@ -1335,6 +1339,7 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
     if (streams > m_pull_options.max_streams_request) {
         // A request above the limit of the site is given the limit, not an error.
         streams = m_pull_options.max_streams_request;
+        PullMon::limit_request++;
         std::stringstream ss;
         ss << "asked=" << streams_asked << ", granted=" << streams << ", reason=request_limit";
         logTransferEvent(LogMask::Info, rec, "STREAM_LIMIT", ss.str());
@@ -1397,11 +1402,13 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
             // Packet marking has not been made to work with stream threads
             // yet.  Where every request carries a SciTag this is every pull,
             // against what the server said at start: an operator must see it.
+            PullMon::sequential_marking++;
             logTransferEvent(WarningOncePerMinute(s_last_marking_warning), rec, "MULTISTREAM_MODE",
                 "mode=sequential, reason=packet_marking; a pull with packet marking is not"
                 " carried out in blocks");
         } else if (usingEC) {
             // The erasure coding writer takes the data in file order only.
+            PullMon::sequential_ec++;
             logTransferEvent(WarningOncePerMinute(s_last_ec_warning), rec, "MULTISTREAM_MODE",
                 "mode=sequential, reason=erasure_coding; the erasure coding writer cannot"
                 " write at offsets");
@@ -1427,6 +1434,7 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
             stream_threads.ShrinkTo(in_blocks ? streams : 0);
             rec.streams = streams;
             if (streams < granted) {
+                if (!strcmp(reason, "server_limit")) {PullMon::limit_server++;}
                 std::stringstream ss;
                 ss << "asked=" << streams_asked << ", granted=" << streams << ", reason=" << reason;
                 // A file too small for the streams asked is routine.  A
@@ -1472,11 +1480,13 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
     if (in_blocks) {
         return RunPullInBlocks(req, state, stream, block_plan, streams_asked, stream_threads, rec);
     } else if (streams > 1) {
+        PullMon::sequential++;
         return RunCurlWithStreams(req, state, streams, rec);
     } else {
         // Single request: close each connection once done so the redirector
         // connection does not stay idle for the whole transfer
         curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+        PullMon::single++;
         return RunCurlWithUpdates(curl, req, state, rec);
     }
 }

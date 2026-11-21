@@ -172,7 +172,7 @@ private:
     // The verdict of a pull in blocks whose streams have all ended.
     int ConcludePullInBlocks(XrdHttpExtReq &req, TPC::State &first_state, TPC::Stream &stream,
                              TPC::BlockPull &pull, size_t workers, double seconds,
-                             bool &cut_back_armed, TPCLogRecord &rec);
+                             bool &cut_back_armed, bool &verdict_counted, TPCLogRecord &rec);
     // Logs the blocks completed since the last call (debug level).
     void LogBlockReports(TPC::BlockPull &pull, size_t workers, TPCLogRecord &rec);
     // Logs the failure that stops a pull in blocks, when it is first seen.

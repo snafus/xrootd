@@ -5,6 +5,7 @@
  */
 
 #include "XrdHttpTpcBlockPull.hh"
+#include "XrdHttpTpcPullMon.hh"
 #include "XrdHttpTpcPullOptions.hh"
 #include "XrdHttpTpcState.hh"
 #include "XrdHttpTpcStream.hh"
@@ -61,21 +62,37 @@ std::string OneLine(std::string text)
     return text;
 }
 
-// The progress callback of libcurl: the only way to end a request from
-// another thread.  libcurl calls it about once a second, and more often
-// while data arrives.  It is not called while the worker is inside a write.
-int StopCallback(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
-{
-    return static_cast<BlockPull*>(clientp)->stop.load(std::memory_order_relaxed) ? 1 : 0;
-}
-
 // What a worker is started with.  The coordinator keeps these in a vector
 // that outlives the threads.
 struct WorkerStart {
-    State *state;      // owned by this worker until it has been joined
-    BlockPull *pull;   // outlives the worker
-    size_t stream;     // counted from 1, for the log and the messages
+    State *state;          // owned by this worker until it has been joined
+    BlockPull *pull;       // outlives the worker
+    WorkerStatus *status;  // what this worker tells the coordinator; outlives the worker
+    size_t stream;         // counted from 1, for the log and the messages
 };
+
+// Whether the coordinator has asked for the request this worker is in to be
+// ended, because nothing comes from the source.
+bool AbortAsked(const WorkerStatus *status)
+{
+    const unsigned asked = status->abort.load();
+    return asked != 0 && asked == status->request.load();
+}
+
+// The progress callback of libcurl: the only way to end a request from
+// another thread.  libcurl calls it about once a second, and more often
+// while data arrives.  It is not called while the worker is inside a write.
+//
+// It ends the request when the whole pull is stopping, or when the
+// coordinator has found this request stalled.  The second is looked at here
+// and nowhere else.  The stop of the pull is also looked at before a write,
+// where the data collected is dropped; a request ended for a stall must not
+// lose its data that way, since a retry will go on from it.
+int StopCallback(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+{
+    const WorkerStart *start = static_cast<const WorkerStart*>(clientp);
+    return (start->pull->stop.load(std::memory_order_relaxed) || AbortAsked(start->status)) ? 1 : 0;
+}
 
 // One worker: requests one block after another on its own libcurl handle.
 // The entry point of a thread made by XrdSysThread::Run(): it must not let
@@ -85,6 +102,7 @@ void *RunWorker(void *arg) noexcept
     WorkerStart *start = static_cast<WorkerStart*>(arg);
     State *state = start->state;
     BlockPull *pull = start->pull;
+    WorkerStatus *status = start->status;
     const size_t stream = start->stream;
     // The block being fetched; no block between two of them.
     off_t offset = 0, size = 0;
@@ -94,6 +112,11 @@ void *RunWorker(void *arg) noexcept
             in_block = true;
             const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
             state->SetTransferParameters(offset, size);
+            // A new request, for the stall check of the coordinator: from
+            // here it is waiting for the source, except while it writes.
+            status->request_start.store(status->received.load());
+            status->request.fetch_add(1);
+            status->phase.store(WorkerStatus::Receiving);
             CURLcode result = curl_easy_perform(state->GetHandle());
             bool flushed = true;
             if (result == CURLE_OK) {
@@ -102,8 +125,9 @@ void *RunWorker(void *arg) noexcept
                 flushed = state->FlushWriteBuffer();
                 state->CheckRangeComplete();
             }
+            status->phase.store(WorkerStatus::Idle);
             const int error = state->GetErrorCode();
-            const int status = state->GetStatusCode();
+            const int status_code = state->GetStatusCode();
 
             if (!error && pull->stop.load()
                 && (result == CURLE_ABORTED_BY_CALLBACK || result == CURLE_WRITE_ERROR || !flushed)) {
@@ -120,6 +144,15 @@ void *RunWorker(void *arg) noexcept
             failure.block_end = offset + size;
             failure.block_received = state->BytesTransferred();
 
+            if (!error && result == CURLE_ABORTED_BY_CALLBACK && AbortAsked(status)) {
+                // The coordinator ended this request: the source sent nothing
+                // for too long, while this worker was waiting for it.
+                failure.error_code = State::errTimeout;
+                failure.stall_limit = status->stall_limit.load();
+                failure.stall_idle = status->stall_idle.load();
+                pull->Fail(failure);
+                break;
+            }
             if (!flushed && !error) {
                 // Not reachable as the code stands: a flush that fails
                 // without an error is one that saw the stop, and that case
@@ -132,11 +165,11 @@ void *RunWorker(void *arg) noexcept
             }
             // libcurl also returns CURLE_OK for a final answer such as 304,
             // which brings no part of the file: see State::CarriesContent().
-            const bool failed_status = status >= 400
-                || (result == CURLE_OK && !State::CarriesContent(status));
+            const bool failed_status = status_code >= 400
+                || (result == CURLE_OK && !State::CarriesContent(status_code));
             if (error || failed_status || result != CURLE_OK) {
                 failure.error_code = error;
-                failure.status_code = failed_status ? status : 0;
+                failure.status_code = failed_status ? status_code : 0;
                 failure.curl_result = result;
                 failure.message = state->GetErrorMessage();
                 pull->Fail(failure);
@@ -189,6 +222,8 @@ struct WorkerJoiner {
         for (std::unique_ptr<State> &state : states) {
             state->SetPullCounters(nullptr, nullptr);
             state->SetPullStopFlag(nullptr);
+            state->SetWorkerStatus(nullptr);
+            state->SetSourceCheck(nullptr);
             curl_easy_setopt(state->GetHandle(), CURLOPT_XFERINFOFUNCTION, NULL);
             curl_easy_setopt(state->GetHandle(), CURLOPT_XFERINFODATA, NULL);
             curl_easy_setopt(state->GetHandle(), CURLOPT_NOPROGRESS, 1L);
@@ -254,6 +289,14 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
         "Initial transfer response sent to the TPC client");
 
     BlockPull pull(file_size, plan.block_size, planned);
+    // Every response of the pull must come from the same version of the file.
+    SourceCheck source_check(file_size, m_pull_options.source_validators);
+    // What each worker tells of itself, and what is remembered of it between
+    // two looks, for the stall check of each stream.  One entry per worker;
+    // the workers keep pointers to theirs, so the first is never resized.
+    std::unique_ptr<WorkerStatus[]> statuses(new WorkerStatus[planned]);
+    std::vector<StallWatch> watches(planned);
+    PullMon::pulls++;
 
     // A pull that does not succeed leaves only complete blocks in the file.
     // Without this the file could have the size of the source and a hole in
@@ -290,17 +333,17 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
     std::vector<WorkerStart> starts;
     WorkerJoiner joiner{pull, threads, states};
 
-    for (std::unique_ptr<State> &worker_state : states) {
-        worker_state->SetPullCounters(&pull.received, &pull.written);
-        worker_state->SetPullStopFlag(&pull.stop);
-        curl_easy_setopt(worker_state->GetHandle(), CURLOPT_XFERINFOFUNCTION, StopCallback);
-        curl_easy_setopt(worker_state->GetHandle(), CURLOPT_XFERINFODATA, &pull);
-        curl_easy_setopt(worker_state->GetHandle(), CURLOPT_NOPROGRESS, 0L);
+    for (size_t idx = 0; idx < planned; idx++) {
+        states[idx]->SetPullCounters(&pull.received, &pull.written);
+        states[idx]->SetPullStopFlag(&pull.stop);
+        states[idx]->SetWorkerStatus(&statuses[idx]);
+        states[idx]->SetSourceCheck(&source_check);
     }
 
     // No exception may leave this function from here on without being
     // caught: the server has no handler above it, and without one the
     // workers would not be joined before the process ends.
+    bool verdict_counted = false;
     bool client_gone = false;
     bool failure_logged = false;
     size_t workers = planned;
@@ -310,7 +353,12 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
         threads.reserve(planned);
         starts.reserve(planned);
         for (size_t idx = 0; idx < planned; idx++) {
-            starts.push_back(WorkerStart{states[idx].get(), &pull, idx + 1});
+            starts.push_back(WorkerStart{states[idx].get(), &pull, &statuses[idx], idx + 1});
+            // The progress callback is given the worker's own entry, which
+            // does not move once the vector is filled.
+            curl_easy_setopt(states[idx]->GetHandle(), CURLOPT_XFERINFOFUNCTION, StopCallback);
+            curl_easy_setopt(states[idx]->GetHandle(), CURLOPT_XFERINFODATA, &starts[idx]);
+            curl_easy_setopt(states[idx]->GetHandle(), CURLOPT_NOPROGRESS, 0L);
         }
         for (size_t idx = 0; idx < planned; idx++) {
             pull.WorkerStarting();
@@ -321,6 +369,7 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
             const int reason = XrdSysThread::Run(&thread, RunWorker, &starts[idx], XRDSYSTHREAD_HOLD);
             if (reason) {
                 pull.WorkerNotStarted();
+                PullMon::start_failures++;
                 workers = threads.size();
                 std::stringstream ss;
                 if (workers) {
@@ -358,15 +407,47 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
         const long long transfer_start = last_advance_time;
         long long stop_time = 0;
         bool slow_stop_logged = false;
+        unsigned long long last_requests = 0;
+        off_t counted_bytes = 0;
+        size_t counted_blocks = 0;
+        // Two checks that the pull moves, with the times of tpc.timeout: the
+        // first-byte time until a request has had a byte, the other after.
+        //
+        // - Each stream: a request that waits for the source and gets
+        //   nothing is ended, and its stream and block are named.
+        // - The whole pull: nothing at all has moved.  This is what catches
+        //   a storage that does not take data, where no stream is waiting
+        //   for the source.
+        //
+        // The second must not fire for what the first is about to catch, or
+        // no stream is named.  So the start of a request counts as movement
+        // of the pull, like a byte; while a request waits for its first byte
+        // the pull has the first-byte time too; and ending a request gives
+        // the pull a new period.
         while (!pull.WaitForWorkers(std::chrono::seconds(1))) {
             const long long now = SteadySeconds();
             const off_t received = pull.received.load();
             const off_t written = pull.written.load();
-            if (received + written > last_advance_bytes) {
+            unsigned long long requests = 0;
+            bool awaiting_first_byte = false;
+            for (size_t idx = 0; idx < workers; idx++) {
+                requests += statuses[idx].request.load();
+                awaiting_first_byte = awaiting_first_byte
+                    || (statuses[idx].phase.load() == WorkerStatus::Receiving
+                        && statuses[idx].received.load() <= statuses[idx].request_start.load());
+            }
+            if (received + written > last_advance_bytes || requests != last_requests) {
                 last_advance_bytes = received + written;
+                last_requests = requests;
                 last_advance_time = now;
             }
             LogBlockReports(pull, workers, rec);
+            // The counters follow the pull as it runs, not only at its end.
+            const size_t blocks_done = pull.BlocksDone();
+            PullMon::bytes += static_cast<unsigned long long>(received - counted_bytes);
+            PullMon::blocks += blocks_done - counted_blocks;
+            counted_bytes = received;
+            counted_blocks = blocks_done;
 
             if (pull.stop.load()) {
                 // A failure is recorded and the workers are stopping.  One
@@ -406,7 +487,37 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
                 }
                 last_marker = now;
             }
-            const int timeout = (transfer_start == last_advance_time) ? m_first_timeout : m_timeout;
+            // Each stream on its own.
+            for (size_t idx = 0; idx < workers; idx++) {
+                WorkerStatus &status = statuses[idx];
+                const unsigned request = status.request.load();
+                const off_t stream_received = status.received.load();
+                const off_t request_start = status.request_start.load();
+                const long long idle = watches[idx].Stalled(now, stream_received, request_start,
+                    status.phase.load(), request, m_first_timeout, m_timeout);
+                if (idle && request != 0 && status.abort.load() != request) {
+                    const int limit = StallWatch::Allowed(stream_received, request_start,
+                                                          m_first_timeout, m_timeout);
+                    // The numbers first, the order second: the worker reads
+                    // the numbers once it has seen the order.
+                    status.stall_limit.store(limit);
+                    status.stall_idle.store(static_cast<int>(idle));
+                    status.abort.store(request);
+                    PullMon::stream_stalls++;
+                    last_advance_time = now;
+                    // For information: the failure of the stream, which
+                    // follows as an error, says the same with its block.
+                    std::stringstream ss;
+                    ss << "stream=" << (idx + 1) << ", workers=" << workers << ", idle_seconds=" << idle
+                       << ", limit=" << limit
+                       << "; nothing received from the source; ending the request";
+                    logTransferEvent(LogMask::Info, rec, "STREAM_STALL", ss.str());
+                }
+            }
+
+            // The whole pull.
+            const int timeout = (transfer_start == last_advance_time || awaiting_first_byte)
+                                ? m_first_timeout : m_timeout;
             if (now > last_advance_time + timeout) {
                 // Every worker stops at its next progress callback; the loop
                 // ends when they have.
@@ -425,6 +536,7 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
                           " (pull mode) in " << timeout << " seconds.";
                 }
                 failure.message = ss.str();
+                PullMon::pull_stalls++;
                 pull.Fail(failure);
             }
         }
@@ -435,13 +547,18 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
         if (pull.Failed() && !failure_logged) {LogStreamFailure(pull, workers, rec);}
 
         rec.bytes_transferred = pull.received.load();
+        // What the last look in the loop had not counted yet.
+        PullMon::bytes += static_cast<unsigned long long>(pull.received.load() - counted_bytes);
+        PullMon::blocks += pull.BlocksDone() - counted_blocks;
         if (client_gone) {
             // Nobody is left to tell; the file is cut back on the way out.
+            PullMon::failed++;
+            verdict_counted = true;
             return -1;
         }
         const std::chrono::duration<double> took = std::chrono::steady_clock::now() - began;
         return ConcludePullInBlocks(req, *states[0], stream, pull, workers, took.count(),
-                                    cut_back.armed, rec);
+                                    cut_back.armed, verdict_counted, rec);
     } catch (...) {
         // In practice: out of memory.  Nothing that could throw again is done
         // here; the joiner stops and joins the workers and the file is cut
@@ -450,6 +567,8 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
         BlockFailure failure;
         failure.error_code = BlockPull::errInternal;
         pull.Fail(failure);
+        // Once for the pull, also if the verdict was counted before it threw.
+        if (!verdict_counted) {PullMon::failed++;}
         return -1;
     }
 }
@@ -465,7 +584,8 @@ int TPCHandler::RunPullInBlocks(XrdHttpExtReq &req, State &state, Stream &stream
 // mode, so that a transfer client that looks for them finds them; the stream
 // and the block follow.
 int TPCHandler::ConcludePullInBlocks(XrdHttpExtReq &req, State &first_state, Stream &stream,
-    BlockPull &pull, size_t workers, double seconds, bool &cut_back_armed, TPCLogRecord &rec)
+    BlockPull &pull, size_t workers, double seconds, bool &cut_back_armed, bool &verdict_counted,
+    TPCLogRecord &rec)
 {
     const off_t file_size = pull.FileSize();
     const BlockFailure failure = pull.Failure();
@@ -504,12 +624,28 @@ int TPCHandler::ConcludePullInBlocks(XrdHttpExtReq &req, State &first_state, Str
         ss2 << Where(failure, workers, true);
         logTransferEvent(LogMask::Error, rec, "MULTISTREAM_FAIL", ss2.str() + left);
         ss << generateClientErr(ss2, rec);
+    } else if (failed && failure.error_code == State::errTimeout && failure.stream) {
+        // The stall check of one stream: the words of the stall message of
+        // the whole pull, then the stream and the block that got nothing.
+        // The seconds are the time the stream was allowed, as in the message
+        // of the whole pull.
+        std::stringstream ss2;
+        ss2 << "Transfer failed because no bytes have been received from the source (pull mode) in "
+            << failure.stall_limit << " seconds" << Where(failure, workers, true);
+        logTransferEvent(LogMask::Error, rec, "MULTISTREAM_FAIL", ss2.str() + left);
+        ss << generateClientErr(ss2, rec);
     } else if (failed && failure.error_code == State::errTimeout) {
-        // The stall check of the coordinator: the message says what did not
+        // The stall check of the whole pull: the message says what did not
         // move, and no stream is to blame more than another.
         std::stringstream ss2;
         ss2 << failure.message;
         logTransferEvent(LogMask::Error, rec, "MULTISTREAM_FAIL", OneLine(failure.message) + left);
+        ss << generateClientErr(ss2, rec);
+    } else if (failed && failure.error_code == State::errSource) {
+        // The message says what changed and names the server that answered.
+        std::stringstream ss2;
+        ss2 << OneLine(failure.message) << Where(failure, workers, true);
+        logTransferEvent(LogMask::Error, rec, "MULTISTREAM_FAIL", ss2.str() + left);
         ss << generateClientErr(ss2, rec);
     } else if (failed && failure.error_code == State::errRange) {
         // The message names the range that was asked for and what came.
@@ -572,6 +708,14 @@ int TPCHandler::ConcludePullInBlocks(XrdHttpExtReq &req, State &first_state, Str
             success = true;
         }
     }
+
+    if (success) {
+        PullMon::succeeded++;
+    } else {
+        PullMon::failed++;
+        if (failed && failure.error_code == State::errSource) {PullMon::source_changed++;}
+    }
+    verdict_counted = true;
 
     int retval;
     if ((retval = req.ChunkResp(ss.str().c_str(), 0))) {
@@ -643,10 +787,18 @@ void TPCHandler::LogStreamFailure(BlockPull &pull, size_t workers, TPCLogRecord 
         ss << ", block=" << failure.block_start << "-" << (failure.block_end - 1)
            << ", received=" << failure.block_received;
     }
+    if (failure.error_code == State::errTimeout) {
+        ss << ", idle_seconds=" << failure.stall_idle << ", limit=" << failure.stall_limit;
+    }
     // Free text comes last, so that the fields before it can be picked out.
     ss << ", cause=";
     if (failure.status_code) {
         ss << "status " << failure.status_code;
+    } else if (failure.error_code == State::errTimeout) {
+        ss << "stall; nothing received from the source";
+    } else if (failure.error_code == State::errSource) {
+        // The message says it: "The source file changed during the transfer: ...".
+        ss << "source changed";
     } else if (failure.error_code == State::errRange) {
         ss << "wrong range";
     } else if (failure.error_code == BlockPull::errInternal) {
@@ -656,7 +808,15 @@ void TPCHandler::LogStreamFailure(BlockPull &pull, size_t workers, TPCLogRecord 
     } else {
         ss << "libcurl: " << curl_easy_strerror(failure.curl_result);
     }
-    if (!failure.message.empty()) {ss << "; " << OneLine(failure.message);}
+    if (!failure.message.empty()) {
+        // What changed, without the words the cause has just said.
+        static const std::string changed = "The source file changed during the transfer: ";
+        std::string text = OneLine(failure.message);
+        if (failure.error_code == State::errSource && text.compare(0, changed.size(), changed) == 0) {
+            text.erase(0, changed.size());
+        }
+        ss << "; " << text;
+    }
     ss << "; stopping the other streams";
     logTransferEvent(LogMask::Error, rec, "STREAM_FAIL", ss.str());
 }
@@ -682,11 +842,13 @@ std::string TPCHandler::CutBackFailedPull(Stream &stream, BlockPull &pull, TPCLo
     if (keep < pull.FileSize() && !stream.Truncate(keep, error)) {
         // The file may be left with the size of the source and a hole in it.
         cut_failed = true;
+        PullMon::cut_back_failures++;
         ss << ", left=unknown, file_size=" << pull.FileSize();
         logTransferEvent(LogMask::Warning, rec, "TRUNCATE_FAIL", ss.str()
             + "; unable to cut the file back to its complete leading blocks: " + error);
         return ss.str();
     }
+    if (keep < pull.FileSize()) {PullMon::cut_backs++;}
     ss << ", left=" << keep << ", file_size=" << pull.FileSize();
     return ss.str();
 }

@@ -78,6 +78,16 @@ struct PullOptions {
     // this size.
     off_t write_size{16 * MiB};
 
+    // http_multi.source_check full | size
+    //
+    // A pull in blocks checks that every response comes from the same
+    // version of the source file.  `full` compares the total size, and the
+    // strong ETag or else the Last-Modified, between responses of one
+    // server.  `size` compares sizes only: for a source that serves one file
+    // from several servers behind a single address, whose validators differ
+    // although the content is the same.
+    bool source_validators{true};
+
     // http_multi.retry <attempts> [<wait>]
     //
     // The tries a block gets without making progress, and the wait in

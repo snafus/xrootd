@@ -129,6 +129,9 @@ TEST(XrdHttpTpcBlockPullTests, TheFirstFailureIsKeptAndStopsThePull) {
   first.stream = 2;
   first.block_start = 1 * MiB;
   first.block_end = 2 * MiB;
+  first.block_received = 12345;
+  first.stall_limit = 60;
+  first.stall_idle = 61;
   first.message = "first";
   pull.Fail(first);
 
@@ -145,6 +148,12 @@ TEST(XrdHttpTpcBlockPullTests, TheFirstFailureIsKeptAndStopsThePull) {
   EXPECT_EQ(0, kept.error_code);
   EXPECT_EQ(2u, kept.stream);
   EXPECT_EQ(1 * MiB, kept.block_start);
+  EXPECT_EQ(2 * MiB, kept.block_end);
+  EXPECT_EQ(12345, kept.block_received);
+  // Every field of the failure is kept, not only those the verdict needs most.
+  EXPECT_EQ(60, kept.stall_limit);
+  EXPECT_EQ(61, kept.stall_idle);
+  EXPECT_EQ(CURLE_OK, kept.curl_result);
   EXPECT_EQ("first", kept.message);
 }
 
@@ -201,4 +210,172 @@ TEST(XrdHttpTpcBlockPullTests, TheBudgetGivesWhatIsLeftAndTakesItBack) {
   }
   // Every share gives back what it holds when it goes.
   EXPECT_EQ(0, StreamThreadBudget::InUse());
+}
+
+TEST(XrdHttpTpcBlockPullTests, AStreamThatWaitsForTheSourceTooLongIsStalled) {
+  // A first byte may take 6 s, more data 3 s.
+  StallWatch watch;
+  const int receiving = WorkerStatus::Receiving;
+  EXPECT_EQ(0, watch.Stalled(100, 0, 0, receiving, 1, 6, 3));   // first look: the time starts
+  EXPECT_EQ(0, watch.Stalled(106, 0, 0, receiving, 1, 6, 3));   // exactly the time allowed
+  EXPECT_EQ(7, watch.Stalled(107, 0, 0, receiving, 1, 6, 3));   // longer: stalled, for 7 s
+
+  // Once data has come, the shorter time applies, counted from the last byte.
+  StallWatch moving;
+  EXPECT_EQ(0, moving.Stalled(100, 0, 0, receiving, 1, 6, 3));
+  EXPECT_EQ(0, moving.Stalled(101, 500, 0, receiving, 1, 6, 3));
+  EXPECT_EQ(0, moving.Stalled(104, 500, 0, receiving, 1, 6, 3));
+  EXPECT_EQ(4, moving.Stalled(105, 500, 0, receiving, 1, 6, 3));
+  // A byte more and it is alive again.
+  EXPECT_EQ(0, moving.Stalled(106, 501, 0, receiving, 1, 6, 3));
+  EXPECT_EQ(0, moving.Stalled(109, 501, 0, receiving, 1, 6, 3));
+  EXPECT_EQ(4, moving.Stalled(110, 501, 0, receiving, 1, 6, 3));
+}
+
+TEST(XrdHttpTpcBlockPullTests, TimeSpentWritingOrBetweenRequestsIsNotAStall) {
+  StallWatch watch;
+  EXPECT_EQ(0, watch.Stalled(100, 0, 0, WorkerStatus::Receiving, 1, 6, 3));
+  EXPECT_EQ(0, watch.Stalled(101, 900, 0, WorkerStatus::Receiving, 1, 6, 3));
+  // A write that takes a minute, looked at every second as the coordinator
+  // does: nothing is received meanwhile, and that is not the source's doing.
+  for (long long now = 102; now <= 162; now++) {
+    EXPECT_EQ(0, watch.Stalled(now, 900, 0, WorkerStatus::Writing, 1, 6, 3));
+  }
+  // Back to waiting for the source: the time counts from the last look at
+  // which it was still writing.
+  EXPECT_EQ(0, watch.Stalled(163, 900, 0, WorkerStatus::Receiving, 1, 6, 3));
+  EXPECT_EQ(0, watch.Stalled(165, 900, 0, WorkerStatus::Receiving, 1, 6, 3));
+  EXPECT_EQ(4, watch.Stalled(166, 900, 0, WorkerStatus::Receiving, 1, 6, 3));
+
+  // Waiting for a block to be handed out.
+  StallWatch idle;
+  EXPECT_EQ(0, idle.Stalled(100, 0, 0, WorkerStatus::Idle, 0, 6, 3));
+  EXPECT_EQ(0, idle.Stalled(500, 0, 0, WorkerStatus::Idle, 0, 6, 3));
+}
+
+TEST(XrdHttpTpcBlockPullTests, ANewRequestStartsItsOwnTime) {
+  StallWatch watch;
+  const int receiving = WorkerStatus::Receiving;
+  EXPECT_EQ(0, watch.Stalled(100, 0, 0, receiving, 1, 6, 3));
+  EXPECT_EQ(0, watch.Stalled(101, 1000, 0, receiving, 1, 6, 3));
+  // The next request has received nothing yet: it has the time of a first
+  // byte, although the worker has received bytes before.
+  EXPECT_EQ(0, watch.Stalled(103, 1000, 1000, receiving, 2, 6, 3));
+  EXPECT_EQ(0, watch.Stalled(109, 1000, 1000, receiving, 2, 6, 3));
+  EXPECT_EQ(7, watch.Stalled(110, 1000, 1000, receiving, 2, 6, 3));
+}
+
+namespace {
+
+SourceCheck::Seen Response(const char *host, off_t total, const char *etag, const char *modified) {
+  SourceCheck::Seen seen;
+  seen.host = host;
+  seen.total = total;
+  seen.etag = etag;
+  seen.last_modified = modified;
+  return seen;
+}
+
+}
+
+TEST(XrdHttpTpcBlockPullTests, ResponsesOfTheSameVersionAgree) {
+  SourceCheck check(1000);
+  std::string error = "unset";
+  EXPECT_TRUE(check.Agrees(Response("a", 1000, "\"v1\"", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_TRUE(check.Agrees(Response("a", 1000, "\"v1\"", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  // A response that gives less is not a mismatch.
+  EXPECT_TRUE(check.Agrees(Response("a", -1, "", ""), error));
+  EXPECT_TRUE(check.Agrees(Response("a", 1000, "", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_EQ("unset", error);
+}
+
+TEST(XrdHttpTpcBlockPullTests, AChangedSizeOrValidatorOfOneHostIsAChangedFile) {
+  std::string error;
+  {
+    SourceCheck check(1000);
+    EXPECT_TRUE(check.Agrees(Response("a", 1000, "", ""), error));
+    EXPECT_FALSE(check.Agrees(Response("a", 1001, "", ""), error));
+    EXPECT_NE(std::string::npos, error.find("its size was 1000 bytes and is now 1001")) << error;
+    EXPECT_NE(std::string::npos, error.find("(server a)")) << error;
+  }
+  {
+    SourceCheck check(1000);
+    EXPECT_TRUE(check.Agrees(Response("a", 1000, "\"v1\"", ""), error));
+    EXPECT_FALSE(check.Agrees(Response("a", 1000, "\"v2\"", ""), error));
+    EXPECT_NE(std::string::npos, error.find("its ETag was \"v1\" and is now \"v2\"")) << error;
+  }
+  {
+    // No strong ETag: Last-Modified decides.
+    SourceCheck check(1000);
+    EXPECT_TRUE(check.Agrees(Response("a", 1000, "W/\"v1\"", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+    EXPECT_FALSE(check.Agrees(Response("a", 1000, "W/\"v1\"", "Tue, 02 Jan 2024 00:00:00 GMT"), error));
+    EXPECT_NE(std::string::npos, error.find("Last-Modified")) << error;
+  }
+}
+
+TEST(XrdHttpTpcBlockPullTests, WhatDoesNotProveAChangeIsNotOne) {
+  std::string error;
+  // A weak ETag says "equivalent", not "the same bytes": it is not compared.
+  SourceCheck weak(1000);
+  EXPECT_TRUE(weak.Agrees(Response("a", 1000, "W/\"v1\"", ""), error));
+  EXPECT_TRUE(weak.Agrees(Response("a", 1000, "W/\"v2\"", ""), error));
+
+  // Where the host gives a strong ETag and it is the same, a Last-Modified
+  // that differs does not decide.
+  SourceCheck both(1000);
+  EXPECT_TRUE(both.Agrees(Response("a", 1000, "\"v1\"", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_TRUE(both.Agrees(Response("a", 1000, "\"v1\"", "Tue, 02 Jan 2024 00:00:00 GMT"), error));
+
+  // Two servers that hold copies of the file have validators of their own.
+  SourceCheck replicas(1000);
+  EXPECT_TRUE(replicas.Agrees(Response("a", 1000, "\"v1\"", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_TRUE(replicas.Agrees(Response("b", 1000, "\"other\"", "Wed, 03 Jan 2024 00:00:00 GMT"), error));
+  // ... but each must agree with itself, and both with the size.
+  EXPECT_FALSE(replicas.Agrees(Response("b", 1000, "\"changed\"", ""), error));
+  EXPECT_FALSE(replicas.Agrees(Response("c", 999, "", ""), error));
+}
+
+TEST(XrdHttpTpcBlockPullTests, LastModifiedDecidesWheneverNoETagWasCompared) {
+  std::string error;
+  // The server gave a strong ETag once; a later response without one is
+  // judged by its Last-Modified.
+  SourceCheck later(1000);
+  EXPECT_TRUE(later.Agrees(Response("a", 1000, "\"v1\"", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_FALSE(later.Agrees(Response("a", 1000, "", "Tue, 02 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_NE(std::string::npos, error.find("Last-Modified")) << error;
+
+  // The first strong ETag of a server has nothing to be compared with: the
+  // Last-Modified that comes with it is.
+  SourceCheck first(1000);
+  EXPECT_TRUE(first.Agrees(Response("a", 1000, "", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_FALSE(first.Agrees(Response("a", 1000, "\"v1\"", "Tue, 02 Jan 2024 00:00:00 GMT"), error));
+}
+
+TEST(XrdHttpTpcBlockPullTests, WithoutValidatorsOnlyTheSizeIsCompared) {
+  std::string error;
+  SourceCheck check(1000, false);
+  EXPECT_TRUE(check.Agrees(Response("a", 1000, "\"v1\"", "Mon, 01 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_TRUE(check.Agrees(Response("a", 1000, "\"v2\"", "Tue, 02 Jan 2024 00:00:00 GMT"), error));
+  EXPECT_FALSE(check.Agrees(Response("a", 1001, "\"v2\"", ""), error));
+}
+
+TEST(XrdHttpTpcBlockPullTests, WhatTheSourceSentIsMadeFitForAMessage) {
+  std::string error;
+  SourceCheck check(1000);
+  const std::string first = "\"" + std::string(500, 'a') + "\"";
+  const std::string second = "\"x\ry\tz\"";
+  EXPECT_TRUE(check.Agrees(Response("", 1000, first.c_str(), ""), error));
+  EXPECT_FALSE(check.Agrees(Response("", 1000, second.c_str(), ""), error));
+  // Long values are cut, control characters replaced, and a server that is
+  // not known is not named.
+  EXPECT_LT(error.size(), 400u) << error;
+  EXPECT_NE(std::string::npos, error.find("...")) << error;
+  EXPECT_NE(std::string::npos, error.find("\"x?y?z\"")) << error;
+  EXPECT_EQ(std::string::npos, error.find("server")) << error;
+  EXPECT_EQ(std::string::npos, error.find('\r')) << error;
+}
+
+TEST(XrdHttpTpcBlockPullTests, ARequestIsAllowedLongerUntilItsFirstByte) {
+  EXPECT_EQ(120, StallWatch::Allowed(5000, 5000, 120, 60));
+  EXPECT_EQ(60, StallWatch::Allowed(5001, 5000, 120, 60));
 }

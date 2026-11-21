@@ -40,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -47,6 +48,8 @@
 
 #include <curl/curl.h>
 #include <sys/types.h>
+
+#include "XrdSys/XrdSysRAtomic.hh"
 
 namespace TPC {
 
@@ -86,10 +89,15 @@ public:
     static Share Take(int wanted, int limit);
 
     // Threads taken at this moment.
-    static int InUse() {return s_in_use.load();}
+    static int InUse() {return s_in_use;}
+
+    // The count itself, to be registered with the summary statistics of the
+    // server: what is reported is then the number the budget works with, and
+    // cannot lag behind it.
+    static RAtomic_int32_t &Counter() {return s_in_use;}
 
 private:
-    static std::atomic<int> s_in_use;
+    static RAtomic_int32_t s_in_use;
 };
 
 /**
@@ -104,6 +112,135 @@ struct BlockFailure {
     off_t block_start{0};            // the block it was fetching: bytes [block_start, block_end);
     off_t block_end{0};              // both 0 when it was not fetching one
     off_t block_received{0};         // bytes of that block received when it failed
+    // Not 0: the request was ended by the stall check of its stream.  The
+    // seconds the stream was allowed to wait, and those it had waited.
+    int stall_limit{0};
+    int stall_idle{0};
+};
+
+/**
+ * What a worker tells about itself, for the stall check of the coordinator.
+ *
+ * The check of the whole pull (do the bytes of all streams together grow?)
+ * does not see one stream that has stopped among others that move.  So each
+ * worker publishes how much it has received and what it is doing, and the
+ * coordinator ends the request of a worker that is waiting for the source
+ * and gets nothing.  libcurl does not call its progress callback while a
+ * worker is inside a write, so it could not judge this itself: time spent
+ * writing, or waiting for a block, must not count against the source.
+ *
+ * All members are atomics: the worker writes `received`, `request_start`,
+ * `phase` and `request`; the coordinator writes `stall_limit`, `stall_idle`
+ * and `abort`.
+ * They are read one by one, not together: a look that mixes two requests is
+ * off by one look, a second, and no more.
+ */
+struct WorkerStatus {
+    enum Phase : int {
+        Idle = 0,       // between two requests, or waiting for a block
+        Receiving = 1,  // in a request: connecting, or waiting for data from the source
+        Writing = 2     // in a request, inside a write to the file or waiting for its turn to write
+    };
+
+    std::atomic<off_t>    received{0};         // bytes received by this worker, over all its requests
+    std::atomic<off_t>    request_start{0};    // what `received` was when the request in progress began
+    std::atomic<int>      phase{Idle};
+    std::atomic<unsigned> request{0};          // number of the request in progress; counts from 1
+    std::atomic<int>      stall_limit{0};      // when `abort` was set: the seconds allowed,
+    std::atomic<int>      stall_idle{0};       // and the seconds for which nothing had come
+    // The request the coordinator wants ended; 0 for none.  It names the
+    // request, so that an order that comes a moment too late, when the worker
+    // has gone on to its next request, ends nothing.
+    std::atomic<unsigned> abort{0};
+};
+
+/**
+ * What the coordinator remembers of one worker between two looks at its
+ * WorkerStatus.  Used by the coordinator only.
+ */
+class StallWatch {
+public:
+    /**
+     * Looks at a worker.
+     *
+     * @param now            seconds on a steady clock
+     * @param received,request_start,phase,request  what the worker published
+     * @param first_timeout  seconds a request may wait for its first byte
+     * @param timeout        seconds a request may wait for more once it has some
+     * @return 0, or the seconds for which the worker has been waiting for the
+     *         source and got nothing, if that is longer than allowed
+     */
+    long long Stalled(long long now, off_t received, off_t request_start, int phase,
+                      unsigned request, int first_timeout, int timeout);
+
+    // The seconds a request in that state may wait: `first_timeout` until it
+    // has had a byte, `timeout` afterwards.
+    static int Allowed(off_t received, off_t request_start, int first_timeout, int timeout) {
+        return received <= request_start ? first_timeout : timeout;
+    }
+
+private:
+    bool m_seen{false};
+    unsigned m_request{0};        // the request last looked at
+    off_t m_received{0};          // bytes at the last look
+    long long m_since{0};         // when it last received, wrote, or started the request
+};
+
+/**
+ * The check that the source file does not change during a pull.
+ *
+ * A pull fetches a file in several requests, and their parts may only be
+ * put together if they come from the same version of the file (RFC 9110,
+ * Section 15.3.7.3).  Each response is compared with what earlier ones said:
+ *
+ * - the total length it gives in Content-Range, with the size of the file;
+ * - a strong ETag, or failing that Last-Modified, with the first one from
+ *   the same host.
+ *
+ * Validators are compared between responses of one server only.  Behind a
+ * redirector the requests of a pull may be answered by different servers
+ * that hold copies of the file, whose ETag and Last-Modified commonly differ
+ * although the content is the same.  A header that is absent is not a
+ * mismatch.
+ *
+ * Servers that share one address (behind a load balancer, or a proxy) cannot
+ * be told apart here, and if their validators differ a healthy pull fails.
+ * For such a source the comparison of validators can be turned off, which
+ * leaves the comparison of sizes.
+ *
+ * Safe to call from every stream thread.
+ */
+class SourceCheck {
+public:
+    // What one response says about the version of the file.
+    struct Seen {
+        std::string host;           // the server that answered, as tcp:address:port; empty if unknown
+        off_t total{-1};            // total length from Content-Range; -1 if not given
+        std::string etag;           // the ETag header as sent; empty if none
+        std::string last_modified;  // the Last-Modified header as sent; empty if none
+    };
+
+    /**
+     * @param file_size   size of the source file, as the pull was told it
+     * @param validators  whether ETag and Last-Modified are compared as well
+     */
+    explicit SourceCheck(off_t file_size, bool validators = true)
+        : m_file_size(file_size), m_validators(validators) {}
+
+    // False, with what changed in `error`, if the response disagrees with the
+    // size of the file or with an earlier response of the same host.
+    bool Agrees(const Seen &seen, std::string &error);
+
+private:
+    struct Version {
+        std::string etag;           // the first strong ETag of the host
+        std::string last_modified;  // its first Last-Modified
+    };
+
+    const off_t m_file_size;
+    const bool m_validators;
+    std::mutex m_mutex;                      // guards m_hosts
+    std::map<std::string, Version> m_hosts;
 };
 
 /**

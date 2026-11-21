@@ -70,6 +70,23 @@ TEST(XrdHttpTpcTests, prepareOpenURLTest) {
   }
 }
 
+TEST(XrdHttpTpcTests, parseContentRangeTotalTest) {
+  long long first = -1, last = -1, total = -5;
+  ASSERT_TRUE(XrdHttpTpcUtils::parseContentRange("bytes 0-99/1000", first, last, &total));
+  EXPECT_EQ(0, first);
+  EXPECT_EQ(99, last);
+  EXPECT_EQ(1000, total);
+  // An unknown total is given as -1.
+  ASSERT_TRUE(XrdHttpTpcUtils::parseContentRange("bytes 100-199/*", first, last, &total));
+  EXPECT_EQ(-1, total);
+  // A value that is not a range leaves all three as they were.
+  first = 1; last = 2; total = 3;
+  ASSERT_FALSE(XrdHttpTpcUtils::parseContentRange("bytes 5-4/10", first, last, &total));
+  EXPECT_EQ(1, first);
+  EXPECT_EQ(2, last);
+  EXPECT_EQ(3, total);
+}
+
 TEST(XrdHttpTpcTests, parseContentRangeTest) {
   long long first = -1, last = -1;
 
