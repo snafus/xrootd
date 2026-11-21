@@ -1045,6 +1045,22 @@ int TPCHandler::RunCurlWithUpdates(CURL *curl, XrdHttpExtReq &req, State &state,
         logTransferEvent(LogMask::Error, rec, "TRANSFER_FAIL", ss3.str());
         ss2 << finalizeErrorSuffix;
         ss << generateClientErr(ss2, rec, res);
+    } else if (rec.mTpcType == TpcType::Pull && !State::CarriesContent(state.GetStatusCode())) {
+        // The request ended without an error from the source, from libcurl
+        // or from the local filesystem, but not with the file: the source
+        // answered the GET with a status such as 204 or 304, or with a
+        // redirect that could not be followed.  Only a pull is concerned; the
+        // PUT of a push may rightly end with 201 or 204.
+        std::string err = state.GetErrorMessage();
+        std::stringstream ss2;
+        ss2 << "Remote side failed with status code " << state.GetStatusCode();
+        if (!err.empty()) {
+            std::replace(err.begin(), err.end(), '\n', ' ');
+            ss2 << "; error message: \"" << err << "\"";
+        }
+        logTransferEvent(LogMask::Error, rec, "TRANSFER_FAIL", ss2.str());
+        ss2 << finalizeErrorSuffix;
+        ss << generateClientErr(ss2, rec);
     } else if (!finalizeErrorMsg.empty()) {
         // Nothing else went wrong: the flush/close failure is the reason of the failure.
         std::stringstream ss2;

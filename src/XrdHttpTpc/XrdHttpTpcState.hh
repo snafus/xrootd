@@ -123,6 +123,16 @@ public:
 
     int GetStatusCode() const {return m_status_code;}
 
+    // Whether the final status of a GET says that the response carries what
+    // was asked for: 200 for the file, 203 for the file as a proxy has passed
+    // it on, 206 for a range of it.  Any other status below 400 that ends a
+    // request - 204, 304, a redirect that libcurl has not followed - comes
+    // without the file, and the pull has failed even though neither the
+    // source nor libcurl reports an error.
+    static bool CarriesContent(int status_code) {
+        return status_code == 200 || status_code == 203 || status_code == 206;
+    }
+
     std::string GetErrorMessage() const {return m_error_buf;}
 
     void SetErrorMessage(const std::string &error_msg) {m_error_buf = error_msg;}

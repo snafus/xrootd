@@ -315,6 +315,16 @@ size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) 
         else
             return size*nitems;
     }  // Status indicates failure.
+    if (!CarriesContent(obj->GetStatusCode())) {
+        // Not the file: keep the beginning for the error message and drop
+        // the rest.  The request is left to end normally, so that the pull
+        // fails on the status and not on an aborted transfer.
+        if (obj->m_error_buf.size() < 1024) {
+            obj->m_error_buf.append(static_cast<char*>(buffer),
+                                    std::min(1024 - obj->m_error_buf.size(), size*nitems));
+        }
+        return size*nitems;
+    }
     return obj->Write(static_cast<char*>(buffer), size*nitems);
 }
 

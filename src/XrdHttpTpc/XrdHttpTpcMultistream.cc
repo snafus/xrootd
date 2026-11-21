@@ -85,8 +85,12 @@ public:
                     m_error_code = error_code;
                     m_error_message = (*state_iter)->GetErrorMessage();
                 }
+                // The status of the first request that failed: an error
+                // status, or one that ended the request normally but without
+                // the range (see State::CarriesContent).
                 int status_code = (*state_iter)->GetStatusCode();
-                if (status_code >= 400 && !m_status_code) {
+                if (!m_status_code && (status_code >= 400
+                        || (result == CURLE_OK && !State::CarriesContent(status_code)))) {
                     m_status_code = status_code;
                     m_error_message = (*state_iter)->GetErrorMessage();
                 }
@@ -488,7 +492,8 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
     // Generate the final response back to the client.
     std::stringstream ss;
     success = false;
-    if (mch.GetStatusCode() >= 400) {
+    if (mch.GetStatusCode()) {
+        // Set only by a request that failed on its status.
         std::string err = mch.GetErrorMessage();
         std::stringstream ss2;
         ss2 << "Remote side failed with status code " << mch.GetStatusCode();
