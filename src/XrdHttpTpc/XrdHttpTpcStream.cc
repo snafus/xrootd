@@ -230,3 +230,49 @@ Stream::Read(off_t offset, char *buf, size_t size)
 {
     return m_fh->read(offset, buf, size);
 }
+
+
+ssize_t
+Stream::WriteAt(off_t offset, const char *buf, size_t size, std::string &error)
+{
+    // m_open_for_write only changes in Finalize(), which the thread of the
+    // request calls after the stream threads have ended.
+    if (!m_open_for_write) {
+        error = "Logic error: writing to a buffer not opened for write";
+        return SFS_ERROR;
+    }
+    if (size == 0) {return 0;}
+
+    std::lock_guard<std::mutex> lock(m_write_mutex);
+    ssize_t retval = m_fh->write(offset, buf, size);
+    if (retval == SFS_ERROR) {
+        // Still under the lock: the text is in the one error object of the
+        // file, which the next failing write would replace.
+        std::stringstream ss;
+        const char *msg = m_fh->error.getErrText();
+        if (!msg || (*msg == '\0')) {msg = "(no error message provided)";}
+        ss << msg << " (code=" << m_fh->error.getErrInfo() << ")";
+        error = ss.str();
+    }
+    return retval;
+}
+
+
+bool
+Stream::Truncate(off_t size, std::string &error)
+{
+    if (!m_open_for_write) {
+        error = "the file is not open for write";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_write_mutex);
+    if (m_fh->truncate(size) != SFS_OK) {
+        std::stringstream ss;
+        const char *msg = m_fh->error.getErrText();
+        if (!msg || (*msg == '\0')) {msg = "(no error message provided)";}
+        ss << msg << " (code=" << m_fh->error.getErrInfo() << ")";
+        error = ss.str();
+        return false;
+    }
+    return true;
+}

@@ -197,6 +197,10 @@ void State::ResetAfterRequest() {
     m_recv_all_headers = false;
     m_recv_status_line = false;
     m_repr_digests.clear();
+    m_wbuf.clear();
+    // What a response said belongs to that response: a text kept from one
+    // request must not be reported as the cause of the failure of the next.
+    m_error_buf.clear();
 }
 
 void State::RecordStatusOnFailure(int curl_result)
@@ -209,11 +213,19 @@ void State::RecordStatusOnFailure(int curl_result)
     }
 }
 
+// HeaderCB and WriteCB are callbacks of libcurl, which is C: no exception may
+// pass through them.  In blocks mode they run in a stream thread, where an
+// exception that escapes ends the server.  Returning a number other than the
+// one libcurl handed over makes it end the request with an error.
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)
 {
-    State *obj = static_cast<State*>(userdata);
-    std::string header(buffer, size*nitems);
-    return obj->Header(header);
+    try {
+        State *obj = static_cast<State*>(userdata);
+        std::string header(buffer, size*nitems);
+        return obj->Header(header);
+    } catch (...) {
+        return 0;
+    }
 }
 
 int State::Header(const std::string &header) {
@@ -235,6 +247,9 @@ int State::Header(const std::string &header) {
             return 0;
         }
         m_recv_status_line = true;
+        // A new response: what an earlier one of this request said (a
+        // redirection that was followed) is not about this one.
+        m_error_buf.clear();
         m_resp_content_length = -1;
         m_resp_range_first = -1;
         m_resp_range_last = -1;
@@ -312,30 +327,38 @@ bool State::CheckRangeResponse() {
 }
 
 size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) {
-    State *obj = static_cast<State*>(userdata);
-    if (obj->GetStatusCode() < 0) {
+    try {
+        return static_cast<State*>(userdata)->Body(buffer, size, nitems);
+    } catch (...) {
+        // Not size*nitems: libcurl ends the request with a write error.
         return 0;
-     }  // malformed request - got body before headers.
-    if (obj->GetStatusCode() >= 400) {
-        obj->m_error_buf += std::string(static_cast<char*>(buffer),
-                                        std::min(static_cast<size_t>(1024), size*nitems));
+    }
+}
+
+size_t State::Body(void *buffer, size_t size, size_t nitems) {
+    if (GetStatusCode() < 0) {
+        return 0;
+    }  // malformed request - got body before headers.
+    if (GetStatusCode() >= 400) {
+        m_error_buf += std::string(static_cast<char*>(buffer),
+                                   std::min(static_cast<size_t>(1024), size*nitems));
         // Record error messages until we hit a KB; at that point, fail out.
-        if (obj->m_error_buf.size() >= 1024)
+        if (m_error_buf.size() >= 1024)
             return 0;
         else
             return size*nitems;
     }  // Status indicates failure.
-    if (!CarriesContent(obj->GetStatusCode())) {
+    if (!CarriesContent(GetStatusCode())) {
         // Not the file: keep the beginning for the error message and drop
         // the rest.  The request is left to end normally, so that the pull
         // fails on the status and not on an aborted transfer.
-        if (obj->m_error_buf.size() < 1024) {
-            obj->m_error_buf.append(static_cast<char*>(buffer),
-                                    std::min(1024 - obj->m_error_buf.size(), size*nitems));
+        if (m_error_buf.size() < 1024) {
+            m_error_buf.append(static_cast<char*>(buffer),
+                               std::min(1024 - m_error_buf.size(), size*nitems));
         }
         return size*nitems;
     }
-    return obj->Write(static_cast<char*>(buffer), size*nitems);
+    return Write(static_cast<char*>(buffer), size*nitems);
 }
 
 /**
@@ -385,6 +408,37 @@ ssize_t State::Write(char *buffer, size_t size) {
         m_error_code = errRange;
         return -1;
     }
+    const size_t write_size = m_stream->OffsetWriteSize();
+    if (write_size) {
+        // Blocks mode: collect the data and write it at its own offset each
+        // time one write is complete.  libcurl hands the data over in pieces
+        // of at most its buffer, 16 KiB unless set otherwise; written as they
+        // come, these pieces would each be a system call and a record for the
+        // real-time checksum of the storage.
+        size_t done = 0;
+        try {
+            while (done < size) {
+                if (m_wbuf.empty()) {
+                    m_wbuf.reserve(write_size);
+                    m_wbuf_offset = m_start_offset + m_offset + done;
+                }
+                size_t count = std::min(size - done, write_size - m_wbuf.size());
+                m_wbuf.insert(m_wbuf.end(), buffer + done, buffer + done + count);
+                done += count;
+                if (m_wbuf.size() == write_size && !FlushWriteBuffer()) {
+                    return -1;
+                }
+            }
+        } catch (std::exception &e) {
+            m_error_buf = std::string("Failed to buffer the data received: ") + e.what();
+            m_error_code = errWrite;
+            return -1;
+        }
+        // Only now: the whole piece is in the buffer or in the file.
+        m_offset += size;
+        if (m_pull_received) {m_pull_received->fetch_add(size, std::memory_order_relaxed);}
+        return size;
+    }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
     if (retval == SFS_ERROR) {
         m_error_buf = m_stream->GetErrorMessage();
@@ -393,6 +447,39 @@ ssize_t State::Write(char *buffer, size_t size) {
     }
     m_offset += retval;
     return retval;
+}
+
+bool State::FlushWriteBuffer() {
+    if (m_wbuf.empty()) {return true;}
+    if (m_pull_stop && m_pull_stop->load(std::memory_order_relaxed)) {
+        // The pull is being stopped for a reason that is already recorded,
+        // by another stream or by the thread of the request.  Nothing more is
+        // written, and this is not a cause.
+        m_wbuf.clear();
+        return false;
+    }
+    const off_t offset = m_wbuf_offset;
+    const size_t size = m_wbuf.size();
+    std::string error;
+    ssize_t retval = m_stream->WriteAt(offset, m_wbuf.data(), size, error);
+    m_wbuf.clear();
+    if (retval != static_cast<ssize_t>(size)) {
+        // A short write counts as a failure: the bytes the storage did not
+        // take are not in the file, whatever the layers above it believe.
+        std::stringstream ss;
+        if (retval >= 0) {
+            ss << "The storage took only " << retval << " of the " << size
+               << " bytes of a write at offset " << offset;
+        } else {
+            ss << (error.empty() ? "(no error message provided)" : error)
+               << "; write of " << size << " bytes at offset " << offset;
+        }
+        m_error_buf = ss.str();
+        m_error_code = errWrite;
+        return false;
+    }
+    if (m_pull_written) {m_pull_written->fetch_add(retval, std::memory_order_relaxed);}
+    return true;
 }
 
 void State::RecordFinalizeError(int error_code, const std::string &error_msg) {

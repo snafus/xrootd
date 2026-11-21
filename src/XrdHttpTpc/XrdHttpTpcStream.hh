@@ -10,6 +10,7 @@
 #include "XrdSfs/XrdSfsInterface.hh"
 
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -82,6 +83,42 @@ public:
     bool Finalize();
 
     std::string GetErrorMessage() const {return m_error_buf;}
+
+    // -- Writes at offsets, for a pull in blocks ---------------------------
+    //
+    // In blocks mode each stream of a pull is a thread that collects its own
+    // data and writes it at the offset it belongs to.  Write() and its
+    // reorder buffers are then not used at all.
+    //
+    // Threads: WriteAt() may be called from every stream thread at the same
+    // time, and so may OffsetWriteSize(), which only reads a value set before
+    // the threads exist.  Everything else of this class is called by one
+    // thread only: the thread of the request, before the stream threads
+    // start and after they have been joined.
+
+    // Turns on writes at offsets, each of this size.  To be called before any
+    // stream thread exists.
+    void EnableOffsetWrites(size_t write_size) {m_offset_write_size = write_size;}
+
+    // The size of a write at an offset; 0 when writes are in file order.
+    size_t OffsetWriteSize() const {return m_offset_write_size;}
+
+    // Writes the buffer at the offset and returns the number of bytes the
+    // storage took, or SFS_ERROR with the reason in `error`.  The reason is
+    // handed to the caller and not kept here, so that two streams failing at
+    // the same moment do not overwrite each other's.
+    //
+    // One stream writes at a time.  The file object is not safe for writes
+    // from several threads at once, and it keeps the text of an error in a
+    // single place; buffered writes to one file are serialised by the kernel
+    // in any case.
+    ssize_t WriteAt(off_t offset, const char *buffer, size_t size, std::string &error);
+
+    // Cuts the file to the size given.  Used when a pull in blocks has
+    // failed, to leave only blocks that are complete; to be called after the
+    // stream threads have been joined.  False with the reason in `error` when
+    // the storage refuses.
+    bool Truncate(off_t size, std::string &error);
 
 private:
 
@@ -193,6 +230,8 @@ private:
     Entry *FirstAvailableBuffer();
 
     bool m_open_for_write;
+    size_t m_offset_write_size{0};  // not 0: the streams write at offsets, see EnableOffsetWrites()
+    std::mutex m_write_mutex;       // one WriteAt() at a time; also guards the error object of m_fh
     size_t m_avail_count;
     std::unique_ptr<XrdSfsFile> m_fh;
     off_t m_offset;
