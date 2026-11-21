@@ -12,6 +12,7 @@
 
 #include "XrdHttpTpcState.hh"
 #include "XrdHttpTpcStream.hh"
+#include "XrdHttpTpcUtils.hh"
 
 #include "XrdHttp/XrdHttpHeaderUtils.hh"
 
@@ -192,6 +193,7 @@ void State::ResetAfterRequest() {
     m_status_code = -1;
     m_content_length = -1;
     m_push_length = -1;
+    m_range_length = -1;
     m_recv_all_headers = false;
     m_recv_status_line = false;
     m_repr_digests.clear();
@@ -223,8 +225,14 @@ int State::Header(const std::string &header) {
             return 0;
         }
         m_recv_status_line = true;
+        m_resp_content_length = -1;
+        m_resp_range_first = -1;
+        m_resp_range_last = -1;
     } else if (header.size() == 0 || header == "\n" || header == "\r\n") {
         m_recv_all_headers = true;
+        if (!CheckRangeResponse()) {
+            return 0;
+        }
     }
     else if (header != "\r\n") {
         // Parse the header
@@ -242,6 +250,12 @@ int State::Header(const std::string &header) {
                     //printf("Content-length header unparseable\n");
                     return 0;
                 }
+                m_resp_content_length = m_content_length;
+            }
+            if (header_name == "content-range") {
+                // An unparseable value leaves the range unset; it is reported
+                // once all the headers are in.
+                XrdHttpTpcUtils::parseContentRange(header_value, m_resp_range_first, m_resp_range_last);
             }
             if(header_name == "repr-digest") {
               XrdHttpHeaderUtils::parseReprDigest(header_value,m_repr_digests);
@@ -254,6 +268,37 @@ int State::Header(const std::string &header) {
         }
     }
     return header.size();
+}
+
+bool State::CheckRangeResponse() {
+    // Only a successful answer to a range request is checked here; errors and
+    // intermediate responses (redirections) are handled elsewhere.
+    if (m_push || m_range_length < 0 || m_status_code < 200 || m_status_code >= 300) {
+        return true;
+    }
+    const long long first = m_start_offset;
+    const long long last = first + m_range_length - 1;
+    if (m_status_code == 206 && m_resp_range_first == first && m_resp_range_last == last) {
+        return true;
+    }
+    // A server may ignore the Range header and send the whole file. That is
+    // what was requested when the range covers the whole file.
+    if (m_status_code == 200 && first == 0 && m_resp_content_length == m_range_length) {
+        return true;
+    }
+    std::stringstream ss;
+    ss << "The source did not return the requested range (bytes " << first << "-" << last
+       << "): it answered with status " << m_status_code;
+    if (m_resp_range_first >= 0) {
+        ss << " and the range bytes " << m_resp_range_first << "-" << m_resp_range_last;
+    } else if (m_status_code == 206) {
+        ss << " without a valid Content-Range header";
+    } else if (m_status_code == 200) {
+        ss << "; it must support range requests for a transfer with several streams";
+    }
+    m_error_buf = ss.str();
+    m_error_code = errRange;
+    return false;
 }
 
 size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) {
@@ -270,6 +315,16 @@ size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) 
         else
             return size*nitems;
     }  // Status indicates failure.
+    if (!CarriesContent(obj->GetStatusCode())) {
+        // Not the file: keep the beginning for the error message and drop
+        // the rest.  The request is left to end normally, so that the pull
+        // fails on the status and not on an aborted transfer.
+        if (obj->m_error_buf.size() < 1024) {
+            obj->m_error_buf.append(static_cast<char*>(buffer),
+                                    std::min(1024 - obj->m_error_buf.size(), size*nitems));
+        }
+        return size*nitems;
+    }
     return obj->Write(static_cast<char*>(buffer), size*nitems);
 }
 
@@ -296,7 +351,30 @@ size_t State::PushRespCB(void *buffer, size_t size, size_t nitems, void *userdat
   return size*nitems;
 }
 
+bool State::CheckRangeComplete() {
+    if (m_push || m_range_length < 0 || m_error_code || m_offset == m_range_length
+        || m_status_code < 200 || m_status_code >= 300) {
+        return true;
+    }
+    std::stringstream ss;
+    ss << "The source sent " << m_offset << " bytes for the range bytes " << m_start_offset
+       << "-" << (m_start_offset + m_range_length - 1) << ", which is " << m_range_length
+       << " bytes long";
+    m_error_buf = ss.str();
+    m_error_code = errRange;
+    return false;
+}
+
 ssize_t State::Write(char *buffer, size_t size) {
+    if (m_range_length >= 0 && m_offset + static_cast<off_t>(size) > m_range_length) {
+        // Never write past the end of the range: these bytes belong to another request.
+        std::stringstream ss;
+        ss << "The source sent more than " << m_range_length << " bytes for the range bytes "
+           << m_start_offset << "-" << (m_start_offset + m_range_length - 1);
+        m_error_buf = ss.str();
+        m_error_code = errRange;
+        return -1;
+    }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
     if (retval == SFS_ERROR) {
         m_error_buf = m_stream->GetErrorMessage();
@@ -371,6 +449,7 @@ void State::SetTransferParameters(off_t offset, size_t size) {
     m_start_offset = offset;
     m_offset = 0;
     m_content_length = size;
+    m_range_length = size;
     std::stringstream ss;
     ss << offset << "-" << (offset+size-1);
     curl_easy_setopt(m_curl, CURLOPT_RANGE, ss.str().c_str());

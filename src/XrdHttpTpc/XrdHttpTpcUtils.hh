@@ -64,6 +64,17 @@ public:
    * @return the XRootD open URL that will contain at least one opaque parameter (oss.task)
    */
   static std::string prepareOpenURL(PrepareOpenURLParams & params);
+
+  /**
+   * Parses the value of a Content-Range response header of the form
+   * "bytes FIRST-LAST/TOTAL", where TOTAL may be "*".
+   * @param value the value of the header (surrounding white space is ignored)
+   * @param first set to the offset of the first byte of the range
+   * @param last set to the offset of the last byte of the range
+   * @return true if the value is a valid byte range, false otherwise (first and
+   * last are then left untouched)
+   */
+  static bool parseContentRange(const std::string & value, long long & first, long long & last);
 };
 
 

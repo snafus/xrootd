@@ -29,6 +29,7 @@ public:
         errWrite   = 1,  // Failure while writing the received data to the local file.
         errFlush   = 2,  // Failure while flushing the local file.
         errClose   = 3,  // Failure while closing the local file.
+        errRange   = 4,  // The source did not answer with the range that was requested, or not with all of it.
         errTimeout = 10  // The transfer did not make any progress within the timeout.
     };
 
@@ -98,6 +99,12 @@ public:
 
     void SetTransferParameters(off_t offset, size_t size);
 
+    // To be called when a request has completed without a transport error:
+    // checks that the body filled the range that was requested, and records
+    // the error otherwise.  libcurl cannot tell when the body carries no
+    // length of its own (chunked encoding).
+    bool CheckRangeComplete();
+
     void SetupHeaders(XrdHttpExtReq &req);
 
     void SetupHeadersForHEAD(XrdHttpExtReq & req);
@@ -115,6 +122,16 @@ public:
     void SetErrorCode(int error_code) {m_error_code = error_code;}
 
     int GetStatusCode() const {return m_status_code;}
+
+    // Whether the final status of a GET says that the response carries what
+    // was asked for: 200 for the file, 203 for the file as a proxy has passed
+    // it on, 206 for a range of it.  Any other status below 400 that ends a
+    // request - 204, 304, a redirect that libcurl has not followed - comes
+    // without the file, and the pull has failed even though neither the
+    // source nor libcurl reports an error.
+    static bool CarriesContent(int status_code) {
+        return status_code == 200 || status_code == 203 || status_code == 206;
+    }
 
     std::string GetErrorMessage() const {return m_error_buf;}
 
@@ -189,6 +206,9 @@ private:
     static size_t HeaderCB(char *buffer, size_t size, size_t nitems,
                            void *userdata);
     int Header(const std::string &header);
+    // Whether the response whose headers were just received carries the range
+    // that was requested; records the error otherwise.
+    bool CheckRangeResponse();
     static size_t WriteCB(void *buffer, size_t size, size_t nitems, void *userdata);
     ssize_t Write(char *buffer, size_t size);
     /**
@@ -207,6 +227,10 @@ private:
     int m_status_code;  // status code from HTTP response.
     int m_error_code; // error code from underlying stream operations.
     off_t m_content_length;  // value of Content-Length header, if we received one.
+    off_t m_range_length{-1};  // number of bytes of the range we requested; -1 if we requested no range.
+    off_t m_resp_content_length{-1};  // Content-Length of the current response; -1 if it has none.
+    long long m_resp_range_first{-1};  // first byte of the Content-Range of the current response; -1 if it has none.
+    long long m_resp_range_last{-1};  // last byte of the Content-Range of the current response.
     off_t m_push_length; // For push transfers, the size of the file on our server.
     Stream *m_stream;  // stream corresponding to this transfer.
     CURL *m_curl;  // libcurl handle

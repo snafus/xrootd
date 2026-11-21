@@ -17,6 +17,9 @@
 
 #include <curl/curl.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <dlfcn.h>
 #include <fcntl.h>
 
@@ -162,6 +165,21 @@ int TPCHandler::opensocket_callback(void *clientp,
     return CURL_SOCKET_BAD;
   }
 
+  // Remember the connection for the performance markers.  The HTTP-TPC
+  // specification wants tcp:1.2.3.4:1094 and tcp:[2001:db8::1]:1094.
+  char ip[INET6_ADDRSTRLEN];
+  std::stringstream desc;
+  if (aInfo->addr.sa_family == AF_INET) {
+    const struct sockaddr_in *sin = reinterpret_cast<const struct sockaddr_in *>(&(aInfo->addr));
+    if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
+      desc << "tcp:" << ip << ":" << ntohs(sin->sin_port);
+  } else if (aInfo->addr.sa_family == AF_INET6) {
+    const struct sockaddr_in6 *sin6 = reinterpret_cast<const struct sockaddr_in6 *>(&(aInfo->addr));
+    if (inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)))
+      desc << "tcp:[" << ip << "]:" << ntohs(sin6->sin6_port);
+  }
+  rec->connections[fd] = desc.str();
+
   return fd;
 }
 
@@ -172,6 +190,7 @@ int TPCHandler::closesocket_callback(void *clientp, curl_socket_t fd) {
   // Otherwise, we would lose the socket usage information if the socket is closed before
   // the PMark handle is closed.
   rec->pmarkManager.endPmark(fd);
+  rec->connections.erase(fd);
 
   return close(fd);
 }
@@ -735,7 +754,7 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, TPC::State
 /*            T P C H a n d l e r : : S e n d P e r f M a r k e r             */
 /******************************************************************************/
   
-int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vector<State*> &state,
+int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vector<State*> & /*state*/,
     off_t bytes_transferred)
 {
     // The 'performance marker' format is largely derived from how GridFTP works
@@ -758,15 +777,18 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vecto
     ss << "Stripe Bytes Transferred: " << bytes_transferred << crlf;
     ss << "Total Stripe Count: 1" << crlf;
     // Build a list of TCP connections associated with this transfer; used by
-    // the TPC client for monitoring purposes.
+    // the TPC client for monitoring purposes.  The request handles cannot be
+    // asked: there are many more of them than connections, and a handle keeps
+    // reporting the connection of its previous request until libcurl starts
+    // its next one.  The list is the sockets libcurl has open for the
+    // transfer, as recorded by the socket callbacks.
     bool first = true;
     std::stringstream ss2;
-    for (std::vector<State*>::const_iterator iter = state.begin();
-        iter != state.end(); iter++)
+    for (std::map<int, std::string>::const_iterator iter = rec.connections.begin();
+        iter != rec.connections.end(); iter++)
     {
-        std::string desc = (*iter)->GetConnectionDescription();
-        if (!desc.empty()) {
-            ss2 << (first ? "" : ",") << desc;
+        if (!iter->second.empty()) {
+            ss2 << (first ? "" : ",") << iter->second;
             first = false;
         }
     }
@@ -1023,6 +1045,22 @@ int TPCHandler::RunCurlWithUpdates(CURL *curl, XrdHttpExtReq &req, State &state,
         logTransferEvent(LogMask::Error, rec, "TRANSFER_FAIL", ss3.str());
         ss2 << finalizeErrorSuffix;
         ss << generateClientErr(ss2, rec, res);
+    } else if (rec.mTpcType == TpcType::Pull && !State::CarriesContent(state.GetStatusCode())) {
+        // The request ended without an error from the source, from libcurl
+        // or from the local filesystem, but not with the file: the source
+        // answered the GET with a status such as 204 or 304, or with a
+        // redirect that could not be followed.  Only a pull is concerned; the
+        // PUT of a push may rightly end with 201 or 204.
+        std::string err = state.GetErrorMessage();
+        std::stringstream ss2;
+        ss2 << "Remote side failed with status code " << state.GetStatusCode();
+        if (!err.empty()) {
+            std::replace(err.begin(), err.end(), '\n', ' ');
+            ss2 << "; error message: \"" << err << "\"";
+        }
+        logTransferEvent(LogMask::Error, rec, "TRANSFER_FAIL", ss2.str());
+        ss2 << finalizeErrorSuffix;
+        ss << generateClientErr(ss2, rec);
     } else if (!finalizeErrorMsg.empty()) {
         // Nothing else went wrong: the flush/close failure is the reason of the failure.
         std::stringstream ss2;
@@ -1264,6 +1302,8 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
         return req.SendSimpleResp(rec.status, NULL, NULL, generateClientErr(ss, rec).c_str(), 0);
     }
     uint64_t sourceFileContentLength = 0;
+    // False if the source answered the HEAD request without a Content-Length
+    bool sourceFileContentLengthKnown = false;
     {
         //Get the content-length of the source file and pass it to the OSS layer
         //during the open
@@ -1274,7 +1314,10 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
         if(success) {
             //In the case we cannot get the information from the source server (offline or other error)
             //we just don't add the file information to the opaque of the local file to open
-            full_url += "&oss.asize=" + std::to_string(sourceFileContentLength);
+            sourceFileContentLengthKnown = static_cast<int64_t>(sourceFileContentLength) >= 0;
+            if (sourceFileContentLengthKnown) {
+                full_url += "&oss.asize=" + std::to_string(sourceFileContentLength);
+            }
             mismatchDigests = mismatchReprDigest(sourceFileReprDigest,req,rec);
         }
         if(!success || mismatchDigests) {
@@ -1283,6 +1326,14 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
             // just exit here
             return 0;
         }
+    }
+    if (streams > 1 && (sourceFileContentLength == 0 || !sourceFileContentLengthKnown)) {
+        // An empty file has no range to hand out to the streams: the
+        // multistream code would run no request at all and report an internal
+        // error. A file of unknown size cannot be cut into ranges either.
+        // Pull both with the single request instead.
+        streams = 1;
+        rec.streams = streams;
     }
     int open_result = OpenWaitStall(*fh, full_url, mode|SFS_O_WRONLY,
                                     0644 | SFS_O_MKPTH,
