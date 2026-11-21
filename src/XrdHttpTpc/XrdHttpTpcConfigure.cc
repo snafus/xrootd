@@ -180,7 +180,11 @@ bool TPCHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
                << m_pull_options.block_min << " to " << m_pull_options.block_max
                << " bytes; writes of " << m_pull_options.write_size << " bytes (up to "
                << (static_cast<long long>(m_pull_options.max_stream_threads) * m_pull_options.write_size / PullOptions::MiB)
-               << " MiB of write buffers)";
+               << " MiB of write buffers); a stream may wait " << m_first_timeout
+               << " seconds for the first byte of a request and " << m_timeout
+               << " for more; the source file is checked for "
+               << (m_pull_options.source_validators ? "its size and its ETag or Last-Modified"
+                                                    : "its size only");
             m_log.Say("Config ", ss.str().c_str());
         }
     }
@@ -301,6 +305,7 @@ bool TPCHandler::ConfigureLogger(XrdOucStream &config_obj)
 //   http_multi.max_streams <streams of one request> [<stream threads of the server>]
 //   http_multi.block_size  <minimum> [<maximum>]         sizes take k, m, g, t
 //   http_multi.write_size  <size>
+//   http_multi.source_check full | size
 //   http_multi.retry       <attempts> [<wait>]            read and checked; not used yet
 //
 // Each value is checked against its limits here, so that the message names
@@ -360,6 +365,15 @@ bool TPCHandler::ConfigureMultistream(const char *name, XrdOucStream &Config)
             return false;
         }
         m_pull_options.write_size = static_cast<off_t>(size);
+    } else if (!strcmp(name, "source_check")) {
+        if (!strcmp(val, "full")) {
+            m_pull_options.source_validators = true;
+        } else if (!strcmp(val, "size")) {
+            m_pull_options.source_validators = false;
+        } else {
+            m_log.Emsg("Config", "http_multi.source_check must be 'full' or 'size', not", val);
+            return false;
+        }
     } else if (!strcmp(name, "retry")) {
         if (XrdOuca2x::a2i(m_log, "http_multi.retry attempts", val,
                            &m_pull_options.retry_attempts, 1, PullOptions::MaxRetryAttempts)) {

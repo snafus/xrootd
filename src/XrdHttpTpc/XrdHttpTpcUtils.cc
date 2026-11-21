@@ -84,7 +84,7 @@ bool readNumber(const std::string & str, size_t & pos, long long & number) {
 }
 }
 
-bool XrdHttpTpcUtils::parseContentRange(const std::string & value, long long & first, long long & last) {
+bool XrdHttpTpcUtils::parseContentRange(const std::string & value, long long & first, long long & last, long long * totalLength) {
   static const char blanks[] = " \t\r\n";
   const size_t begin = value.find_first_not_of(blanks);
   if (begin == std::string::npos) return false;
@@ -94,7 +94,7 @@ bool XrdHttpTpcUtils::parseContentRange(const std::string & value, long long & f
   if (range.size() <= unit.size() || strncasecmp(range.c_str(), unit.c_str(), unit.size())) return false;
 
   size_t pos = unit.size();
-  long long firstByte, lastByte, total;
+  long long firstByte, lastByte, total = -1;
   if (!readNumber(range, pos, firstByte)) return false;
   if (pos == range.size() || range[pos++] != '-') return false;
   if (!readNumber(range, pos, lastByte)) return false;
@@ -107,5 +107,6 @@ bool XrdHttpTpcUtils::parseContentRange(const std::string & value, long long & f
 
   first = firstByte;
   last = lastByte;
+  if (totalLength) *totalLength = total;
   return true;
 }

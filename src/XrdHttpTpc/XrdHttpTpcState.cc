@@ -10,6 +10,7 @@
 
 #include <curl/curl.h>
 
+#include "XrdHttpTpcBlockPull.hh"
 #include "XrdHttpTpcState.hh"
 #include "XrdHttpTpcStream.hh"
 #include "XrdHttpTpcUtils.hh"
@@ -253,9 +254,12 @@ int State::Header(const std::string &header) {
         m_resp_content_length = -1;
         m_resp_range_first = -1;
         m_resp_range_last = -1;
+        m_resp_range_total = -1;
+        m_resp_etag.clear();
+        m_resp_last_modified.clear();
     } else if (header.size() == 0 || header == "\n" || header == "\r\n") {
         m_recv_all_headers = true;
-        if (!CheckRangeResponse()) {
+        if (!CheckRangeResponse() || !CheckSourceUnchanged()) {
             return 0;
         }
     }
@@ -280,7 +284,17 @@ int State::Header(const std::string &header) {
             if (header_name == "content-range") {
                 // An unparseable value leaves the range unset; it is reported
                 // once all the headers are in.
-                XrdHttpTpcUtils::parseContentRange(header_value, m_resp_range_first, m_resp_range_last);
+                XrdHttpTpcUtils::parseContentRange(header_value, m_resp_range_first, m_resp_range_last,
+                                                   &m_resp_range_total);
+            }
+            if (header_name == "etag" || header_name == "last-modified") {
+                // Kept as sent, without the white space around it: they are
+                // only compared with those of other responses.
+                static const char blanks[] = " \t\r\n";
+                const size_t begin = header_value.find_first_not_of(blanks);
+                const std::string value = begin == std::string::npos ? std::string()
+                    : header_value.substr(begin, header_value.find_last_not_of(blanks) - begin + 1);
+                (header_name == "etag" ? m_resp_etag : m_resp_last_modified) = value;
             }
             if(header_name == "repr-digest") {
               XrdHttpHeaderUtils::parseReprDigest(header_value,m_repr_digests);
@@ -324,6 +338,28 @@ bool State::CheckRangeResponse() {
     m_error_buf = ss.str();
     m_error_code = errRange;
     return false;
+}
+
+bool State::CheckSourceUnchanged() {
+    // Only a response that brings a part of the file says something about
+    // the file; a redirection or an error does not.
+    if (!m_source_check || m_push || !CarriesContent(m_status_code)) {
+        return true;
+    }
+    SourceCheck::Seen seen;
+    seen.total = m_resp_range_total;
+    seen.etag = m_resp_etag;
+    seen.last_modified = m_resp_last_modified;
+    // The server that answered, in the form the performance markers use:
+    // behind a redirector the requests of a pull may reach different servers.
+    seen.host = GetConnectionDescription();
+    std::string error;
+    if (!m_source_check->Agrees(seen, error)) {
+        m_error_buf = error;
+        m_error_code = errSource;
+        return false;
+    }
+    return true;
 }
 
 size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) {
@@ -437,6 +473,7 @@ ssize_t State::Write(char *buffer, size_t size) {
         // Only now: the whole piece is in the buffer or in the file.
         m_offset += size;
         if (m_pull_received) {m_pull_received->fetch_add(size, std::memory_order_relaxed);}
+        if (m_worker_status) {m_worker_status->received.fetch_add(size, std::memory_order_relaxed);}
         return size;
     }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
@@ -461,7 +498,11 @@ bool State::FlushWriteBuffer() {
     const off_t offset = m_wbuf_offset;
     const size_t size = m_wbuf.size();
     std::string error;
+    // While this stream writes, or waits for its turn to write, it is not
+    // waiting for the source.
+    if (m_worker_status) {m_worker_status->phase.store(WorkerStatus::Writing);}
     ssize_t retval = m_stream->WriteAt(offset, m_wbuf.data(), size, error);
+    if (m_worker_status) {m_worker_status->phase.store(WorkerStatus::Receiving);}
     m_wbuf.clear();
     if (retval != static_cast<ssize_t>(size)) {
         // A short write counts as a failure: the bytes the storage did not

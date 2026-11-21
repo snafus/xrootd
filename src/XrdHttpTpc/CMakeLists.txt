@@ -24,6 +24,7 @@ add_library(${XrdHttpTPC} MODULE
   XrdHttpTpcMultistream.cc
   XrdHttpTpcPMarkManager.cc  XrdHttpTpcPMarkManager.hh
   XrdHttpTpcPullInBlocks.cc
+  XrdHttpTpcPullMon.cc       XrdHttpTpcPullMon.hh
   XrdHttpTpcPullOptions.cc   XrdHttpTpcPullOptions.hh
   XrdHttpTpcState.cc         XrdHttpTpcState.hh
   XrdHttpTpcStream.cc        XrdHttpTpcStream.hh

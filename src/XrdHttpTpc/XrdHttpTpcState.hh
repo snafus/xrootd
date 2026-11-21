@@ -20,6 +20,8 @@ struct curl_slist;
 
 namespace TPC {
 class Stream;
+class SourceCheck;
+struct WorkerStatus;
 
 class State {
 public:
@@ -33,6 +35,7 @@ public:
         errFlush   = 2,  // Failure while flushing the local file.
         errClose   = 3,  // Failure while closing the local file.
         errRange   = 4,  // The source did not answer with the range that was requested, or not with all of it.
+        errSource  = 5,  // The source file changed between two requests of the pull.
         errTimeout = 10  // The transfer did not make any progress within the timeout.
     };
 
@@ -197,6 +200,15 @@ public:
     // for the storage first.
     void SetPullStopFlag(const std::atomic<bool> *stop) {m_pull_stop = stop;}
 
+    // Where this state tells what its stream is doing, for the stall check
+    // of the thread of the request: bytes received, and whether it is inside
+    // a write.  See WorkerStatus.
+    void SetWorkerStatus(WorkerStatus *status) {m_worker_status = status;}
+
+    // The check that every response of the pull comes from the same version
+    // of the source file; shared by the streams.  See SourceCheck.
+    void SetSourceCheck(SourceCheck *check) {m_source_check = check;}
+
     CURL *GetHandle() const {return m_curl;}
 
     int AvailableBuffers() const;
@@ -287,6 +299,15 @@ private:
     off_t m_resp_content_length{-1};  // Content-Length of the current response; -1 if it has none.
     long long m_resp_range_first{-1};  // first byte of the Content-Range of the current response; -1 if it has none.
     long long m_resp_range_last{-1};  // last byte of the Content-Range of the current response.
+    long long m_resp_range_total{-1};  // total length in the Content-Range of the current response; -1 if none.
+    std::string m_resp_etag;  // ETag of the current response, as sent.
+    std::string m_resp_last_modified;  // Last-Modified of the current response, as sent.
+    WorkerStatus *m_worker_status{nullptr};  // blocks mode: see SetWorkerStatus().
+    SourceCheck *m_source_check{nullptr};  // blocks mode: see SetSourceCheck().
+    // Compares the response whose headers have all arrived with what earlier
+    // responses of the pull said of the source file.  False, with an
+    // errSource recorded, if the file has changed.
+    bool CheckSourceUnchanged();
     off_t m_push_length; // For push transfers, the size of the file on our server.
     Stream *m_stream;  // stream corresponding to this transfer.
     CURL *m_curl;  // libcurl handle
