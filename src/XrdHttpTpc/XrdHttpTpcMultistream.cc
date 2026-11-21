@@ -555,6 +555,12 @@ int TPCHandler::RunCurlWithStreamsImpl(XrdHttpExtReq &req, State &state,
             logTransferEvent(LogMask::Error, rec, "MULTISTREAM_ERROR",
                 ss2.str());
         } else {
+            // Every range was fetched and written, so the pull has the whole
+            // file.  For a client that is a complete 200 (OK) response
+            // (RFC 9110, Section 15.3.7.3), and 200 is what a single-stream
+            // pull logs for a success; the status kept so far is only the
+            // first error of a stream, which is 0 here.
+            rec.tpc_status = 200;
             ss << "success: Created";
             success = true;
         }
