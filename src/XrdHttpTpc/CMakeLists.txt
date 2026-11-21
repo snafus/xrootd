@@ -19,9 +19,13 @@ endif()
 set(XrdHttpTPC XrdHttpTPC-${PLUGIN_VERSION})
 
 add_library(${XrdHttpTPC} MODULE
+  XrdHttpTpcBlockPull.cc     XrdHttpTpcBlockPull.hh
   XrdHttpTpcConfigure.cc
   XrdHttpTpcMultistream.cc
   XrdHttpTpcPMarkManager.cc  XrdHttpTpcPMarkManager.hh
+  XrdHttpTpcPullInBlocks.cc
+  XrdHttpTpcPullMon.cc       XrdHttpTpcPullMon.hh
+  XrdHttpTpcPullOptions.cc   XrdHttpTpcPullOptions.hh
   XrdHttpTpcState.cc         XrdHttpTpcState.hh
   XrdHttpTpcStream.cc        XrdHttpTpcStream.hh
   XrdHttpTpcTPC.cc           XrdHttpTpcTPC.hh

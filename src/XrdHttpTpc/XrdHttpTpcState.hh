@@ -6,7 +6,10 @@
 #ifndef __XRD_TPC_STATE_HH__
 #define __XRD_TPC_STATE_HH__
 
+#include <atomic>
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 // Forward dec'ls
@@ -17,6 +20,8 @@ struct curl_slist;
 
 namespace TPC {
 class Stream;
+class SourceCheck;
+struct WorkerStatus;
 
 class State {
 public:
@@ -30,6 +35,7 @@ public:
         errFlush   = 2,  // Failure while flushing the local file.
         errClose   = 3,  // Failure while closing the local file.
         errRange   = 4,  // The source did not answer with the range that was requested, or not with all of it.
+        errSource  = 5,  // The source file changed between two requests of the pull.
         errTimeout = 10  // The transfer did not make any progress within the timeout.
     };
 
@@ -148,6 +154,46 @@ public:
 
     void ResetAfterRequest();
 
+    // -- A pull in blocks ---------------------------------------------------
+    //
+    // When the stream writes at offsets (Stream::EnableOffsetWrites), this
+    // state does not hand its data to the reorder buffers.  It collects one
+    // write of data and writes it at the offset it belongs to; the stream
+    // thread that owns the state calls FlushWriteBuffer() at the end of a
+    // block for what is left.
+    //
+    // Threads: a state belongs to one stream thread from the moment that
+    // thread starts until it has been joined.  The three pointers below lead
+    // to objects shared by all the streams of the pull, which outlive them.
+
+    // Writes what has been collected.  False if the storage did not take all
+    // of it, with the reason recorded as an errWrite; false with no error
+    // recorded if the pull is stopping, in which case the data is dropped:
+    // another stream has already recorded why the pull fails.
+    bool FlushWriteBuffer();
+
+    // Counters, shared by the streams of a pull, of the bytes received from
+    // the source and of the bytes the storage has taken.  The thread of the
+    // request reads them for the markers and to see whether the pull moves.
+    void SetPullCounters(std::atomic<off_t> *received, std::atomic<off_t> *written) {
+        m_pull_received = received;
+        m_pull_written = written;
+    }
+
+    // The flag that tells every stream of a pull to stop.  It is looked at
+    // before each write, so that a stream that is stopping does not queue
+    // for the storage first.
+    void SetPullStopFlag(const std::atomic<bool> *stop) {m_pull_stop = stop;}
+
+    // Where this state tells what its stream is doing, for the stall check
+    // of the thread of the request: bytes received, and whether it is inside
+    // a write.  See WorkerStatus.
+    void SetWorkerStatus(WorkerStatus *status) {m_worker_status = status;}
+
+    // The check that every response of the pull comes from the same version
+    // of the source file; shared by the streams.  See SourceCheck.
+    void SetSourceCheck(SourceCheck *check) {m_source_check = check;}
+
     CURL *GetHandle() const {return m_curl;}
 
     int AvailableBuffers() const;
@@ -210,6 +256,8 @@ private:
     // that was requested; records the error otherwise.
     bool CheckRangeResponse();
     static size_t WriteCB(void *buffer, size_t size, size_t nitems, void *userdata);
+    // What WriteCB does with a piece of the response body; may throw.
+    size_t Body(void *buffer, size_t size, size_t nitems);
     ssize_t Write(char *buffer, size_t size);
     /**
     * This callback is used to give users the error message returns by the passive server of
@@ -224,6 +272,11 @@ private:
     bool m_recv_all_headers;  // true if we have seen the end of headers.
     off_t m_offset;  // number of bytes we have received.
     off_t m_start_offset;  // offset where we started in the file.
+    std::vector<char> m_wbuf;  // blocks mode: data collected for the next write.
+    off_t m_wbuf_offset{0};  // blocks mode: offset in the file of the first byte of m_wbuf.
+    std::atomic<off_t> *m_pull_received{nullptr};  // blocks mode: see SetPullCounters().
+    std::atomic<off_t> *m_pull_written{nullptr};  // blocks mode: see SetPullCounters().
+    const std::atomic<bool> *m_pull_stop{nullptr};  // blocks mode: see SetPullStopFlag().
     int m_status_code;  // status code from HTTP response.
     int m_error_code; // error code from underlying stream operations.
     off_t m_content_length;  // value of Content-Length header, if we received one.
@@ -231,6 +284,15 @@ private:
     off_t m_resp_content_length{-1};  // Content-Length of the current response; -1 if it has none.
     long long m_resp_range_first{-1};  // first byte of the Content-Range of the current response; -1 if it has none.
     long long m_resp_range_last{-1};  // last byte of the Content-Range of the current response.
+    long long m_resp_range_total{-1};  // total length in the Content-Range of the current response; -1 if none.
+    std::string m_resp_etag;  // ETag of the current response, as sent.
+    std::string m_resp_last_modified;  // Last-Modified of the current response, as sent.
+    WorkerStatus *m_worker_status{nullptr};  // blocks mode: see SetWorkerStatus().
+    SourceCheck *m_source_check{nullptr};  // blocks mode: see SetSourceCheck().
+    // Compares the response whose headers have all arrived with what earlier
+    // responses of the pull said of the source file.  False, with an
+    // errSource recorded, if the file has changed.
+    bool CheckSourceUnchanged();
     off_t m_push_length; // For push transfers, the size of the file on our server.
     Stream *m_stream;  // stream corresponding to this transfer.
     CURL *m_curl;  // libcurl handle

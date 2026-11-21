@@ -37,6 +37,7 @@ PMarkManager::PMarkManager(XrdHttpExtReq & req, TPC::TpcType tpcType) : mPmark(r
 void PMarkManager::addFd(int fd, const struct sockaddr * sockP) {
   if(isEnabled() && mTransferWillStart) {
     // The transfer will start and the packet marking has been configured, this socket must be registered for future packet marking
+    std::lock_guard<std::mutex> lock(mMutex);
     mSocketInfos.emplace(fd, sockP);
   }
 }
@@ -65,6 +66,7 @@ void PMarkManager::startTransfer() {
 }
 
 void PMarkManager::beginPMarks() {
+  std::lock_guard<std::mutex> lock(mMutex);
   if(mSocketInfos.empty()) {
     return;
   }
@@ -112,6 +114,7 @@ void PMarkManager::beginPMarks() {
 void PMarkManager::endPmark(int fd) {
   // We need to delete the PMark handle associated to the fd passed in parameter
   // we just look for it and reset the unique_ptr to nullptr to trigger the PMark handle deletion
+  std::lock_guard<std::mutex> lock(mMutex);
   mPmarkHandles.erase(fd);
 }
 } // namespace XrdHttpTpc
