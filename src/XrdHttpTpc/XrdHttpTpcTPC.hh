@@ -1,7 +1,9 @@
 #ifndef XRD_HTTP_TPC_TPC_HH
 #define XRD_HTTP_TPC_TPC_HH
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <sys/time.h>
@@ -12,7 +14,9 @@
 #include "XrdHttp/XrdHttpUtils.hh"
 
 #include "XrdTls/XrdTlsTempCA.hh"
+#include "XrdHttpTpcBlockPull.hh"
 #include "XrdHttpTpcPMarkManager.hh"
+#include "XrdHttpTpcPullOptions.hh"
 
 #include <curl/curl.h>
 #include <openssl/ssl.h>
@@ -26,6 +30,7 @@ typedef void CURL;
 
 namespace TPC {
 class State;
+class Stream;
 
 enum LogMask {
     Debug   = 0x01,
@@ -92,17 +97,23 @@ private:
         timeval     begT;
         off_t bytes_transferred;
         int status;
-        int tpc_status;
+        // tpc_status and isIPv6 are also set by the socket callbacks of
+        // libcurl, which in a pull in blocks run in the thread of each stream.
+        std::atomic<int> tpc_status;
         unsigned int streams;
-        bool isIPv6;
+        std::atomic<bool> isIPv6;
         bool allow_local;
         bool allow_private;
         XrdHttpExtReq & mReq;
         XrdHttpTpc::PMarkManager pmarkManager;
         // The sockets libcurl has open for this transfer, by descriptor, each
         // with the description of its peer used in a performance marker.
-        // Kept by the socket callbacks, which run in the thread of the request.
+        // Kept by the socket callbacks.
         std::map<int, std::string> connections;
+        // Protects connections: in a pull in blocks the socket callbacks run
+        // in the thread of each stream while the thread of the request reads
+        // the map for the performance markers.
+        std::mutex mtx;
         XrdSysError * m_log;
         TpcType mTpcType;
     };
@@ -151,6 +162,25 @@ private:
     // Experimental multi-stream version of RunCurlWithUpdates
     int RunCurlWithStreams(XrdHttpExtReq &req, TPC::State &state,
                            size_t streams, TPCLogRecord &rec);
+    // A multistream pull in blocks: one thread per stream, each writing the
+    // blocks it fetches at their own offsets.  See XrdHttpTpcBlockPull.hh.
+    // `stream_threads` is the share of the server's stream threads taken for
+    // the pull; what cannot be started is given back.
+    int RunPullInBlocks(XrdHttpExtReq &req, TPC::State &state, TPC::Stream &stream,
+                        const TPC::BlockPlan &plan, size_t streams_asked,
+                        TPC::StreamThreadBudget::Share &stream_threads, TPCLogRecord &rec);
+    // The verdict of a pull in blocks whose streams have all ended.
+    int ConcludePullInBlocks(XrdHttpExtReq &req, TPC::State &first_state, TPC::Stream &stream,
+                             TPC::BlockPull &pull, size_t workers, double seconds,
+                             bool &cut_back_armed, TPCLogRecord &rec);
+    // Logs the blocks completed since the last call (debug level).
+    void LogBlockReports(TPC::BlockPull &pull, size_t workers, TPCLogRecord &rec);
+    // Logs the failure that stops a pull in blocks, when it is first seen.
+    void LogStreamFailure(TPC::BlockPull &pull, size_t workers, TPCLogRecord &rec);
+    // Cuts the file of a failed pull in blocks back to its complete leading
+    // blocks.  Returns what the file is left with, in the form of the log.
+    std::string CutBackFailedPull(TPC::Stream &stream, TPC::BlockPull &pull, TPCLogRecord &rec,
+                                  bool &cut_failed);
     int RunCurlWithStreamsImpl(XrdHttpExtReq &req, TPC::State &state,
                            size_t streams, std::vector<TPC::State*> &streams_handles,
                            std::vector<ManagedCurlHandle> &curl_handles,
@@ -162,6 +192,8 @@ private:
     bool ConfigureFSLib(XrdOucStream &Config, std::string &path1, bool &path1_alt,
                         std::string &path2, bool &path2_alt);
     bool Configure(const char *configfn, XrdOucEnv *myEnv);
+    // Reads one http_multi.<name> directive into m_pull_options.
+    bool ConfigureMultistream(const char *name, XrdOucStream &Config);
     bool ConfigureLogger(XrdOucStream &Config);
 
     // Generate a consistently-formatted log message.
@@ -196,6 +228,7 @@ private:
     long m_low_speed_limit; // Minimum transfer rate in bytes per second; zero disables the check.
     long m_low_speed_time; // Time the transfer may remain below m_low_speed_limit before it is aborted.
     int m_timeout; // the 'timeout interval'; if no bytes have been received during this time period, abort the transfer.
+    PullOptions m_pull_options; // how a pull with several streams is carried out: the http_multi.* directives.
     int m_first_timeout; // the 'first timeout interval'; the amount of time we're willing to wait to get the first byte.
                          // Unless explicitly specified, this is 2x the timeout interval.
     std::string m_cadir;  // The directory to use for CAs.

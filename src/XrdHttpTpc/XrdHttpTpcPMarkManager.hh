@@ -29,6 +29,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <queue>
 
 namespace TPC {
@@ -124,6 +125,11 @@ private:
   */
   void addFd(int fd, const struct sockaddr * sockP);
 
+  // Protects the queue and the map below.  Sockets are registered and
+  // released by the socket callbacks of libcurl, which in a pull in blocks
+  // run in the thread of each stream, while beginPMarks() runs in the thread
+  // of the request.
+  std::mutex mMutex;
   // The queue of socket information from which we will create the packet marking handles
   std::queue<SocketInfo> mSocketInfos;
   // The map of socket FD and packet marking handles
