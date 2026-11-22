@@ -202,6 +202,37 @@ void State::ResetAfterRequest() {
     // What a response said belongs to that response: a text kept from one
     // request must not be reported as the cause of the failure of the next.
     m_error_buf.clear();
+    m_resp_retry_after = -1;
+    m_body_overran = false;
+}
+
+bool State::ContinueRange(std::string &error) {
+    const off_t next = m_start_offset + m_offset;
+    const off_t left = m_range_length - m_offset;
+    std::stringstream ss;
+    if (m_push || m_range_length < 0 || left <= 0) {
+        ss << "No part of the range is left to ask for (at offset " << next << ")";
+        error = ss.str();
+        return false;
+    }
+    if (!m_wbuf.empty() && m_wbuf_offset + static_cast<off_t>(m_wbuf.size()) != next) {
+        // The data collected ends at the last byte received, unless a
+        // write failed half way through a piece without the failure being
+        // recorded.  Then this is what stops the request from going on.
+        ss << "The data held for the next write ends at offset "
+           << (m_wbuf_offset + static_cast<off_t>(m_wbuf.size()))
+           << " and the request would go on at " << next;
+        error = ss.str();
+        return false;
+    }
+    // The data collected outlives the reset; swap() does not allocate.
+    std::vector<char> kept;
+    kept.swap(m_wbuf);
+    ResetAfterRequest();
+    m_wbuf.swap(kept);
+    m_error_code = errNone;
+    SetTransferParameters(next, left);
+    return true;
 }
 
 // HeaderCB and WriteCB are callbacks of libcurl, which is C: no exception may
@@ -247,6 +278,7 @@ int State::Header(const std::string &header) {
         m_resp_range_total = -1;
         m_resp_etag.clear();
         m_resp_last_modified.clear();
+        m_resp_retry_after = -1;
     } else if (header.size() == 0 || header == "\n" || header == "\r\n") {
         m_recv_all_headers = true;
         if (!CheckRangeResponse() || !CheckSourceUnchanged()) {
@@ -285,6 +317,17 @@ int State::Header(const std::string &header) {
                 const std::string value = begin == std::string::npos ? std::string()
                     : header_value.substr(begin, header_value.find_last_not_of(blanks) - begin + 1);
                 (header_name == "etag" ? m_resp_etag : m_resp_last_modified) = value;
+            }
+            if (header_name == "retry-after") {
+                // Seconds; the other form, a date, is not used.
+                try {
+                    size_t used = 0;
+                    const long seconds = std::stol(header_value, &used);
+                    const bool whole = header_value.find_first_not_of(" \t\r\n", used) == std::string::npos;
+                    m_resp_retry_after = (whole && seconds >= 0) ? seconds : -1;
+                } catch (...) {
+                    m_resp_retry_after = -1;
+                }
             }
             if(header_name == "repr-digest") {
               XrdHttpHeaderUtils::parseReprDigest(header_value,m_repr_digests);
@@ -432,6 +475,7 @@ ssize_t State::Write(char *buffer, size_t size) {
            << m_start_offset << "-" << (m_start_offset + m_range_length - 1);
         m_error_buf = ss.str();
         m_error_code = errRange;
+        m_body_overran = true;
         return -1;
     }
     const size_t write_size = m_stream->OffsetWriteSize();
