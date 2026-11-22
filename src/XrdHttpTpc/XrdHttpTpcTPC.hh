@@ -175,6 +175,8 @@ private:
                              bool &cut_back_armed, bool &verdict_counted, TPCLogRecord &rec);
     // Logs the blocks completed since the last call (debug level).
     void LogBlockReports(TPC::BlockPull &pull, size_t workers, TPCLogRecord &rec);
+    // Logs and counts the requests made again since the last call (warning level).
+    void LogRetries(TPC::BlockPull &pull, size_t workers, TPCLogRecord &rec);
     // Logs the failure that stops a pull in blocks, when it is first seen.
     void LogStreamFailure(TPC::BlockPull &pull, size_t workers, TPCLogRecord &rec);
     // Cuts the file of a failed pull in blocks back to its complete leading

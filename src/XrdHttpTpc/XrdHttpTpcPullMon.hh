@@ -55,6 +55,12 @@ struct PullMon {
     // source, and pulls that failed because nothing moved at all.
     static RAtomic_uint64_t stream_stalls;
     static RAtomic_uint64_t pull_stalls;
+    // Requests of a pull in blocks that failed and were made again for the
+    // rest of their block; pulls that succeeded after at least one such
+    // retry; and pulls that failed with the tries of a block used up.
+    static RAtomic_uint64_t retries;
+    static RAtomic_uint64_t retried_pulls;
+    static RAtomic_uint64_t retries_exhausted;
     // Pulls that failed because the source file changed under them.
     static RAtomic_uint64_t source_changed;
     // Failed pulls whose file was cut back to its complete leading blocks,

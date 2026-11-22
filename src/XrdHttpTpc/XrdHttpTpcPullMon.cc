@@ -23,6 +23,9 @@ RAtomic_uint64_t PullMon::sequential_marking{0};
 RAtomic_uint64_t PullMon::sequential_ec{0};
 RAtomic_uint64_t PullMon::stream_stalls{0};
 RAtomic_uint64_t PullMon::pull_stalls{0};
+RAtomic_uint64_t PullMon::retries{0};
+RAtomic_uint64_t PullMon::retried_pulls{0};
+RAtomic_uint64_t PullMon::retries_exhausted{0};
 RAtomic_uint64_t PullMon::source_changed{0};
 RAtomic_uint64_t PullMon::cut_backs{0};
 RAtomic_uint64_t PullMon::cut_back_failures{0};
@@ -52,6 +55,9 @@ void PullMon::Register(XrdOucEnv *env, XrdSysError &log)
         {"sequential_for_ec",        sequential_ec},
         {"stalled_requests",         stream_stalls},
         {"stalled_pulls",            pull_stalls},
+        {"in_blocks_requests_retried",       retries},
+        {"in_blocks_succeeded_after_retry",  retried_pulls},
+        {"in_blocks_failed_retries_used_up", retries_exhausted},
         {"source_changed",           source_changed},
         {"cut_backs",                cut_backs},
         {"cut_back_failures",        cut_back_failures},

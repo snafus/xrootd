@@ -88,13 +88,19 @@ struct PullOptions {
     // although the content is the same.
     bool source_validators{true};
 
-    // http_multi.retry <attempts> [<wait>]
+    // http_multi.retry <attempts> [<wait> [<most>]]
     //
-    // The tries a block gets without making progress, and the wait in
-    // seconds before the second one.  One attempt means no retry.
-    // Read and checked; not used yet: a block that fails still fails the pull.
+    // A request of a pull in blocks that fails is made again for the part of
+    // the block that is missing, unless the failure is one that another try
+    // is known not to cure (see XrdHttpTpcRetry.hh).  `attempts` is the tries
+    // a block gets in a row without progress, which is one write of new
+    // data; one means no retry.  `wait` is the seconds before the second
+    // try; it doubles for each further try without progress, up to 30
+    // seconds or the wait itself if that is longer.  `most` caps all the
+    // tries of one block, with progress or without.
     int retry_attempts{3};
     int retry_wait{2};
+    int retry_most{10};
 
     /**
      * Checks the settings against the limits and against each other, and

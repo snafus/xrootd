@@ -56,6 +56,9 @@ bool PullOptions::Validate(std::string &error)
     } else if (retry_wait < 0 || retry_wait > MaxRetryWait) {
         ss << "http_multi.retry: the wait must be from 0 to " << MaxRetryWait
            << " seconds, not " << retry_wait;
+    } else if (retry_most < retry_attempts || retry_most > MaxRetryAttempts) {
+        ss << "http_multi.retry: the most tries of a block must be from the attempts ("
+           << retry_attempts << ") to " << MaxRetryAttempts << ", not " << retry_most;
     }
 
     error = ss.str();

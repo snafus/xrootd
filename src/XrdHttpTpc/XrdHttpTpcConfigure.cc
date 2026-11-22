@@ -185,6 +185,13 @@ bool TPCHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
                << " for more; the source file is checked for "
                << (m_pull_options.source_validators ? "its size and its ETag or Last-Modified"
                                                     : "its size only");
+            if (m_pull_options.retry_attempts > 1) {
+                ss << "; a block that fails gets " << m_pull_options.retry_attempts
+                   << " tries without progress and " << m_pull_options.retry_most
+                   << " in all, the second after " << m_pull_options.retry_wait << " seconds";
+            } else {
+                ss << "; a block that fails is not tried again";
+            }
             m_log.Say("Config ", ss.str().c_str());
         }
     }
@@ -306,7 +313,8 @@ bool TPCHandler::ConfigureLogger(XrdOucStream &config_obj)
 //   http_multi.block_size  <minimum> [<maximum>]         sizes take k, m, g, t
 //   http_multi.write_size  <size>
 //   http_multi.source_check full | size
-//   http_multi.retry       <attempts> [<wait>]            read and checked; not used yet
+//   http_multi.retry       <attempts> [<wait> [<most>]]   tries of a block without progress,
+//                                                          seconds before the second, tries in all
 //
 // Each value is checked against its limits here, so that the message names
 // the value that is wrong; PullOptions::Validate() checks them against each
@@ -375,6 +383,7 @@ bool TPCHandler::ConfigureMultistream(const char *name, XrdOucStream &Config)
             return false;
         }
     } else if (!strcmp(name, "retry")) {
+        bool most_given = false;
         if (XrdOuca2x::a2i(m_log, "http_multi.retry attempts", val,
                            &m_pull_options.retry_attempts, 1, PullOptions::MaxRetryAttempts)) {
             return false;
@@ -384,6 +393,18 @@ bool TPCHandler::ConfigureMultistream(const char *name, XrdOucStream &Config)
                                 &m_pull_options.retry_wait, 0, PullOptions::MaxRetryWait)) {
                 return false;
             }
+            if ((val = Config.GetWord()) && *val) {
+                if (XrdOuca2x::a2i(m_log, "http_multi.retry most tries of a block", val,
+                                   &m_pull_options.retry_most, 1, PullOptions::MaxRetryAttempts)) {
+                    return false;
+                }
+                most_given = true;
+            }
+        }
+        // More attempts than the default cap, and no cap given: the cap
+        // follows, so that the attempts asked for are all made.
+        if (!most_given && m_pull_options.retry_most < m_pull_options.retry_attempts) {
+            m_pull_options.retry_most = m_pull_options.retry_attempts;
         }
     } else {
         m_log.Emsg("Config", "unknown directive", directive.c_str());
