@@ -26,6 +26,7 @@ add_library(${XrdHttpTPC} MODULE
   XrdHttpTpcPullInBlocks.cc
   XrdHttpTpcPullMon.cc       XrdHttpTpcPullMon.hh
   XrdHttpTpcPullOptions.cc   XrdHttpTpcPullOptions.hh
+  XrdHttpTpcRetry.cc         XrdHttpTpcRetry.hh
   XrdHttpTpcState.cc         XrdHttpTpcState.hh
   XrdHttpTpcStream.cc        XrdHttpTpcStream.hh
   XrdHttpTpcTPC.cc           XrdHttpTpcTPC.hh
