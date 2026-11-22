@@ -169,6 +169,41 @@ public:
 
     void ResetAfterRequest();
 
+    // -- Retry of a range ---------------------------------------------------
+
+    /**
+     * Sets up the next request for the part of the range that the last one
+     * did not bring: bytes [Position(), end of the range).  Everything the
+     * last request and its response left behind is reset, the error
+     * included; the data collected for the next write is kept, and the new
+     * request goes on filling it.
+     *
+     * Nothing is asked for twice.  It is refused, with the reason in
+     * `error`, when the range is complete, or when the data collected does
+     * not end where the new request starts: going on would then write a
+     * byte twice or leave one out.
+     *
+     * Blocks mode only; called by the stream thread that owns the state.
+     */
+    bool ContinueRange(std::string &error);
+
+    // The offset in the file of the next byte the request in progress, or
+    // the last one, is to receive.
+    off_t Position() const {return m_start_offset + m_offset;}
+
+    // Whether every byte of the range has arrived.
+    bool RangeFilled() const {return m_range_length >= 0 && m_offset == m_range_length;}
+
+    // Whether the source sent more than the range in answer to the last
+    // request.  Such a request is not continued: the source does not keep to
+    // the range it announced.
+    bool BodyOverran() const {return m_body_overran;}
+
+    // Seconds the source asked to wait before the next request, from the
+    // Retry-After header of the last response; -1 if it gave none, or gave a
+    // date.
+    long GetRetryAfter() const {return m_resp_retry_after;}
+
     // -- A pull in blocks ---------------------------------------------------
     //
     // When the stream writes at offsets (Stream::EnableOffsetWrites), this
@@ -302,6 +337,8 @@ private:
     long long m_resp_range_total{-1};  // total length in the Content-Range of the current response; -1 if none.
     std::string m_resp_etag;  // ETag of the current response, as sent.
     std::string m_resp_last_modified;  // Last-Modified of the current response, as sent.
+    long m_resp_retry_after{-1};  // Retry-After of the current response, in seconds; -1 if none.
+    bool m_body_overran{false};  // the body of the last response was longer than the range.
     WorkerStatus *m_worker_status{nullptr};  // blocks mode: see SetWorkerStatus().
     SourceCheck *m_source_check{nullptr};  // blocks mode: see SetSourceCheck().
     // Compares the response whose headers have all arrived with what earlier
