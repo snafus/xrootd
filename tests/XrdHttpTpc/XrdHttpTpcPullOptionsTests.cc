@@ -99,6 +99,7 @@ TEST(XrdHttpTpcPullOptionsTests, TheMessageSaysWhichValueIsWrong) {
   PullOptions defaults;
   EXPECT_EQ(128, defaults.max_stream_threads);
   EXPECT_EQ(3, defaults.retry_attempts);
+  EXPECT_EQ(10, defaults.retry_most);
 }
 
 TEST(XrdHttpTpcPullOptionsTests, SettingsThatCannotBeHonouredAreRefusedWithTheDirectiveNamed) {
@@ -116,6 +117,8 @@ TEST(XrdHttpTpcPullOptionsTests, SettingsThatCannotBeHonouredAreRefusedWithTheDi
     {"http_multi.retry",       [](PullOptions &o) {o.retry_attempts = 0;}},
     {"http_multi.retry",       [](PullOptions &o) {o.retry_wait = -1;}},
     {"http_multi.retry",       [](PullOptions &o) {o.retry_wait = 301;}},
+    {"http_multi.retry",       [](PullOptions &o) {o.retry_most = 2;}},
+    {"http_multi.retry",       [](PullOptions &o) {o.retry_most = 101;}},
   };
   for (const Case &c : cases) {
     PullOptions options;

@@ -8,6 +8,8 @@
  * a thread, a "worker", that owns one libcurl handle and its State.  A worker
  * takes the next block, requests it with a range request, writes it at its
  * own offset in pieces of one write size, reports it done, and takes the next.
+ * A request that fails is made again for the part of the block that is
+ * missing, as far as the tries of the block allow (see XrdHttpTpcRetry.hh).
  * The thread of the COPY request is the "coordinator": it starts the workers,
  * sends the performance markers to the client, watches that the pull moves,
  * and gives the verdict once every worker has ended.
@@ -27,9 +29,11 @@
  *
  * Stopping
  * --------
- * The first failure is recorded, once, and every worker is told to stop.  A
- * worker sees the stop in the progress callback of libcurl (called about once
- * a second), before each write to the file, or when it asks for a block.
+ * The first failure that is not retried, or that has used up the tries of
+ * its block, is recorded, once, and every worker is told to stop.  A worker
+ * sees the stop in the progress callback of libcurl (called about once a
+ * second), before each write to the file, when it asks for a block, or at
+ * once when it is waiting to retry.
  * BlockPull outlives the workers: the coordinator joins every thread on every
  * way out before it lets go of it.
  */
@@ -116,6 +120,21 @@ struct BlockFailure {
     // seconds the stream was allowed to wait, and those it had waited.
     int stall_limit{0};
     int stall_idle{0};
+    // Tries of the block that have failed, this one included; 0 when the
+    // failure is not that of a request.
+    int attempts{0};
+    // The failure was one that is retried, and the tries of the block were
+    // used up.
+    bool gave_up{false};
+};
+
+/**
+ * A request that failed and is being made again, for the log.
+ */
+struct RetryReport {
+    BlockFailure why;        // what the request failed with; `attempts` numbers the try
+    double wait_seconds{0};  // the wait before the next try
+    long retry_after{-1};    // seconds the source asked for with Retry-After; -1 if it did not
 };
 
 /**
@@ -130,8 +149,8 @@ struct BlockFailure {
  * writing, or waiting for a block, must not count against the source.
  *
  * All members are atomics: the worker writes `received`, `request_start`,
- * `phase` and `request`; the coordinator writes `stall_limit`, `stall_idle`
- * and `abort`.
+ * `phase`, `request` and `retrying`; the coordinator writes `stall_limit`,
+ * `stall_idle` and `abort`.
  * They are read one by one, not together: a look that mixes two requests is
  * off by one look, a second, and no more.
  */
@@ -139,13 +158,19 @@ struct WorkerStatus {
     enum Phase : int {
         Idle = 0,       // between two requests, or waiting for a block
         Receiving = 1,  // in a request: connecting, or waiting for data from the source
-        Writing = 2     // in a request, inside a write to the file or waiting for its turn to write
+        Writing = 2,    // in a request, inside a write to the file or waiting for its turn to write
+        Waiting = 3     // between two tries of a block, waiting before the next
     };
 
     std::atomic<off_t>    received{0};         // bytes received by this worker, over all its requests
     std::atomic<off_t>    request_start{0};    // what `received` was when the request in progress began
     std::atomic<int>      phase{Idle};
     std::atomic<unsigned> request{0};          // number of the request in progress; counts from 1
+    // The request in progress is another try of a block.  It is then given
+    // the shorter of the two times to bring its first byte: the source has
+    // served this file a moment ago, and a source that has gone silent must
+    // not take the long time once for every try.
+    std::atomic<bool>     retrying{false};
     std::atomic<int>      stall_limit{0};      // when `abort` was set: the seconds allowed,
     std::atomic<int>      stall_idle{0};       // and the seconds for which nothing had come
     // The request the coordinator wants ended; 0 for none.  It names the
@@ -250,7 +275,9 @@ struct BlockReport {
     size_t stream;
     off_t start;     // bytes [start, end)
     off_t end;
-    double seconds;  // from the request to the last write
+    double seconds;  // from the first request to the last write, waits included
+    int retries;     // requests of the block that failed and were made again
+    bool broke_off;  // the last response had all its bytes but did not end properly
 };
 
 class BlockPull {
@@ -283,11 +310,23 @@ public:
     bool NextBlock(off_t &offset, off_t &size);
 
     // The block starting at `offset` has been received in full and written.
-    void BlockDone(size_t stream, off_t offset, off_t size, double seconds);
+    void BlockDone(size_t stream, off_t offset, off_t size, double seconds,
+                   int retries = 0, bool broke_off = false);
 
     // Records the first failure and stops the pull.  Later calls change
     // nothing but still stop it.  Called from catch blocks: does not throw.
     void Fail(const BlockFailure &failure) noexcept;
+
+    /**
+     * Waits before another try of a block.
+     *
+     * @return false if the pull is stopping, in which case the wait ends at
+     *         once and the try is not to be made.
+     */
+    bool WaitToRetry(std::chrono::milliseconds wait);
+
+    // A request failed and will be made again.  For the log and the count.
+    void ReportRetry(const RetryReport &report);
 
     // The last thing a worker does.
     void WorkerEnded() noexcept;
@@ -309,6 +348,11 @@ public:
 
     // The blocks completed since the last call.
     std::vector<BlockReport> TakeReports();
+
+    // The requests that were made again since the last call, and their
+    // number since the pull began.
+    std::vector<RetryReport> TakeRetries();
+    size_t Retries();
 
     bool Failed();
     BlockFailure Failure();
@@ -342,7 +386,8 @@ private:
     const off_t  m_window;  // how far, in bytes, the hand-out may be ahead of the oldest unfinished block
 
     std::mutex m_mutex;                 // guards everything below
-    std::condition_variable m_changed;  // a block is done, a worker has ended, or the pull stops
+    // Signalled when a block is done, a worker has ended, or the pull stops.
+    std::condition_variable m_changed;
     off_t m_next_offset{0};             // start of the next block to hand out
     std::set<off_t> m_in_flight;        // starts of the blocks handed out and not done
     size_t m_blocks_done{0};
@@ -350,6 +395,8 @@ private:
     bool m_failed{false};
     BlockFailure m_failure;             // the first failure
     std::vector<BlockReport> m_reports;
+    std::vector<RetryReport> m_retry_reports;
+    size_t m_retries{0};                // requests made again
 };
 
 }

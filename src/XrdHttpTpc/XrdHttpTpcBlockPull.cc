@@ -84,13 +84,14 @@ bool BlockPull::NextBlock(off_t &offset, off_t &size)
     return true;
 }
 
-void BlockPull::BlockDone(size_t stream, off_t offset, off_t size, double seconds)
+void BlockPull::BlockDone(size_t stream, off_t offset, off_t size, double seconds,
+                          int retries, bool broke_off)
 {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_in_flight.erase(offset);
         m_blocks_done++;
-        m_reports.push_back(BlockReport{stream, offset, offset + size, seconds});
+        m_reports.push_back(BlockReport{stream, offset, offset + size, seconds, retries, broke_off});
     }
     m_changed.notify_all();
 }
@@ -110,6 +111,8 @@ void BlockPull::Fail(const BlockFailure &failure) noexcept
             m_failure.block_received = failure.block_received;
             m_failure.stall_limit = failure.stall_limit;
             m_failure.stall_idle = failure.stall_idle;
+            m_failure.attempts = failure.attempts;
+            m_failure.gave_up = failure.gave_up;
             // Last: the copy of the text is the one thing here that can
             // throw, and a failure without its text is still a failure.
             m_failure.message = failure.message;
@@ -133,6 +136,27 @@ void BlockPull::Stop() noexcept
         stop.store(true);
     }
     m_changed.notify_all();
+}
+
+bool BlockPull::WaitToRetry(std::chrono::milliseconds wait)
+{
+    std::unique_lock<std::mutex> lock(m_mutex);
+    // Other workers signal the condition for their own reasons; only the
+    // stop ends this wait early.
+#if defined(__SANITIZE_THREAD__)
+    // See WaitForWorkers().
+    return !m_changed.wait_until(lock, std::chrono::system_clock::now() + wait,
+                                 [this] {return stop.load();});
+#else
+    return !m_changed.wait_for(lock, wait, [this] {return stop.load();});
+#endif
+}
+
+void BlockPull::ReportRetry(const RetryReport &report)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_retries++;
+    m_retry_reports.push_back(report);
 }
 
 void BlockPull::WorkerStarting()
@@ -187,6 +211,20 @@ std::vector<BlockReport> BlockPull::TakeReports()
     std::lock_guard<std::mutex> lock(m_mutex);
     reports.swap(m_reports);
     return reports;
+}
+
+std::vector<RetryReport> BlockPull::TakeRetries()
+{
+    std::vector<RetryReport> reports;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    reports.swap(m_retry_reports);
+    return reports;
+}
+
+size_t BlockPull::Retries()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_retries;
 }
 
 bool BlockPull::Failed()
