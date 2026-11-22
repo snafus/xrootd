@@ -4,12 +4,14 @@ find_package(CURL REQUIRED)
 add_executable(xrdhttptpc-unit-tests
   XrdHttpTpcTests.cc
   XrdHttpTpcPullOptionsTests.cc
-  XrdHttpTpcBlockPullTests.cc)
+  XrdHttpTpcBlockPullTests.cc
+  XrdHttpTpcRetryTests.cc)
 
 add_library(XrdHttpTpcUtils
   ${PROJECT_SOURCE_DIR}/src/XrdHttpTpc/XrdHttpTpcUtils.cc
   ${PROJECT_SOURCE_DIR}/src/XrdHttpTpc/XrdHttpTpcPullOptions.cc
   ${PROJECT_SOURCE_DIR}/src/XrdHttpTpc/XrdHttpTpcBlockPull.cc
+  ${PROJECT_SOURCE_DIR}/src/XrdHttpTpc/XrdHttpTpcRetry.cc
 )
 
 target_link_libraries(XrdHttpTpcUtils
