@@ -199,6 +199,16 @@ void State::ResetAfterRequest() {
     m_repr_digests.clear();
 }
 
+void State::RecordStatusOnFailure(int curl_result)
+{
+    if (curl_result != CURLE_HTTP_RETURNED_ERROR || m_status_code >= 400) {return;}
+    long status_code = 0;
+    if (curl_easy_getinfo(m_curl, CURLINFO_RESPONSE_CODE, &status_code) == CURLE_OK
+        && status_code >= 400) {
+        m_status_code = status_code;
+    }
+}
+
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)
 {
     State *obj = static_cast<State*>(userdata);

@@ -953,6 +953,10 @@ int TPCHandler::RunCurlWithUpdates(CURL *curl, XrdHttpExtReq &req, State &state,
         }
     } while (msg);
 
+    // With an older libcurl the status that failed the request is not in the
+    // state yet; see State::RecordStatusOnFailure().
+    state.RecordStatusOnFailure(res);
+
     if (!state.GetErrorCode() && res == static_cast<CURLcode>(-1)) { // No transfers returned?!?
         curl_multi_remove_handle(multi_handle, curl);
         curl_multi_cleanup(multi_handle);

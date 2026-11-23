@@ -123,6 +123,21 @@ public:
 
     int GetStatusCode() const {return m_status_code;}
 
+    // To be called with the result of libcurl (a CURLcode) for the request of
+    // this state, once the request is over and before the handle is used
+    // again.
+    //
+    // The handle of a pull has CURLOPT_FAILONERROR set, so libcurl ends a
+    // request on a status of 400 or more.  An older libcurl (7.61.1, as in
+    // EL8) does so before it hands the status line to the header callback:
+    // the status code of this state is then still unset, or is that of a
+    // redirection that came before.  libcurl has recorded the status all the
+    // same, and it is taken from there, so that the pull fails with the
+    // status of the source and not with a failure of the HTTP library.  A
+    // newer libcurl (7.76.1, as in EL9) hands the status line over first,
+    // and this changes nothing.
+    void RecordStatusOnFailure(int curl_result);
+
     // Whether the final status of a GET says that the response carries what
     // was asked for: 200 for the file, 203 for the file as a proxy has passed
     // it on, 206 for a range of it.  Any other status below 400 that ends a

@@ -87,7 +87,10 @@ public:
                 }
                 // The status of the first request that failed: an error
                 // status, or one that ended the request normally but without
-                // the range (see State::CarriesContent).
+                // the range (see State::CarriesContent).  With an older
+                // libcurl an error status is not in the state yet; see
+                // State::RecordStatusOnFailure().
+                (*state_iter)->RecordStatusOnFailure(result);
                 int status_code = (*state_iter)->GetStatusCode();
                 if (!m_status_code && (status_code >= 400
                         || (result == CURLE_OK && !State::CarriesContent(status_code)))) {
