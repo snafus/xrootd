@@ -23,6 +23,7 @@
 #include "XrdHttpTpc/XrdHttpTpcTPC.hh"
 
 #include <sstream>
+#include <strings.h>
 
 std::string XrdHttpTpcUtils::prepareOpenURL(PrepareOpenURLParams & params) {
   auto iter = XrdOucTUtils::caseInsensitiveFind(params.reqHeaders,"xrd-http-query");
@@ -68,4 +69,43 @@ std::string XrdHttpTpcUtils::prepareOpenURL(PrepareOpenURLParams & params) {
 
 
   return params.reqResource + opaque.str();
+}
+
+namespace {
+// Reads a non-negative decimal number at pos and moves pos past it.
+bool readNumber(const std::string & str, size_t & pos, long long & number) {
+  const size_t begin = pos;
+  number = 0;
+  // 18 digits always fit in a long long
+  while (pos < str.size() && pos - begin < 18 && str[pos] >= '0' && str[pos] <= '9') {
+    number = number * 10 + (str[pos++] - '0');
+  }
+  return pos != begin && (pos == str.size() || str[pos] < '0' || str[pos] > '9');
+}
+}
+
+bool XrdHttpTpcUtils::parseContentRange(const std::string & value, long long & first, long long & last) {
+  static const char blanks[] = " \t\r\n";
+  const size_t begin = value.find_first_not_of(blanks);
+  if (begin == std::string::npos) return false;
+  const std::string range = value.substr(begin, value.find_last_not_of(blanks) - begin + 1);
+
+  static const std::string unit = "bytes ";
+  if (range.size() <= unit.size() || strncasecmp(range.c_str(), unit.c_str(), unit.size())) return false;
+
+  size_t pos = unit.size();
+  long long firstByte, lastByte, total;
+  if (!readNumber(range, pos, firstByte)) return false;
+  if (pos == range.size() || range[pos++] != '-') return false;
+  if (!readNumber(range, pos, lastByte)) return false;
+  if (pos == range.size() || range[pos++] != '/') return false;
+  if (range.compare(pos, std::string::npos, "*") != 0) {
+    if (!readNumber(range, pos, total) || pos != range.size()) return false;
+    if (lastByte >= total) return false;
+  }
+  if (lastByte < firstByte) return false;
+
+  first = firstByte;
+  last = lastByte;
+  return true;
 }

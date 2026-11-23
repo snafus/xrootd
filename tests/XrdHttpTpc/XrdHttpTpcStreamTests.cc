@@ -9,6 +9,9 @@
 #include <cstring>
 #include <gtest/gtest.h>
 #include <memory>
+#include <numeric>
+#include <random>
+#include <string>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -353,4 +356,111 @@ TEST_F(XrdHttpTpcStreamTests, FilesystemWriteFailureIsPropagated) {
   raw_file->FailWrites();
   EXPECT_EQ(SFS_ERROR, stream.Write(0, "abcdefgh", 8, false));
   EXPECT_FALSE(stream.GetErrorMessage().empty());
+}
+
+// The backing file must see one sequential stream of writes that adds up to
+// the expected content, whatever the order of arrival was.
+static void ExpectSequentialWrites(const MemorySfsFile &file,
+                                   const std::vector<char> &expected,
+                                   const std::string &context) {
+  XrdSfsFileOffset next = 0;
+  for (const auto &write : file.Writes()) {
+    ASSERT_EQ(next, write.first) << "write out of sequence, " << context;
+    next += write.second;
+  }
+  EXPECT_EQ(static_cast<XrdSfsFileOffset>(expected.size()), next) << context;
+  EXPECT_EQ(expected, file.Data()) << context;
+}
+
+TEST_F(XrdHttpTpcStreamTests, EveryArrivalOrderOfFourRangesIsWrittenInSequence) {
+  XrdSysLogger logger(STDERR_FILENO, 0);
+  XrdSysError log(&logger, "StreamTest");
+  const std::string content = "aaaaaaaabbbbbbbbccccccccdddddddd";
+
+  std::vector<int> order = {0, 1, 2, 3};
+  do {
+    std::string context = "order";
+    for (int range : order) {context += " " + std::to_string(range);}
+
+    auto file = std::make_unique<MemorySfsFile>();
+    auto raw_file = file.get();
+    TPC::Stream stream(std::move(file), 4, 8, log);
+
+    for (int range : order) {
+      ASSERT_EQ(8, stream.Write(range * 8, &content[range * 8], 8, false)) << context;
+    }
+    EXPECT_EQ(4u, stream.AvailableBuffers()) << context;
+    EXPECT_EQ(4u, raw_file->Writes().size()) << context;
+    ExpectSequentialWrites(*raw_file, AsBytes(content), context);
+    EXPECT_TRUE(stream.Finalize()) << context;
+  } while (std::next_permutation(order.begin(), order.end()));
+}
+
+// Ranges are handed out the way the multi-stream scheduler does it (see
+// MultiCurlHandler::CanStartTransfer): a range starts only when a buffer is
+// free for it, counting one buffer for each range that has started but has not
+// delivered a byte yet.  The ranges in flight then deliver pieces of odd sizes
+// in a random order.
+TEST_F(XrdHttpTpcStreamTests, RandomInterleavingOfRangesIsWrittenInSequence) {
+  XrdSysLogger logger(STDERR_FILENO, 0);
+  XrdSysError log(&logger, "StreamTest");
+  const size_t buffer_size = 64, buffers = 4, ranges = 23;
+  // The last range is short, as at the end of a real file.
+  const size_t file_size = (ranges - 1) * buffer_size + 13;
+
+  std::vector<char> expected(file_size);
+  for (size_t idx = 0; idx < file_size; idx++) {
+    expected[idx] = static_cast<char>('A' + (idx * 7 + idx / buffer_size) % 53);
+  }
+
+  struct Range {size_t start; size_t size; size_t done;};
+
+  for (unsigned seed = 1; seed <= 200; seed++) {
+    const std::string context = "seed " + std::to_string(seed);
+    std::mt19937 random(seed);
+    auto file = std::make_unique<MemorySfsFile>();
+    auto raw_file = file.get();
+    TPC::Stream stream(std::move(file), buffers, buffer_size, log);
+
+    std::vector<Range> flight;
+    size_t next = 0;
+    auto start_ranges = [&]() {
+      while (next < ranges && flight.size() < buffers) {
+        size_t waiting = std::count_if(flight.begin(), flight.end(),
+                                       [](const Range &r) {return r.done == 0;});
+        if (stream.AvailableBuffers() <= waiting) {break;}
+        size_t start = next * buffer_size;
+        flight.push_back({start, std::min(buffer_size, file_size - start), 0});
+        next++;
+      }
+    };
+
+    start_ranges();
+    while (!flight.empty()) {
+      size_t pick = random() % flight.size();
+      Range &range = flight[pick];
+      size_t piece = std::min<size_t>(1 + random() % 17, range.size - range.done);
+      ASSERT_EQ(static_cast<ssize_t>(piece),
+                stream.Write(range.start + range.done,
+                             &expected[range.start + range.done], piece, false))
+          << context << ": " << stream.GetErrorMessage();
+      range.done += piece;
+      if (range.done == range.size) {flight.erase(flight.begin() + pick);}
+
+      // The scheduler relies on this: a buffer is in use only for a range
+      // that has started and is not yet completely in the file.
+      size_t in_use = buffers - stream.AvailableBuffers();
+      size_t unwritten = next - raw_file->Data().size() / buffer_size;
+      ASSERT_LE(in_use, unwritten) << context;
+      start_ranges();
+      // With ranges left to fetch, something must always be in flight:
+      // otherwise the real transfer would stall here.
+      ASSERT_FALSE(flight.empty() && next < ranges) << "stalled, " << context;
+    }
+
+    EXPECT_EQ(0, stream.Flush()) << context;
+    EXPECT_EQ(buffers, stream.AvailableBuffers()) << context;
+    ExpectSequentialWrites(*raw_file, expected, context);
+    EXPECT_TRUE(stream.Finalize()) << context;
+  }
 }
