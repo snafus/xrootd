@@ -15,6 +15,13 @@
 
 using namespace TPC;
 
+namespace {
+// The directives of the multistream pull have a prefix of their own, so that
+// they are found in one place and are not taken for settings of the tpc.
+// family or of ofs.tpc.  It is spelled here and nowhere else.
+const char MultistreamPrefix[] = "http_multi.";
+}
+
 
 bool TPCHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
 {
@@ -148,9 +155,46 @@ bool TPCHandler::Configure(const char *configfn, XrdOucEnv *myEnv)
             } else {
                 m_first_timeout = 2*m_timeout;
             }
+        } else if (!strncmp(MultistreamPrefix, val, sizeof(MultistreamPrefix) - 1)) {
+            if (!ConfigureMultistream(val + sizeof(MultistreamPrefix) - 1, Config)) {
+                Config.Close();
+                return false;
+            }
         }
     }
     Config.Close();
+
+    // The settings of the multistream pull are checked together, once all of
+    // them are known: a minimum block above the maximum, for example.
+    {
+        std::string error;
+        if (!m_pull_options.Validate(error)) {
+            m_log.Emsg("Config", error.c_str());
+            return false;
+        }
+        if (m_pull_options.mode == PullOptions::Mode::Blocks) {
+            std::stringstream ss;
+            ss << "multistream pulls are carried out in blocks: at most "
+               << m_pull_options.max_streams_request << " streams a request and "
+               << m_pull_options.max_stream_threads << " stream threads in the server; blocks of "
+               << m_pull_options.block_min << " to " << m_pull_options.block_max
+               << " bytes; writes of " << m_pull_options.write_size << " bytes (up to "
+               << (static_cast<long long>(m_pull_options.max_stream_threads) * m_pull_options.write_size / PullOptions::MiB)
+               << " MiB of write buffers); a stream may wait " << m_first_timeout
+               << " seconds for the first byte of a request and " << m_timeout
+               << " for more; the source file is checked for "
+               << (m_pull_options.source_validators ? "its size and its ETag or Last-Modified"
+                                                    : "its size only");
+            if (m_pull_options.retry_attempts > 1) {
+                ss << "; a block that fails gets " << m_pull_options.retry_attempts
+                   << " tries without progress and " << m_pull_options.retry_most
+                   << " in all, the second after " << m_pull_options.retry_wait << " seconds";
+            } else {
+                ss << "; a block that fails is not tried again";
+            }
+            m_log.Say("Config ", ss.str().c_str());
+        }
+    }
 
     // Internal override: allow xrdtpc to use a different ca dir from the one prepared by the xrootd
     // framework.  meant for exceptional situations where the site might need a specially-prepared set
@@ -255,5 +299,121 @@ bool TPCHandler::ConfigureLogger(XrdOucStream &config_obj)
         val = config_obj.GetWord();
     } while (val);
     
+    return true;
+}
+
+/******************************************************************************/
+/*      T P C H a n d l e r : : C o n f i g u r e M u l t i s t r e a m       */
+/******************************************************************************/
+
+// The http_multi.* directives.  `name` is what follows the prefix.
+//
+//   http_multi.mode        sequential | blocks
+//   http_multi.max_streams <streams of one request> [<stream threads of the server>]
+//   http_multi.block_size  <minimum> [<maximum>]         sizes take k, m, g, t
+//   http_multi.write_size  <size>
+//   http_multi.source_check full | size
+//   http_multi.retry       <attempts> [<wait> [<most>]]   tries of a block without progress,
+//                                                          seconds before the second, tries in all
+//
+// Each value is checked against its limits here, so that the message names
+// the value that is wrong; PullOptions::Validate() checks them against each
+// other afterwards.  An unknown name is an error: a misspelt directive that
+// is ignored leaves the server in a mode its operator did not choose.
+bool TPCHandler::ConfigureMultistream(const char *name, XrdOucStream &Config)
+{
+    const std::string directive = std::string(MultistreamPrefix) + name;
+    char *val = Config.GetWord();
+    if (!val || !*val) {
+        m_log.Emsg("Config", directive.c_str(), "value not specified.");
+        return false;
+    }
+
+    if (!strcmp(name, "mode")) {
+        if (!strcmp(val, "sequential")) {
+            m_pull_options.mode = PullOptions::Mode::Sequential;
+        } else if (!strcmp(val, "blocks")) {
+            m_pull_options.mode = PullOptions::Mode::Blocks;
+        } else {
+            m_log.Emsg("Config", "http_multi.mode must be 'sequential' or 'blocks', not", val);
+            return false;
+        }
+    } else if (!strcmp(name, "max_streams")) {
+        if (XrdOuca2x::a2i(m_log, "http_multi.max_streams streams of a request", val,
+                           &m_pull_options.max_streams_request, 1, PullOptions::MaxStreamsPerRequest)) {
+            return false;
+        }
+        if ((val = Config.GetWord()) && *val) {
+            if (XrdOuca2x::a2i(m_log, "http_multi.max_streams stream threads of the server", val,
+                               &m_pull_options.max_stream_threads, 2, PullOptions::MaxStreamThreads)) {
+                return false;
+            }
+        }
+    } else if (!strcmp(name, "block_size")) {
+        long long size;
+        if (XrdOuca2x::a2sz(m_log, "http_multi.block_size minimum", val, &size,
+                            PullOptions::MinWriteSize, PullOptions::MaxBlockSize)) {
+            return false;
+        }
+        m_pull_options.block_min = static_cast<off_t>(size);
+        if ((val = Config.GetWord()) && *val) {
+            if (XrdOuca2x::a2sz(m_log, "http_multi.block_size maximum", val, &size,
+                                PullOptions::MinWriteSize, PullOptions::MaxBlockSize)) {
+                return false;
+            }
+            m_pull_options.block_max = static_cast<off_t>(size);
+        } else if (m_pull_options.block_max < m_pull_options.block_min) {
+            // Only a minimum was given, above the default maximum.
+            m_pull_options.block_max = m_pull_options.block_min;
+        }
+    } else if (!strcmp(name, "write_size")) {
+        long long size;
+        if (XrdOuca2x::a2sz(m_log, "http_multi.write_size", val, &size,
+                            PullOptions::MinWriteSize, PullOptions::MaxWriteSize)) {
+            return false;
+        }
+        m_pull_options.write_size = static_cast<off_t>(size);
+    } else if (!strcmp(name, "source_check")) {
+        if (!strcmp(val, "full")) {
+            m_pull_options.source_validators = true;
+        } else if (!strcmp(val, "size")) {
+            m_pull_options.source_validators = false;
+        } else {
+            m_log.Emsg("Config", "http_multi.source_check must be 'full' or 'size', not", val);
+            return false;
+        }
+    } else if (!strcmp(name, "retry")) {
+        bool most_given = false;
+        if (XrdOuca2x::a2i(m_log, "http_multi.retry attempts", val,
+                           &m_pull_options.retry_attempts, 1, PullOptions::MaxRetryAttempts)) {
+            return false;
+        }
+        if ((val = Config.GetWord()) && *val) {
+            if (XrdOuca2x::a2tm(m_log, "http_multi.retry wait", val,
+                                &m_pull_options.retry_wait, 0, PullOptions::MaxRetryWait)) {
+                return false;
+            }
+            if ((val = Config.GetWord()) && *val) {
+                if (XrdOuca2x::a2i(m_log, "http_multi.retry most tries of a block", val,
+                                   &m_pull_options.retry_most, 1, PullOptions::MaxRetryAttempts)) {
+                    return false;
+                }
+                most_given = true;
+            }
+        }
+        // More attempts than the default cap, and no cap given: the cap
+        // follows, so that the attempts asked for are all made.
+        if (!most_given && m_pull_options.retry_most < m_pull_options.retry_attempts) {
+            m_pull_options.retry_most = m_pull_options.retry_attempts;
+        }
+    } else {
+        m_log.Emsg("Config", "unknown directive", directive.c_str());
+        return false;
+    }
+    // A word too many is as likely a mistake as a word that is wrong.
+    if ((val = Config.GetWord()) && *val) {
+        m_log.Emsg("Config", directive.c_str(), "has a value too many:", val);
+        return false;
+    }
     return true;
 }

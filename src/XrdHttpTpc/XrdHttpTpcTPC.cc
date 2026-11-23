@@ -29,6 +29,8 @@
 #include <stdexcept>
 #include <thread>
 
+#include "XrdHttpTpcBlockPull.hh"
+#include "XrdHttpTpcPullMon.hh"
 #include "XrdHttpTpcState.hh"
 #include "XrdHttpTpcStream.hh"
 #include "XrdHttpTpcTPC.hh"
@@ -40,6 +42,29 @@ XrdXrootdTpcMon* TPCHandler::TPCLogRecord::tpcMonitor = 0;
 
 uint64_t TPCHandler::m_monid{0};
 int TPCHandler::m_marker_period = 5;
+
+namespace {
+
+// When each of these was last logged as a warning.  They are things an
+// operator should see at the default log level, which shows warnings and
+// errors only, but which can happen for every pull for as long as they last.
+std::atomic<time_t> s_last_marking_warning{0};
+std::atomic<time_t> s_last_ec_warning{0};
+std::atomic<time_t> s_last_limit_warning{0};
+
+// The level to log such a thing at: a warning if none was logged in the last
+// minute, information otherwise.
+LogMask WarningOncePerMinute(std::atomic<time_t> &last)
+{
+    const time_t now = time(NULL);
+    time_t before = last.load();
+    if (now - before >= 60 && last.compare_exchange_strong(before, now)) {
+        return LogMask::Warning;
+    }
+    return LogMask::Info;
+}
+
+}
 size_t TPCHandler::m_block_size = 16*1024*1024;
 size_t TPCHandler::m_small_block_size = 1*1024*1024;
 XrdSysMutex TPCHandler::m_monid_mutex;
@@ -167,18 +192,26 @@ int TPCHandler::opensocket_callback(void *clientp,
 
   // Remember the connection for the performance markers.  The HTTP-TPC
   // specification wants tcp:1.2.3.4:1094 and tcp:[2001:db8::1]:1094.
-  char ip[INET6_ADDRSTRLEN];
-  std::stringstream desc;
-  if (aInfo->addr.sa_family == AF_INET) {
-    const struct sockaddr_in *sin = reinterpret_cast<const struct sockaddr_in *>(&(aInfo->addr));
-    if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
-      desc << "tcp:" << ip << ":" << ntohs(sin->sin_port);
-  } else if (aInfo->addr.sa_family == AF_INET6) {
-    const struct sockaddr_in6 *sin6 = reinterpret_cast<const struct sockaddr_in6 *>(&(aInfo->addr));
-    if (inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)))
-      desc << "tcp:[" << ip << "]:" << ntohs(sin6->sin6_port);
+  //
+  // This is a callback of libcurl, which is C: no exception may pass through
+  // it.  In a pull in blocks it runs in the thread of a stream.
+  try {
+    char ip[INET6_ADDRSTRLEN];
+    std::stringstream desc;
+    if (aInfo->addr.sa_family == AF_INET) {
+      const struct sockaddr_in *sin = reinterpret_cast<const struct sockaddr_in *>(&(aInfo->addr));
+      if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
+        desc << "tcp:" << ip << ":" << ntohs(sin->sin_port);
+    } else if (aInfo->addr.sa_family == AF_INET6) {
+      const struct sockaddr_in6 *sin6 = reinterpret_cast<const struct sockaddr_in6 *>(&(aInfo->addr));
+      if (inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)))
+        desc << "tcp:[" << ip << "]:" << ntohs(sin6->sin6_port);
+    }
+    std::lock_guard<std::mutex> lock(rec->mtx);
+    rec->connections[fd] = desc.str();
+  } catch (...) {
+    // Without its entry the connection is only missing from the markers.
   }
-  rec->connections[fd] = desc.str();
 
   return fd;
 }
@@ -190,7 +223,10 @@ int TPCHandler::closesocket_callback(void *clientp, curl_socket_t fd) {
   // Otherwise, we would lose the socket usage information if the socket is closed before
   // the PMark handle is closed.
   rec->pmarkManager.endPmark(fd);
-  rec->connections.erase(fd);
+  {
+    std::lock_guard<std::mutex> lock(rec->mtx);
+    rec->connections.erase(fd);
+  }
 
   return close(fd);
 }
@@ -484,6 +520,9 @@ TPCHandler::TPCHandler(XrdSysError *log, const char *config, XrdOucEnv *myEnv) :
     if (!Configure(config, myEnv)) {
         throw std::runtime_error("Failed to configure the HTTP third-party-copy handler.");
     }
+
+    // The counters of the multistream pull, in the summary statistics.
+    PullMon::Register(myEnv, m_log);
 
 // Extract out the TPC monitoring object (we share it with xrootd).
 //
@@ -784,12 +823,17 @@ int TPCHandler::SendPerfMarker(XrdHttpExtReq &req, TPCLogRecord &rec, std::vecto
     // transfer, as recorded by the socket callbacks.
     bool first = true;
     std::stringstream ss2;
-    for (std::map<int, std::string>::const_iterator iter = rec.connections.begin();
-        iter != rec.connections.end(); iter++)
     {
-        if (!iter->second.empty()) {
-            ss2 << (first ? "" : ",") << iter->second;
-            first = false;
+        // In a pull in blocks the socket callbacks change the map from the
+        // threads of the streams.
+        std::lock_guard<std::mutex> lock(rec.mtx);
+        for (std::map<int, std::string>::const_iterator iter = rec.connections.begin();
+            iter != rec.connections.end(); iter++)
+        {
+            if (!iter->second.empty()) {
+                ss2 << (first ? "" : ",") << iter->second;
+                first = false;
+            }
         }
     }
     if (!first)
@@ -1294,6 +1338,16 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
             streams = stream_req == 0 ? 1 : stream_req;
         }
     }
+    // What the client asked for, kept for the log.
+    const int streams_asked = streams;
+    if (streams > m_pull_options.max_streams_request) {
+        // A request above the limit of the site is given the limit, not an error.
+        streams = m_pull_options.max_streams_request;
+        PullMon::limit_request++;
+        std::stringstream ss;
+        ss << "asked=" << streams_asked << ", granted=" << streams << ", reason=request_limit";
+        logTransferEvent(LogMask::Info, rec, "STREAM_LIMIT", ss.str());
+    }
     rec.streams = streams;
     std::string full_url = prepareURL(req);
     std::string authz = GetAuthz(req);
@@ -1339,6 +1393,65 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
         streams = 1;
         rec.streams = streams;
     }
+
+    // Whether this pull is carried out in blocks, one thread per stream.  It
+    // is decided here, before the file is opened and before the response to
+    // the client is started, and not changed afterwards: the stream object
+    // below is set up for one way of writing or the other.
+    BlockPlan block_plan;
+    StreamThreadBudget::Share stream_threads;
+    bool in_blocks = false;
+    if (m_pull_options.mode == PullOptions::Mode::Blocks && streams > 1) {
+        if (rec.pmarkManager.isEnabled()) {
+            // Packet marking has not been made to work with stream threads
+            // yet.  Where every request carries a SciTag this is every pull,
+            // against what the server said at start: an operator must see it.
+            PullMon::sequential_marking++;
+            logTransferEvent(WarningOncePerMinute(s_last_marking_warning), rec, "MULTISTREAM_MODE",
+                "mode=sequential, reason=packet_marking; a pull with packet marking is not"
+                " carried out in blocks");
+        } else if (usingEC) {
+            // The erasure coding writer takes the data in file order only.
+            PullMon::sequential_ec++;
+            logTransferEvent(WarningOncePerMinute(s_last_ec_warning), rec, "MULTISTREAM_MODE",
+                "mode=sequential, reason=erasure_coding; the erasure coding writer cannot"
+                " write at offsets");
+        } else {
+            const int granted = streams;
+            const char *reason = "file_size";
+            block_plan = PlanBlocks(static_cast<off_t>(sourceFileContentLength), streams, m_pull_options);
+            if (block_plan.workers >= 2) {
+                // Each worker is a thread; take them from what the server has left.
+                stream_threads = StreamThreadBudget::Take(static_cast<int>(block_plan.workers),
+                                                          m_pull_options.max_stream_threads);
+                if (stream_threads.Count() < static_cast<int>(block_plan.workers)) {
+                    reason = "server_limit";
+                    block_plan = stream_threads.Count() >= 2
+                        ? PlanBlocks(static_cast<off_t>(sourceFileContentLength), stream_threads.Count(), m_pull_options)
+                        : BlockPlan();
+                }
+            }
+            in_blocks = block_plan.workers >= 2;
+            // With fewer than two workers the file is pulled with the single
+            // request, which needs no thread of its own.
+            streams = in_blocks ? static_cast<int>(block_plan.workers) : 1;
+            stream_threads.ShrinkTo(in_blocks ? streams : 0);
+            rec.streams = streams;
+            if (streams < granted) {
+                if (!strcmp(reason, "server_limit")) {PullMon::limit_server++;}
+                std::stringstream ss;
+                ss << "asked=" << streams_asked << ", granted=" << streams << ", reason=" << reason;
+                // A file too small for the streams asked is routine.  A
+                // server out of stream threads is something an operator
+                // should see at the default log level, but not once for
+                // every pull while it lasts.
+                logTransferEvent(!strcmp(reason, "server_limit")
+                                     ? WarningOncePerMinute(s_last_limit_warning) : LogMask::Info,
+                                 rec, "STREAM_LIMIT", ss.str());
+            }
+        }
+    }
+
     int open_result = OpenWaitStall(*fh, full_url, mode|SFS_O_WRONLY,
                                     0644 | SFS_O_MKPTH,
                                     req.GetSecEntity(), authz);
@@ -1359,16 +1472,25 @@ int TPCHandler::ProcessPullReq(const std::string &resource, XrdHttpExtReq &req) 
         return resp_result;
     }
     Stream stream(std::move(fh), streams * m_pipelining_multiplier, streams > 1 ? m_block_size : m_small_block_size, m_log);
+    if (in_blocks) {
+        // The streams write at their own offsets; the reorder buffers of the
+        // stream object stay unused (they are only allocated when used).
+        stream.EnableOffsetWrites(m_pull_options.write_size);
+    }
     State state(0, stream, curl, false, req.tpcForwardCreds);
     state.SetupHeaders(req);
     state.SetContentLength(sourceFileContentLength);
 
-    if (streams > 1) {
+    if (in_blocks) {
+        return RunPullInBlocks(req, state, stream, block_plan, streams_asked, stream_threads, rec);
+    } else if (streams > 1) {
+        PullMon::sequential++;
         return RunCurlWithStreams(req, state, streams, rec);
     } else {
         // Single request: close each connection once done so the redirector
         // connection does not stay idle for the whole transfer
         curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+        PullMon::single++;
         return RunCurlWithUpdates(curl, req, state, rec);
     }
 }

@@ -71,10 +71,12 @@ public:
    * @param value the value of the header (surrounding white space is ignored)
    * @param first set to the offset of the first byte of the range
    * @param last set to the offset of the last byte of the range
-   * @return true if the value is a valid byte range, false otherwise (first and
-   * last are then left untouched)
+   * @param totalLength if given, set to TOTAL, or to -1 when it is "*"
+   * @return true if the value is a valid byte range, false otherwise (first,
+   * last and the total are then left untouched)
    */
-  static bool parseContentRange(const std::string & value, long long & first, long long & last);
+  static bool parseContentRange(const std::string & value, long long & first, long long & last,
+                                long long * totalLength = nullptr);
 };
 
 

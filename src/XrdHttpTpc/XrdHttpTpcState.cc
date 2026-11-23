@@ -10,6 +10,7 @@
 
 #include <curl/curl.h>
 
+#include "XrdHttpTpcBlockPull.hh"
 #include "XrdHttpTpcState.hh"
 #include "XrdHttpTpcStream.hh"
 #include "XrdHttpTpcUtils.hh"
@@ -197,6 +198,41 @@ void State::ResetAfterRequest() {
     m_recv_all_headers = false;
     m_recv_status_line = false;
     m_repr_digests.clear();
+    m_wbuf.clear();
+    // What a response said belongs to that response: a text kept from one
+    // request must not be reported as the cause of the failure of the next.
+    m_error_buf.clear();
+    m_resp_retry_after = -1;
+    m_body_overran = false;
+}
+
+bool State::ContinueRange(std::string &error) {
+    const off_t next = m_start_offset + m_offset;
+    const off_t left = m_range_length - m_offset;
+    std::stringstream ss;
+    if (m_push || m_range_length < 0 || left <= 0) {
+        ss << "No part of the range is left to ask for (at offset " << next << ")";
+        error = ss.str();
+        return false;
+    }
+    if (!m_wbuf.empty() && m_wbuf_offset + static_cast<off_t>(m_wbuf.size()) != next) {
+        // The data collected ends at the last byte received, unless a
+        // write failed half way through a piece without the failure being
+        // recorded.  Then this is what stops the request from going on.
+        ss << "The data held for the next write ends at offset "
+           << (m_wbuf_offset + static_cast<off_t>(m_wbuf.size()))
+           << " and the request would go on at " << next;
+        error = ss.str();
+        return false;
+    }
+    // The data collected outlives the reset; swap() does not allocate.
+    std::vector<char> kept;
+    kept.swap(m_wbuf);
+    ResetAfterRequest();
+    m_wbuf.swap(kept);
+    m_error_code = errNone;
+    SetTransferParameters(next, left);
+    return true;
 }
 
 void State::RecordStatusOnFailure(int curl_result)
@@ -209,11 +245,19 @@ void State::RecordStatusOnFailure(int curl_result)
     }
 }
 
+// HeaderCB and WriteCB are callbacks of libcurl, which is C: no exception may
+// pass through them.  In blocks mode they run in a stream thread, where an
+// exception that escapes ends the server.  Returning a number other than the
+// one libcurl handed over makes it end the request with an error.
 size_t State::HeaderCB(char *buffer, size_t size, size_t nitems, void *userdata)
 {
-    State *obj = static_cast<State*>(userdata);
-    std::string header(buffer, size*nitems);
-    return obj->Header(header);
+    try {
+        State *obj = static_cast<State*>(userdata);
+        std::string header(buffer, size*nitems);
+        return obj->Header(header);
+    } catch (...) {
+        return 0;
+    }
 }
 
 int State::Header(const std::string &header) {
@@ -235,12 +279,19 @@ int State::Header(const std::string &header) {
             return 0;
         }
         m_recv_status_line = true;
+        // A new response: what an earlier one of this request said (a
+        // redirection that was followed) is not about this one.
+        m_error_buf.clear();
         m_resp_content_length = -1;
         m_resp_range_first = -1;
         m_resp_range_last = -1;
+        m_resp_range_total = -1;
+        m_resp_etag.clear();
+        m_resp_last_modified.clear();
+        m_resp_retry_after = -1;
     } else if (header.size() == 0 || header == "\n" || header == "\r\n") {
         m_recv_all_headers = true;
-        if (!CheckRangeResponse()) {
+        if (!CheckRangeResponse() || !CheckSourceUnchanged()) {
             return 0;
         }
     }
@@ -265,7 +316,28 @@ int State::Header(const std::string &header) {
             if (header_name == "content-range") {
                 // An unparseable value leaves the range unset; it is reported
                 // once all the headers are in.
-                XrdHttpTpcUtils::parseContentRange(header_value, m_resp_range_first, m_resp_range_last);
+                XrdHttpTpcUtils::parseContentRange(header_value, m_resp_range_first, m_resp_range_last,
+                                                   &m_resp_range_total);
+            }
+            if (header_name == "etag" || header_name == "last-modified") {
+                // Kept as sent, without the white space around it: they are
+                // only compared with those of other responses.
+                static const char blanks[] = " \t\r\n";
+                const size_t begin = header_value.find_first_not_of(blanks);
+                const std::string value = begin == std::string::npos ? std::string()
+                    : header_value.substr(begin, header_value.find_last_not_of(blanks) - begin + 1);
+                (header_name == "etag" ? m_resp_etag : m_resp_last_modified) = value;
+            }
+            if (header_name == "retry-after") {
+                // Seconds; the other form, a date, is not used.
+                try {
+                    size_t used = 0;
+                    const long seconds = std::stol(header_value, &used);
+                    const bool whole = header_value.find_first_not_of(" \t\r\n", used) == std::string::npos;
+                    m_resp_retry_after = (whole && seconds >= 0) ? seconds : -1;
+                } catch (...) {
+                    m_resp_retry_after = -1;
+                }
             }
             if(header_name == "repr-digest") {
               XrdHttpHeaderUtils::parseReprDigest(header_value,m_repr_digests);
@@ -311,31 +383,61 @@ bool State::CheckRangeResponse() {
     return false;
 }
 
+bool State::CheckSourceUnchanged() {
+    // Only a response that brings a part of the file says something about
+    // the file; a redirection or an error does not.
+    if (!m_source_check || m_push || !CarriesContent(m_status_code)) {
+        return true;
+    }
+    SourceCheck::Seen seen;
+    seen.total = m_resp_range_total;
+    seen.etag = m_resp_etag;
+    seen.last_modified = m_resp_last_modified;
+    // The server that answered, in the form the performance markers use:
+    // behind a redirector the requests of a pull may reach different servers.
+    seen.host = GetConnectionDescription();
+    std::string error;
+    if (!m_source_check->Agrees(seen, error)) {
+        m_error_buf = error;
+        m_error_code = errSource;
+        return false;
+    }
+    return true;
+}
+
 size_t State::WriteCB(void *buffer, size_t size, size_t nitems, void *userdata) {
-    State *obj = static_cast<State*>(userdata);
-    if (obj->GetStatusCode() < 0) {
+    try {
+        return static_cast<State*>(userdata)->Body(buffer, size, nitems);
+    } catch (...) {
+        // Not size*nitems: libcurl ends the request with a write error.
         return 0;
-     }  // malformed request - got body before headers.
-    if (obj->GetStatusCode() >= 400) {
-        obj->m_error_buf += std::string(static_cast<char*>(buffer),
-                                        std::min(static_cast<size_t>(1024), size*nitems));
+    }
+}
+
+size_t State::Body(void *buffer, size_t size, size_t nitems) {
+    if (GetStatusCode() < 0) {
+        return 0;
+    }  // malformed request - got body before headers.
+    if (GetStatusCode() >= 400) {
+        m_error_buf += std::string(static_cast<char*>(buffer),
+                                   std::min(static_cast<size_t>(1024), size*nitems));
         // Record error messages until we hit a KB; at that point, fail out.
-        if (obj->m_error_buf.size() >= 1024)
+        if (m_error_buf.size() >= 1024)
             return 0;
         else
             return size*nitems;
     }  // Status indicates failure.
-    if (!CarriesContent(obj->GetStatusCode())) {
+    if (!CarriesContent(GetStatusCode())) {
         // Not the file: keep the beginning for the error message and drop
         // the rest.  The request is left to end normally, so that the pull
         // fails on the status and not on an aborted transfer.
-        if (obj->m_error_buf.size() < 1024) {
-            obj->m_error_buf.append(static_cast<char*>(buffer),
-                                    std::min(1024 - obj->m_error_buf.size(), size*nitems));
+        if (m_error_buf.size() < 1024) {
+            m_error_buf.append(static_cast<char*>(buffer),
+                               std::min(1024 - m_error_buf.size(), size*nitems));
         }
         return size*nitems;
     }
-    return obj->Write(static_cast<char*>(buffer), size*nitems);
+    return Write(static_cast<char*>(buffer), size*nitems);
 }
 
 /**
@@ -383,7 +485,40 @@ ssize_t State::Write(char *buffer, size_t size) {
            << m_start_offset << "-" << (m_start_offset + m_range_length - 1);
         m_error_buf = ss.str();
         m_error_code = errRange;
+        m_body_overran = true;
         return -1;
+    }
+    const size_t write_size = m_stream->OffsetWriteSize();
+    if (write_size) {
+        // Blocks mode: collect the data and write it at its own offset each
+        // time one write is complete.  libcurl hands the data over in pieces
+        // of at most its buffer, 16 KiB unless set otherwise; written as they
+        // come, these pieces would each be a system call and a record for the
+        // real-time checksum of the storage.
+        size_t done = 0;
+        try {
+            while (done < size) {
+                if (m_wbuf.empty()) {
+                    m_wbuf.reserve(write_size);
+                    m_wbuf_offset = m_start_offset + m_offset + done;
+                }
+                size_t count = std::min(size - done, write_size - m_wbuf.size());
+                m_wbuf.insert(m_wbuf.end(), buffer + done, buffer + done + count);
+                done += count;
+                if (m_wbuf.size() == write_size && !FlushWriteBuffer()) {
+                    return -1;
+                }
+            }
+        } catch (std::exception &e) {
+            m_error_buf = std::string("Failed to buffer the data received: ") + e.what();
+            m_error_code = errWrite;
+            return -1;
+        }
+        // Only now: the whole piece is in the buffer or in the file.
+        m_offset += size;
+        if (m_pull_received) {m_pull_received->fetch_add(size, std::memory_order_relaxed);}
+        if (m_worker_status) {m_worker_status->received.fetch_add(size, std::memory_order_relaxed);}
+        return size;
     }
     ssize_t retval = m_stream->Write(m_start_offset + m_offset, buffer, size, false);
     if (retval == SFS_ERROR) {
@@ -393,6 +528,43 @@ ssize_t State::Write(char *buffer, size_t size) {
     }
     m_offset += retval;
     return retval;
+}
+
+bool State::FlushWriteBuffer() {
+    if (m_wbuf.empty()) {return true;}
+    if (m_pull_stop && m_pull_stop->load(std::memory_order_relaxed)) {
+        // The pull is being stopped for a reason that is already recorded,
+        // by another stream or by the thread of the request.  Nothing more is
+        // written, and this is not a cause.
+        m_wbuf.clear();
+        return false;
+    }
+    const off_t offset = m_wbuf_offset;
+    const size_t size = m_wbuf.size();
+    std::string error;
+    // While this stream writes, or waits for its turn to write, it is not
+    // waiting for the source.
+    if (m_worker_status) {m_worker_status->phase.store(WorkerStatus::Writing);}
+    ssize_t retval = m_stream->WriteAt(offset, m_wbuf.data(), size, error);
+    if (m_worker_status) {m_worker_status->phase.store(WorkerStatus::Receiving);}
+    m_wbuf.clear();
+    if (retval != static_cast<ssize_t>(size)) {
+        // A short write counts as a failure: the bytes the storage did not
+        // take are not in the file, whatever the layers above it believe.
+        std::stringstream ss;
+        if (retval >= 0) {
+            ss << "The storage took only " << retval << " of the " << size
+               << " bytes of a write at offset " << offset;
+        } else {
+            ss << (error.empty() ? "(no error message provided)" : error)
+               << "; write of " << size << " bytes at offset " << offset;
+        }
+        m_error_buf = ss.str();
+        m_error_code = errWrite;
+        return false;
+    }
+    if (m_pull_written) {m_pull_written->fetch_add(retval, std::memory_order_relaxed);}
+    return true;
 }
 
 void State::RecordFinalizeError(int error_code, const std::string &error_msg) {
